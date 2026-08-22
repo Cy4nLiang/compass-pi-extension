@@ -1,0 +1,41 @@
+{
+	"name": "compass-pi-extension",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"description": "罗盘 Compass：Amazon US 精铺选品工作台的 pi Extension",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/Cy4nLiang/compass-pi-extension.git"
+	},
+	"keywords": [
+		"pi-extension",
+		"amazon",
+		"product-research",
+		"fba"
+	],
+	"scripts": {
+		"test": "node --experimental-strip-types --test tests/*.test.ts",
+		"check": "tsc --noEmit"
+	},
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"dependencies": {
+		"yaml": "2.9.0"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-ai": "^0.84.2",
+		"@earendil-works/pi-coding-agent": "^0.84.2",
+		"@earendil-works/pi-tui": "^0.84.2",
+		"@types/node": "^22.10.0",
+		"typebox": "1.3.7",
+		"typescript": "^5.8.0"
+	},
+	"engines": {
+		"node": ">=22.19.0"
+	}
+}

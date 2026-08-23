@@ -15,7 +15,6 @@ import { Markdown, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { decodeCsvBuffer, parseMarketCsv } from "./csv.ts";
 import { estimateProfit, normalizeProfitInput } from "./economics.ts";
-import { generateMarketReport } from "./report.ts";
 import {
 	budgetStatus,
 	buildStrategyContext,
@@ -25,8 +24,10 @@ import {
 	ensureDefaults,
 	findCandidate,
 	findMarket,
-	importParsedMarket,
+	importMarketAndScreen,
 	latestStrategy,
+	mainCpcForMarket,
+	generateMarketReport,
 	listStrategies,
 	moveCandidate,
 	recordCost,
@@ -92,8 +93,27 @@ function actorName(explicit?: string): string {
 	return explicit?.trim() || process.env.USER || process.env.USERNAME || "pi-user";
 }
 
+function normalizeCapturedAt(value?: string): string {
+	if (!value) return new Date().toISOString();
+	const date = new Date(value);
+	if (!Number.isFinite(date.getTime())) throw new Error(`captured_at 无效：${value}；请使用合法的 ISO 时间`);
+	return date.toISOString();
+}
+
 function details(input: Omit<CompassDetails, "kind">): CompassDetails {
 	return { kind: TOOL_DETAILS_KIND, ...input };
+}
+
+function searchTerms(query: string): string[] {
+	const chunks = query.normalize("NFKC").toLocaleLowerCase().match(/[A-Za-z0-9_]+|[\u4e00-\u9fff]+/gu) ?? [];
+	const terms = new Set<string>();
+	for (const chunk of chunks) {
+		terms.add(chunk);
+		if (/^[\u4e00-\u9fff]+$/u.test(chunk)) {
+			for (let index = 0; index < chunk.length - 1; index++) terms.add(chunk.slice(index, index + 2));
+		}
+	}
+	return [...terms];
 }
 
 function textResult(text: string, toolDetails: CompassDetails) {
@@ -180,29 +200,22 @@ export default function compassExtension(pi: ExtensionAPI): void {
 		const repo = repository(ctx);
 		const path = repo.resolveInputPath(input.path);
 		const buffer = await readFile(path);
-		const capturedAt = input.capturedAt ? new Date(input.capturedAt).toISOString() : new Date().toISOString();
+		const capturedAt = normalizeCapturedAt(input.capturedAt);
 		const parsed = parseMarketCsv(decodeCsvBuffer(buffer), { source: input.source, capturedAt });
 		const archivedFile = await repo.archiveRaw(basename(path), buffer, capturedAt);
 		const fileHash = createHash("sha256").update(buffer).digest("hex");
 		const actor = actorName(input.actor);
-		const { result, store } = await mutateStore(ctx, (data) => {
-			const imported = importParsedMarket(data, {
-				marketName: input.marketName,
-				keywords: input.keywords,
-				parsed,
-				capturedAt,
-				fileName: relative(ctx.cwd, path),
-				archivedFile,
-				fileHash,
-				actor,
-			});
-			const screenRun = input.runScreen === false ? undefined : runStrategy(data, {
-				marketRef: imported.market.id,
-				mode: "screen",
-				actor,
-			});
-			return { ...imported, screenRun };
-		});
+		const { result, store } = await mutateStore(ctx, (data) => importMarketAndScreen(data, {
+			marketName: input.marketName,
+			keywords: input.keywords,
+			parsed,
+			capturedAt,
+			fileName: relative(ctx.cwd, path),
+			archivedFile,
+			fileHash,
+			actor,
+			runScreen: input.runScreen,
+		}));
 		return { ...result, store, parsed, archivedFile };
 	}
 
@@ -307,11 +320,11 @@ export default function compassExtension(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "compass_market_report",
 		label: "Compass Market Report",
-		description: "为一个市场生成完整五维 GSE 报告，包含数据来源、时间、置信度、多源偏差、风险、利润与决策回放，并写入项目 .pi/compass/reports；输出不超过45KB。",
+		description: "为一个市场生成完整五维 GSE 报告，包含数据来源、时间、置信度、多源偏差、风险、利润与决策回放，并写入项目 .pi/compass/reports；自定义 output_path 也必须位于该目录内且使用 .md；输出不超过45KB。",
 		parameters: Type.Object({
 			market_ref: Type.String({ description: "market_id 或唯一市场名称" }),
 			strategy_id: Type.Optional(Type.String()),
-			output_path: Type.Optional(Type.String({ description: "项目内 Markdown 输出路径" })),
+			output_path: Type.Optional(Type.String({ description: ".pi/compass/reports/ 内的 Markdown 输出路径（必须为 .md）" })),
 		}),
 		async execute(_id, params, _signal, _update, ctx) {
 			const store = await readStore(ctx);
@@ -360,8 +373,8 @@ export default function compassExtension(pi: ExtensionAPI): void {
 				const store = await readStore(ctx);
 				const market = findMarket(store, params.market_ref);
 				marketId = market.id;
-				const mainCpc = buildStrategyContext(store, market.id).context.metrics.main_cpc?.value;
-				if (cpc === undefined && typeof mainCpc === "number") cpc = mainCpc;
+				const mainCpc = mainCpcForMarket(store, market.id);
+				if (cpc === undefined && mainCpc !== undefined) cpc = mainCpc;
 			}
 			const input = normalizeProfitInput({
 				marketId,
@@ -609,8 +622,8 @@ export default function compassExtension(pi: ExtensionAPI): void {
 				const { result: event } = await mutateStore(ctx, (store) => recordCost(store, { source: params.source as string, marketRef: params.market_ref, amountCny: params.amount_cny as number, description: params.description, actor: actorName(params.actor), force: params.force }));
 				return textResult(`cost_id=${event.id}\n${event.source} ¥${event.amountCny}\nmarket=${event.marketId ?? "未归因"}`, details({ title: "成本已记账", status: "success", summary: `${event.source} · ¥${event.amountCny.toFixed(2)} · ${event.marketId ?? "未归因"}` }));
 			}
-			if (!params.source || !params.tier || params.monthly_limit_cny === undefined) throw new Error("configure 需要 source、tier、monthly_limit_cny");
-			const { result: pool } = await mutateStore(ctx, (store) => configureBudget(store, { source: params.source as string, tier: params.tier as "A" | "B" | "C", monthlyLimitCny: params.monthly_limit_cny as number, enabled: params.enabled ?? true, note: params.note }));
+			if (!params.source) throw new Error("configure 需要 source；新预算池另需 tier 与 monthly_limit_cny");
+			const { result: pool } = await mutateStore(ctx, (store) => configureBudget(store, { source: params.source as string, tier: params.tier as "A" | "B" | "C" | undefined, monthlyLimitCny: params.monthly_limit_cny, enabled: params.enabled, note: params.note }));
 			return textResult(`${pool.source} | tier=${pool.tier} | limit=¥${pool.monthlyLimitCny} | enabled=${pool.enabled}`, details({ title: "预算池已配置", status: "success", summary: `${pool.source} · ${pool.tier}档 · ¥${pool.monthlyLimitCny}/月` }));
 		},
 		renderCall: renderCallLabel("compass_budget"),
@@ -732,7 +745,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			limit: Type.Optional(Type.Integer({ minimum: 1, maximum: DOMAIN_TOOLS.length })),
 		}),
 		async execute(_id, params) {
-			const terms = params.query.normalize("NFKC").toLocaleLowerCase().split(/[^\p{L}\p{N}_]+/u).filter(Boolean);
+			const terms = searchTerms(params.query);
 			let matches = TOOL_CATALOG.map((item) => ({
 				...item,
 				score: terms.reduce((score, term) => score + (`${item.name} ${item.keywords} ${item.description}`.toLocaleLowerCase().includes(term) ? 1 : 0), 0),
@@ -794,7 +807,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			if (!path) return;
 			const marketName = await ctx.ui.input("市场/关键词族名称", "yoga mat strap");
 			if (!marketName) return;
-			const source = await ctx.ui.select("数据来源", ["auto", "sellersprite", "sorftime", "keepa", "manual_csv", "generic_csv"]);
+			const source = await ctx.ui.select("数据来源", ["auto", "sellersprite", "sorftime", "keepa", "compass_browser", "manual_csv", "generic_csv"]);
 			if (!source) return;
 			const imported = await performImport(ctx, { path, marketName, source, runScreen: true });
 			ctx.ui.notify(`${imported.market.name} 已导入；粗筛=${imported.screenRun?.result.outcome ?? "未运行"}`, imported.screenRun?.result.outcome === "reject" ? "warning" : "info");
@@ -848,7 +861,18 @@ export default function compassExtension(pi: ExtensionAPI): void {
 
 	pi.on("session_start", async (_event, ctx) => {
 		if (!ctx.isProjectTrusted()) return;
-		await mutateStore(ctx, () => undefined);
+		const repo = repository(ctx);
+		try {
+			await withFileMutationQueue(repo.storePath, async () => {
+				const { store } = await repo.update(
+					(store) => ensureDefaults(store),
+					{ shouldSave: (result) => result },
+				);
+				refreshStatus(ctx, store);
+			});
+		} catch (error) {
+			if (ctx.hasUI) ctx.ui.notify(`罗盘启动初始化失败：${error instanceof Error ? error.message : String(error)}`, "warning");
+		}
 		const initial = pi.getActiveTools().filter((name) => !DOMAIN_TOOLS.includes(name as (typeof DOMAIN_TOOLS)[number]));
 		pi.setActiveTools([...new Set([...initial, "compass_tools"])]);
 	});

@@ -2,7 +2,7 @@ import { SOURCE_BASE_CONFIDENCE } from "./defaults.ts";
 import type { KeywordRecord, ListingRecord, MetricEvidence, MetricMap } from "./types.ts";
 
 function finite(values: Array<number | undefined>): number[] {
-	return values.filter((value): value is number => value !== undefined && Number.isFinite(value));
+	return values.filter((value): value is number => value !== undefined && Number.isFinite(value) && value >= 0);
 }
 
 export function quantile(values: number[], q: number): number | undefined {
@@ -108,7 +108,8 @@ function keywordMetrics(keywords: KeywordRecord[]): {
 	cpcKnown: number;
 } {
 	const withVolume = keywords.filter(
-		(keyword): keyword is KeywordRecord & { searchVolume: number } => keyword.searchVolume !== undefined,
+		(keyword): keyword is KeywordRecord & { searchVolume: number } =>
+			keyword.searchVolume !== undefined && Number.isFinite(keyword.searchVolume) && keyword.searchVolume >= 0,
 	);
 	const volumes = withVolume.map((keyword) => keyword.searchVolume).sort((a, b) => b - a);
 	const totalSearchVolume = volumes.length ? volumes.reduce((sum, value) => sum + value, 0) : undefined;
@@ -116,7 +117,10 @@ function keywordMetrics(keywords: KeywordRecord[]): {
 		totalSearchVolume && totalSearchVolume > 0
 			? volumes.slice(0, 3).reduce((sum, value) => sum + value, 0) / totalSearchVolume
 			: undefined;
-	const withCpc = keywords.filter((keyword) => keyword.cpc !== undefined);
+	const withCpc = keywords.filter(
+		(keyword): keyword is KeywordRecord & { cpc: number } =>
+			keyword.cpc !== undefined && Number.isFinite(keyword.cpc) && keyword.cpc >= 0,
+	);
 	let mainCpc: number | undefined;
 	if (withCpc.length) {
 		const weighted = withCpc.filter((keyword) => keyword.searchVolume !== undefined && keyword.searchVolume > 0);
@@ -166,9 +170,17 @@ export function calculateMarketMetrics(input: {
 	const categoryMonthlyRevenue =
 		revenues.length === total && total > 0 ? revenues.reduce((sum, value) => sum + value, 0) : undefined;
 	const newListingShare = ages.length ? ages.filter((months) => months <= 12).length / ages.length : undefined;
-	const lowRatingHighSalesCount = top.filter(
-		(listing) => (listing.rating ?? Infinity) <= 4.2 && (listing.monthlySales ?? -Infinity) >= targetMonthlyUnits,
-	).length;
+	const knownRatings = finite(top.map((listing) => listing.rating));
+	const knownSales = finite(top.map((listing) => listing.monthlySales));
+	const lowRatingHighSalesRows = top.filter(
+		(listing) => listing.rating !== undefined && Number.isFinite(listing.rating) && listing.monthlySales !== undefined &&
+			Number.isFinite(listing.monthlySales),
+	);
+	const lowRatingHighSalesCount = knownRatings.length > 0 && knownSales.length > 0
+		? lowRatingHighSalesRows.filter(
+			(listing) => (listing.rating as number) <= 4.2 && (listing.monthlySales as number) >= targetMonthlyUnits,
+		).length
+		: undefined;
 
 	const metrics: MetricMap = {
 		listing_count: evidence(total, source, capturedAt, total ? base : 0, total),
@@ -227,11 +239,11 @@ export function calculateMarketMetrics(input: {
 			waistReviews.length,
 		),
 		low_rating_high_sales_count: evidence(
-			lowRatingHighSalesCount,
+			round(lowRatingHighSalesCount, 0),
 			source,
 			capturedAt,
-			confidence(base, Math.min(sales.length, finite(top.map((listing) => listing.rating)).length), total),
-			total,
+			confidence(base, lowRatingHighSalesRows.length, total),
+			lowRatingHighSalesRows.length,
 			`星级≤4.2 且月销≥${targetMonthlyUnits}`,
 		),
 		waist_rating_median: evidence(

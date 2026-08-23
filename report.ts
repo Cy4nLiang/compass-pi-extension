@@ -1,5 +1,17 @@
-import { budgetStatus, buildStrategyContext, evaluateMarketWithoutPersisting, findMarket, latestSnapshot, latestStrategy, metricDivergences } from "./service.ts";
-import type { CompassStore, GateOutcome, MetricEvidence, MetricMap } from "./types.ts";
+import type {
+	Candidate,
+	DecisionLog,
+	GateOutcome,
+	Market,
+	MarketSnapshot,
+	MetricEvidence,
+	MetricMap,
+	ProfitEstimate,
+	ReviewAnalysis,
+	RiskRecord,
+	StrategyEvaluation,
+	StrategyVersion,
+} from "./types.ts";
 
 const PERCENT_METRICS = new Set([
 	"cr3",
@@ -18,7 +30,6 @@ const METRIC_LABELS: Record<string, string> = {
 	category_monthly_sales: "类目月销量",
 	category_monthly_revenue: "类目月销售额",
 	waist_monthly_sales: "腰部月销",
-	qualify_rank_depth: "QRD(300)",
 	price_p25: "价格 P25",
 	price_p50: "价格 P50",
 	price_p75: "价格 P75",
@@ -103,12 +114,13 @@ function confidenceLabel(value: number): string {
 	return value >= 0.85 ? "高" : value >= 0.65 ? "中" : value > 0 ? "低" : "缺失";
 }
 
-function metricTable(metrics: MetricMap, names: string[]): string[] {
+function metricTable(metrics: MetricMap, names: string[], targetMonthlyUnits: number): string[] {
 	const lines = ["| 指标 | 值 | 来源 / 时间 | 置信度 |", "|---|---:|---|---|"];
 	for (const name of names) {
 		const metric = metrics[name];
+		const label = name === "qualify_rank_depth" ? `QRD(${targetMonthlyUnits})` : METRIC_LABELS[name] ?? name;
 		lines.push(
-			`| ${escapeCell(METRIC_LABELS[name] ?? name)} | ${escapeCell(formatMetric(name, metric))} | ${escapeCell(metric ? `${metric.source} · ${metric.capturedAt.slice(0, 10)}` : "—")} | ${metric ? `${confidenceLabel(metric.confidence)} (${metric.confidence.toFixed(2)})` : "缺失"} |`,
+			`| ${escapeCell(label)} | ${escapeCell(formatMetric(name, metric))} | ${escapeCell(metric ? `${metric.source} · ${metric.capturedAt.slice(0, 10)}` : "—")} | ${metric ? `${confidenceLabel(metric.confidence)} (${metric.confidence.toFixed(2)})` : "缺失"} |`,
 		);
 	}
 	return lines;
@@ -123,25 +135,30 @@ export interface GeneratedReport {
 	snapshotId: string;
 }
 
-export function generateMarketReport(
-	store: CompassStore,
-	marketRef: string,
-	strategyRef = "jingpu-daily10",
-): GeneratedReport {
-	const market = findMarket(store, marketRef);
-	const snapshot = latestSnapshot(store, market.id);
-	const strategy = latestStrategy(store, strategyRef);
-	const { context } = buildStrategyContext(store, market.id);
-	const evaluation = evaluateMarketWithoutPersisting(store, market.id, strategy.id, "full");
-	const candidate = store.candidates.find((item) => item.marketId === market.id);
+export interface MarketReportData {
+	market: Market;
+	snapshot: MarketSnapshot;
+	strategy: StrategyVersion;
+	metrics: MetricMap;
+	evaluation: StrategyEvaluation;
+	candidate?: Candidate;
+	risk?: RiskRecord;
+	review?: ReviewAnalysis;
+	profit?: ProfitEstimate;
+	decisions: DecisionLog[];
+	divergences: Array<{ metric: string; values: Array<{ source: string; value: number; capturedAt: string }>; divergence: number }>;
+	attributedCostCny: number;
+	fusedBudgetSources: string[];
+}
+
+export function renderMarketReport(data: MarketReportData): GeneratedReport {
+	const { market, snapshot, strategy, metrics, evaluation, candidate, risk, review, profit, decisions, divergences, attributedCostCny, fusedBudgetSources } = data;
 	const ageDays = Math.max(0, Math.floor((Date.now() - Date.parse(snapshot.capturedAt)) / 86_400_000));
 	const freshness = ageDays <= 7 ? "深研新鲜" : ageDays <= 30 ? "仅适合粗筛" : "已过期，建议补数";
-	const divergences = metricDivergences(store, market.id);
-	const decisions = store.decisionLog.filter((item) => item.marketId === market.id).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-	const risk = store.riskRecords.filter((item) => item.marketId === market.id).sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
-	const review = store.reviewAnalyses.filter((item) => item.marketId === market.id).sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
-	const profit = store.profitEstimates.filter((item) => item.marketId === market.id).sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
-	const costs = store.costEvents.filter((item) => item.marketId === market.id).reduce((sum, item) => sum + item.amountCny, 0);
+	const targetMonthlyUnits = typeof strategy.definition.meta.monthly_units_q === "number" && Number.isFinite(strategy.definition.meta.monthly_units_q)
+		? strategy.definition.meta.monthly_units_q
+		: 300;
+	const costs = attributedCostCny;
 
 	const lines: string[] = [
 		`# 罗盘选品报告｜${market.name}`,
@@ -170,7 +187,7 @@ export function generateMarketReport(
 
 	lines.push("", "## 2. 五维证据", "");
 	for (const dimension of DIMENSIONS) {
-		lines.push(`### ${dimension.title}｜${dimension.question}`, "", ...metricTable(context.metrics, dimension.metrics), "");
+		lines.push(`### ${dimension.title}｜${dimension.question}`, "", ...metricTable(metrics, dimension.metrics, targetMonthlyUnits), "");
 	}
 
 	lines.push("## 3. 单位经济情景", "");
@@ -210,7 +227,8 @@ export function generateMarketReport(
 	lines.push("", "## 6. 多源校准与数据质量", "");
 	if (divergences.length) {
 		for (const divergence of divergences) {
-			lines.push(`- **标黄：${METRIC_LABELS[divergence.metric] ?? divergence.metric} 多源偏差 ${(divergence.divergence * 100).toFixed(1)}%**：${divergence.values.map((item) => `${item.source}=${formatNumber(item.value)} (${item.capturedAt.slice(0, 10)})`).join("；")}。`);
+			const label = divergence.metric === "qualify_rank_depth" ? `QRD(${targetMonthlyUnits})` : METRIC_LABELS[divergence.metric] ?? divergence.metric;
+			lines.push(`- **标黄：${label} 多源偏差 ${(divergence.divergence * 100).toFixed(1)}%**：${divergence.values.map((item) => `${item.source}=${formatNumber(item.value)} (${item.capturedAt.slice(0, 10)})`).join("；")}。`);
 		}
 	} else lines.push("- 暂无超过 30% 的多源偏差；若只有一个来源，这不代表数据已被交叉验证。");
 	for (const warning of snapshot.warnings) lines.push(`- 数据警告：${warning}`);
@@ -221,8 +239,7 @@ export function generateMarketReport(
 	}
 	if (!decisions.length) lines.push("| — | — | 尚无决策记录 | — |");
 
-	const allBudgets = budgetStatus(store);
-	const fused = allBudgets.filter((pool) => pool.state === "fused");
+	const fused = fusedBudgetSources;
 	lines.push(
 		"",
 		"## 8. 下一步",
@@ -232,7 +249,7 @@ export function generateMarketReport(
 			: evaluation.outcome === "review"
 				? ["1. 优先补齐缺失指标与人工复核项。", "2. 完成风险官方源核验与利润三情景后，再提交决策评审。"]
 				: ["1. 进入决策评审；确认组合资金约束与样品改良证据。", "2. 通过后进入测品，并建立 30/60/90 天里程碑与退出标准。"]),
-		...(fused.length ? [`3. 预算熔断：${fused.map((pool) => pool.source).join("、")}；付费补数前先处理预算。`] : []),
+		...(fused.length ? [`3. 预算熔断：${fused.join("、")}；付费补数前先处理预算。`] : []),
 		"",
 		"---",
 		"",

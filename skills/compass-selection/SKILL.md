@@ -54,7 +54,7 @@ description: Amazon US 中小卖家精铺选品工作流。用于市场 CSV 导�
 
 默认：毛利率 ≥40%；CPC 承受度 ≤0.60 通过，0.60–0.80 复核，>0.80 否决。若已关联市场且未传 CPC，工具会尝试复用关键词快照里的主词 CPC。
 
-需要补数时先调用 `compass_data_route`，不要无节制调用付费源。
+需要补数时先调用 `compass_data_route`，不要无节制调用付费源。历史回放可用 `compass_asin_history` 与 `compass_keyword_metrics`，二者只读取本地快照，不会联网。
 
 ### 3. 产品力与差评
 
@@ -86,7 +86,7 @@ description: Amazon US 中小卖家精铺选品工作流。用于市场 CSV 导�
 3. 调用 `compass_market_report` 生成报告并保存到 `.pi/compass/reports/`。
 4. 经用户确认后再移动候选阶段。
 
-策略可用 `/compass-strategy` 或 `compass_strategy_manage` 编辑。每次保存产生新版本，禁止覆盖历史版本。表达式支持比较、`&&`、`||`、`!`、括号和 `qualify_rank_depth(q)`；不支持任意代码执行。
+策略可用 `/compass-strategy` 或 `compass_strategy_manage` 编辑。每次保存产生新版本，禁止覆盖历史版本。表达式支持比较、`&&`、`||`、`!`、括号和 `qualify_rank_depth(q)`；不支持任意代码执行。`screen` 模式只执行保留阶段名 `market_screen`；自定义策略若没有该阶段或规则为空，会转人工复核。
 
 ## 数据成本与合规红线
 
@@ -102,4 +102,4 @@ description: Amazon US 中小卖家精铺选品工作流。用于市场 CSV 导�
 - `/compass-import <csv>`：交互导入；
 - `/compass-report [market]`：生成并在会话中展示报告；
 - `/compass-strategy`：版本化编辑 YAML；
-- 数据文件：`.pi/compass/store.json`（权限 0600）；原始快照：`.pi/compass/raw/`。
+- 数据文件：`.pi/compass/store.json`（权限 0600）；原始快照：`.pi/compass/raw/`；快照明细：`.pi/compass/snapshots/`。

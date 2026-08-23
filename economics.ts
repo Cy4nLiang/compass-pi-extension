@@ -51,6 +51,7 @@ export function normalizeProfitInput(input: Partial<ProfitInput> & Pick<ProfitIn
 	})) {
 		assertFiniteNonNegative(name, value);
 	}
+	if (normalized.cpc !== undefined) assertFiniteNonNegative("cpc", normalized.cpc);
 	if (normalized.salePrice <= 0) throw new Error("salePrice 必须大于 0");
 	if (normalized.referralRate > 1 || normalized.cvr > 1 || normalized.returnRate > 1) {
 		throw new Error("referralRate、cvr、returnRate 应使用 0–1 小数（例如 15% 写 0.15）");
@@ -93,7 +94,9 @@ export function estimateProfit(input: ProfitInput): ProfitResult {
 
 	const warnings: string[] = [];
 	if (grossMargin < 0.4) warnings.push("毛利率低于默认 Gate 40%");
-	if (cpcRatio === undefined) warnings.push("未提供主词 CPC，CPC 承受度 Gate 保持待复核");
+	if (cpcRatio === undefined) {
+		warnings.push(input.cpc === undefined ? "未提供主词 CPC，CPC 承受度 Gate 保持待复核" : "毛利不足以形成正向盈亏平衡 CPC，CPC 承受度 Gate 保持待复核");
+	}
 	if (cpcRatio !== undefined && cpcRatio > 0.8) warnings.push("CPC 承受度高于 0.80，超过默认硬上限");
 	else if (cpcRatio !== undefined && cpcRatio > 0.6) warnings.push("CPC 承受度位于 0.60–0.80，需人工复核");
 	if (netMarginScenarios.every((scenario) => scenario.netMargin <= 0)) warnings.push("所有 TACOS 情景均为非正净利率");

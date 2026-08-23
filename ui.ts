@@ -108,6 +108,12 @@ export class CompassDashboard {
 		}).length;
 		const budgets = budgetStatus(this.store);
 		const spent = budgets.reduce((sum, pool) => sum + pool.spentCny, 0);
+		const defaultStrategy = this.store.strategies
+			.filter((strategy) => strategy.id === "jingpu-daily10")
+			.sort((a, b) => b.version - a.version)[0];
+		const targetMonthlyUnits = typeof defaultStrategy?.definition.meta.monthly_units_q === "number" && Number.isFinite(defaultStrategy.definition.meta.monthly_units_q)
+			? defaultStrategy.definition.meta.monthly_units_q
+			: 300;
 		const fused = budgets.filter((pool) => pool.state === "fused").length;
 
 		add("");
@@ -125,7 +131,7 @@ export class CompassDashboard {
 			add(` ${row.join("│")}`);
 		}
 		add("");
-		add(` ${th.fg("muted", "默认 Gate：QRD(300)≥20 · 新品占比≥15% · 毛利≥40% · CPC承受度≤0.60 · 风险非红")}`);
+		add(` ${th.fg("muted", `默认 Gate：QRD(${targetMonthlyUnits})≥20 · 新品占比≥15% · 毛利≥40% · CPC承受度≤0.60 · 风险非红`)}`);
 	}
 
 	private renderMarkets(add: (line?: string) => void, width: number): void {

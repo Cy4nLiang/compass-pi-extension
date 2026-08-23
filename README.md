@@ -77,8 +77,9 @@ Agent 会先调用 `compass_tools`，按需动态激活相关工具。
 
 ```text
 .pi/compass/
-├── store.json       # 0600，结构化快照、策略、决策日志
+├── store.json       # 0600，策略、指标、决策日志与快照元数据
 ├── raw/             # 原始 CSV 不可变归档
+├── snapshots/       # 每个快照的 listing/keyword 数据文件（按需回放）
 └── reports/         # Markdown 选品报告
 ```
 
@@ -105,7 +106,7 @@ Extension：
 - 品牌、卖家类型/是否 Amazon 自营、上架日期/月龄、类目；
 - 关键词、搜索量、建议 CPC。
 
-`.xlsx` 尚未直接解析，请先使用工具的官方 CSV 导出。
+`.xlsx` 尚未直接解析，请先使用工具的官方 CSV 导出。自定义策略的 `screen` 模式只执行阶段名为 `market_screen` 的规则；若没有该阶段或规则为空，会转人工复核，不会判绿。报告自定义输出路径必须位于 `.pi/compass/reports/` 且使用 `.md` 扩展名。
 
 ## 测试与类型检查
 
@@ -114,6 +115,10 @@ cd .pi/extensions/compass
 npm test        # 单元 + 集成测试
 npm run check   # tsc --noEmit 类型检查
 ```
+
+## 复查修复兼容性说明
+
+策略 DSL 不再把 `green`、`yellow` 作为内置字面量；风险状态请使用 `pass`、`review`、`red` 或 `unknown`。旧策略若仍引用这两个无效状态，会按未知指标转人工复核，保存前请更新策略版本。
 
 ## 当前边界
 

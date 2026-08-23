@@ -54,13 +54,21 @@ stages:
 
   - stage: risk_screen
     rules:
+      - id: risk_red_veto
+        when: "risk_overall == red"
+        action: veto
+        label: 风险总体为红色，停止投入
       - id: risk_evidence_complete
         when: "risk_overall == pass"
-        action: require
+        action: review_if_fail
         label: 风险清单完整且至少有一个可点击证据链接
+      - id: certification_red
+        when: "cert_status == red"
+        action: veto
+        label: 认证风险为红色
       - id: certification
         when: "cert_status == pass"
-        action: require
+        action: review_if_fail
         label: 认证要求可满足且成本周期已计入
       - id: ip_risk
         when: "ip_risk_level != red"
@@ -70,9 +78,13 @@ stages:
         when: "season_flag != strong"
         action: review_if_fail
         label: 强季节品转人工复核
+      - id: policy_red
+        when: "policy_flag == red"
+        action: veto
+        label: 政策或受限品类为红色
       - id: policy_edge
         when: "policy_flag == clear"
-        action: require
+        action: review_if_fail
         label: 非擦边或受限品类
       - id: logistics
         when: "logistics_risk != red"

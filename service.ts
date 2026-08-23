@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { DEFAULT_BUDGET_POOLS, DEFAULT_STRATEGY_YAML } from "./defaults.ts";
 import { profitMetrics } from "./economics.ts";
 import { calculateMarketMetrics } from "./metrics.ts";
+import { renderMarketReport, type GeneratedReport, type MarketReportData } from "./report.ts";
 import { evaluateStrategy, parseStrategyYaml, slugify, strategyToYaml, type StrategyContext } from "./strategy.ts";
 import type {
 	BudgetPool,
@@ -41,11 +42,18 @@ function stableMarketId(name: string): string {
 	return `mkt_${slugify(name).slice(0, 32)}_${hash}`;
 }
 
-function normalizeLookup(value: string): string {
-	return value.normalize("NFKC").trim().toLocaleLowerCase();
+function normalizeLookup(value: unknown): string {
+	return typeof value === "string" ? value.normalize("NFKC").trim().toLocaleLowerCase() : "";
 }
 
-export function ensureDefaults(store: CompassStore, actor = "compass"): void {
+function requireMarketName(value: string): string {
+	const name = typeof value === "string" ? value.trim() : "";
+	if (!name) throw new Error("市场名称不能为空");
+	return name;
+}
+
+export function ensureDefaults(store: CompassStore, actor = "compass"): boolean {
+	let changed = false;
 	const definition = parseStrategyYaml(DEFAULT_STRATEGY_YAML);
 	const defaultId = slugify(definition.meta.name);
 	if (!store.strategies.some((strategy) => strategy.id === defaultId)) {
@@ -59,12 +67,15 @@ export function ensureDefaults(store: CompassStore, actor = "compass"): void {
 			actor,
 			changeNote: "内置默认策略",
 		});
+		changed = true;
 	}
 	for (const defaultPool of DEFAULT_BUDGET_POOLS) {
 		if (!store.budgetPools.some((pool) => pool.source === defaultPool.source)) {
 			store.budgetPools.push({ ...defaultPool });
+			changed = true;
 		}
 	}
+	return changed;
 }
 
 export function findMarket(store: CompassStore, reference: string): Market {
@@ -90,18 +101,22 @@ export function findCandidate(store: CompassStore, reference: string): Candidate
 	return candidate;
 }
 
-export function latestSnapshot(store: CompassStore, marketId: string): MarketSnapshot {
-	const snapshots = store.snapshots
+export function latestSnapshotIfPresent(store: CompassStore, marketId: string): MarketSnapshot | undefined {
+	return store.snapshots
 		.filter((snapshot) => snapshot.marketId === marketId)
-		.sort((a, b) => b.capturedAt.localeCompare(a.capturedAt));
-	if (!snapshots.length) throw new Error(`市场 ${marketId} 尚无数据快照`);
-	return snapshots[0];
+		.sort((a, b) => b.capturedAt.localeCompare(a.capturedAt))[0];
+}
+
+export function latestSnapshot(store: CompassStore, marketId: string): MarketSnapshot {
+	const snapshot = latestSnapshotIfPresent(store, marketId);
+	if (!snapshot) throw new Error(`市场 ${marketId} 尚无数据快照`);
+	return snapshot;
 }
 
 export function latestStrategy(store: CompassStore, strategyId = "jingpu-daily10"): StrategyVersion {
 	const normalized = normalizeLookup(strategyId);
 	const versions = store.strategies
-		.filter((strategy) => strategy.id === strategyId || normalizeLookup(strategy.name) === normalized || normalizeLookup(strategy.definition.meta.name) === normalized)
+		.filter((strategy) => strategy.id === strategyId || normalizeLookup(strategy.name) === normalized || normalizeLookup(strategy.definition?.meta?.name) === normalized)
 		.sort((a, b) => b.version - a.version);
 	if (!versions.length) throw new Error(`未找到策略：${strategyId}`);
 	return versions[0];
@@ -118,13 +133,14 @@ export function createLead(
 	input: { marketName: string; keywords?: string[]; category?: string; owner?: string; tags?: string[]; actor: string },
 ): { market: Market; candidate: Candidate; created: boolean } {
 	const timestamp = nowIso();
-	const normalizedName = normalizeLookup(input.marketName);
+	const marketName = requireMarketName(input.marketName);
+	const normalizedName = normalizeLookup(marketName);
 	let market = store.markets.find((item) => normalizeLookup(item.name) === normalizedName);
 	const created = !market;
 	if (!market) {
 		market = {
-			id: stableMarketId(input.marketName),
-			name: input.marketName.trim(),
+			id: stableMarketId(marketName),
+			name: marketName,
 			keywords: [...new Set(input.keywords ?? [])],
 			category: input.category,
 			createdAt: timestamp,
@@ -186,13 +202,14 @@ export function importParsedMarket(
 	},
 ): { market: Market; snapshot: MarketSnapshot; candidate: Candidate; created: boolean } {
 	const timestamp = nowIso();
-	const normalizedName = normalizeLookup(input.marketName);
+	const marketName = requireMarketName(input.marketName);
+	const normalizedName = normalizeLookup(marketName);
 	let market = store.markets.find((item) => normalizeLookup(item.name) === normalizedName);
 	const created = !market;
 	if (!market) {
 		market = {
-			id: stableMarketId(input.marketName),
-			name: input.marketName.trim(),
+			id: stableMarketId(marketName),
+			name: marketName,
 			keywords: [],
 			category: dominantCategory(input.parsed),
 			createdAt: timestamp,
@@ -256,6 +273,19 @@ export function importParsedMarket(
 	return { market, snapshot, candidate, created };
 }
 
+export function importMarketAndScreen(
+	store: CompassStore,
+	input: Parameters<typeof importParsedMarket>[1] & { runScreen?: boolean },
+): ReturnType<typeof importParsedMarket> & { screenRun?: StrategyRun } {
+	const imported = importParsedMarket(store, input);
+	const screenRun = input.runScreen === false ? undefined : runStrategy(store, {
+		marketRef: imported.market.id,
+		mode: "screen",
+		actor: input.actor,
+	});
+	return { ...imported, screenRun };
+}
+
 export function recordProfitEstimate(
 	store: CompassStore,
 	input: ProfitInput,
@@ -290,7 +320,7 @@ export function recordProfitEstimate(
 			type: "profit",
 			conclusion: result.grossMargin >= 0.4 ? "毛利 Gate 达标" : "毛利 Gate 未达标",
 			reason: `毛利率 ${(result.grossMargin * 100).toFixed(1)}%，CPC承受度 ${result.cpcRatio?.toFixed(2) ?? "缺数据"}`,
-			snapshotId: latestSnapshot(store, marketId).id,
+			snapshotId: latestSnapshotIfPresent(store, marketId)?.id,
 			actor,
 		});
 	}
@@ -353,7 +383,7 @@ export function recordRisk(
 		type: "risk",
 		conclusion: `风险 ${record.overall}`,
 		reason: input.notes || `认证=${input.certStatus}，IP=${input.ipRiskLevel}，季节=${input.seasonFlag}，政策=${input.policyFlag}，物流=${input.logisticsRisk}`,
-		snapshotId: latestSnapshot(store, market.id).id,
+		snapshotId: latestSnapshotIfPresent(store, market.id)?.id,
 		actor: input.actor,
 	});
 	return record;
@@ -373,8 +403,8 @@ export function recordReviewAnalysis(
 	},
 ): ReviewAnalysis {
 	const market = findMarket(store, input.marketRef);
-	const snapshot = latestSnapshot(store, market.id);
-	const waistFromSnapshot = snapshot.metrics.waist_rating_median?.value;
+	const snapshot = latestSnapshotIfPresent(store, market.id);
+	const waistFromSnapshot = snapshot?.metrics.waist_rating_median?.value;
 	const waistRating = input.waistRating ?? (typeof waistFromSnapshot === "number" ? waistFromSnapshot : undefined);
 	const estimatedRatingGap = input.estimatedRating !== undefined && waistRating !== undefined
 		? Math.round((input.estimatedRating - waistRating) * 100) / 100
@@ -400,7 +430,7 @@ export function recordReviewAnalysis(
 		type: "review",
 		conclusion: "差评主题已留痕",
 		reason: `${input.reviewCount} 条评论，${input.themes.length} 个主题，预估星级差 ${estimatedRatingGap ?? "缺数据"}`,
-		snapshotId: snapshot.id,
+		snapshotId: snapshot?.id,
 		actor: input.actor,
 	});
 	return analysis;
@@ -460,6 +490,12 @@ export function buildStrategyContext(store: CompassStore, marketId: string): { s
 	const review = latestForMarket(store.reviewAnalyses, marketId);
 	Object.assign(metrics, reviewMetrics(review));
 	return { snapshot, context: { metrics, listings: snapshot.listings } };
+}
+
+export function mainCpcForMarket(store: CompassStore, marketId: string): number | undefined {
+	const snapshot = latestSnapshotIfPresent(store, marketId);
+	const value = snapshot?.metrics.main_cpc?.value;
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
 }
 
 export function runStrategy(
@@ -562,6 +598,9 @@ export function moveCandidate(
 	if (previous === input.stage) throw new Error(`候选已处于 ${input.stage} 阶段`);
 	candidate.stage = input.stage;
 	candidate.updatedAt = nowIso();
+	const latestRun = candidate.latestStrategyRunId
+		? store.strategyRuns.find((run) => run.id === candidate.latestStrategyRunId)
+		: undefined;
 	appendDecision(store, {
 		candidateId: candidate.id,
 		marketId: candidate.marketId,
@@ -571,9 +610,8 @@ export function moveCandidate(
 		snapshotId: store.snapshots
 			.filter((snapshot) => snapshot.marketId === candidate.marketId)
 			.sort((a, b) => b.capturedAt.localeCompare(a.capturedAt))[0]?.id,
-		strategyId: candidate.latestStrategyRunId
-			? store.strategyRuns.find((run) => run.id === candidate.latestStrategyRunId)?.strategyId
-			: undefined,
+		strategyId: latestRun?.strategyId,
+		strategyVersion: latestRun?.strategyVersion,
 		actor: input.actor,
 	});
 	return candidate;
@@ -633,14 +671,28 @@ export function recordCost(
 
 export function configureBudget(
 	store: CompassStore,
-	input: { source: string; tier: "A" | "B" | "C"; monthlyLimitCny: number; enabled: boolean; note?: string },
+	input: { source: string; tier?: "A" | "B" | "C"; monthlyLimitCny?: number; enabled?: boolean; note?: string },
 ): BudgetPool {
-	if (!Number.isFinite(input.monthlyLimitCny) || input.monthlyLimitCny < 0) throw new Error("monthlyLimitCny 必须为非负数字");
+	if (input.monthlyLimitCny !== undefined && (!Number.isFinite(input.monthlyLimitCny) || input.monthlyLimitCny < 0)) {
+		throw new Error("monthlyLimitCny 必须为非负数字");
+	}
 	let pool = store.budgetPools.find((item) => item.source === input.source);
 	if (!pool) {
-		pool = { ...input };
+		if (!input.tier || input.monthlyLimitCny === undefined) throw new Error("新预算池需要 tier 与 monthlyLimitCny");
+		pool = {
+			source: input.source,
+			tier: input.tier,
+			monthlyLimitCny: input.monthlyLimitCny,
+			enabled: input.enabled ?? true,
+			note: input.note,
+		};
 		store.budgetPools.push(pool);
-	} else Object.assign(pool, input);
+		return pool;
+	}
+	if (input.tier !== undefined) pool.tier = input.tier;
+	if (input.monthlyLimitCny !== undefined) pool.monthlyLimitCny = input.monthlyLimitCny;
+	if (input.enabled !== undefined) pool.enabled = input.enabled;
+	if (input.note !== undefined) pool.note = input.note;
 	return pool;
 }
 
@@ -747,5 +799,41 @@ export function listStrategies(store: CompassStore): StrategyVersion[] {
 		const existing = latest.get(strategy.id);
 		if (!existing || existing.version < strategy.version) latest.set(strategy.id, strategy);
 	}
-	return [...latest.values()].sort((a, b) => a.name.localeCompare(b.name));
+	return [...latest.values()].sort((a, b) => String(a.name).localeCompare(String(b.name)));
+}
+
+export function generateMarketReport(
+	store: CompassStore,
+	marketRef: string,
+	strategyRef = "jingpu-daily10",
+): GeneratedReport {
+	const market = findMarket(store, marketRef);
+	const snapshot = latestSnapshot(store, market.id);
+	const strategy = latestStrategy(store, strategyRef);
+	const { context } = buildStrategyContext(store, market.id);
+	context.targetMonthlyUnits = Number(strategy.definition.meta.monthly_units_q ?? 300);
+	const evaluation = evaluateStrategy(strategy.definition, context, "full");
+	const candidate = store.candidates.find((item) => item.marketId === market.id);
+	const decisions = store.decisionLog.filter((item) => item.marketId === market.id).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+	const risk = store.riskRecords.filter((item) => item.marketId === market.id).sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+	const review = store.reviewAnalyses.filter((item) => item.marketId === market.id).sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+	const profit = store.profitEstimates.filter((item) => item.marketId === market.id).sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+	const attributedCostCny = store.costEvents.filter((item) => item.marketId === market.id).reduce((sum, item) => sum + item.amountCny, 0);
+	const fusedBudgetSources = budgetStatus(store).filter((pool) => pool.state === "fused").map((pool) => pool.source);
+	const data: MarketReportData = {
+		market,
+		snapshot,
+		strategy,
+		metrics: context.metrics,
+		evaluation,
+		candidate,
+		risk,
+		review,
+		profit,
+		decisions,
+		divergences: metricDivergences(store, market.id),
+		attributedCostCny,
+		fusedBudgetSources,
+	};
+	return renderMarketReport(data);
 }

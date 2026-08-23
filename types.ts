@@ -82,6 +82,7 @@ export interface MarketSnapshot {
 	fileName?: string;
 	archivedFile?: string;
 	fileHash?: string;
+	dataFile?: string;
 	rowCount: number;
 	listings: ListingRecord[];
 	keywords: KeywordRecord[];

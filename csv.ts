@@ -3,7 +3,7 @@ import type { KeywordRecord, ListingRecord, ParsedMarketCsv } from "./types.ts";
 const FIELD_ALIASES: Record<string, string[]> = {
 	asin: ["asin", "商品asin", "父asin", "parentasin", "childasin", "商品编号"],
 	title: ["title", "producttitle", "商品标题", "标题", "产品名称", "商品名称"],
-	rank: ["rank", "ranking", "序号", "排名", "自然排名", "bsr", "bsr排名", "类目排名"],
+	rank: ["rank", "ranking", "排名", "自然排名", "bsr", "bsr排名", "类目排名", "序号"],
 	price: ["price", "售价", "价格", "当前价格", "buybox价格", "buyboxprice", "商品价格"],
 	rating: ["rating", "ratings", "评分", "星级", "reviewrating", "平均评分"],
 	reviewCount: ["reviewcount", "reviews", "ratingscount", "评论数", "评价数", "评分数", "review"],
@@ -103,7 +103,7 @@ export function detectDelimiter(text: string): string {
 		.sort((a, b) => b.count - a.count)[0]?.delimiter ?? ",";
 }
 
-export function parseDelimited(text: string, delimiter = detectDelimiter(text)): string[][] {
+function parseDelimitedInternal(text: string, delimiter: string): { rows: string[][]; unclosedQuote: boolean } {
 	const rows: string[][] = [];
 	let row: string[] = [];
 	let field = "";
@@ -143,7 +143,11 @@ export function parseDelimited(text: string, delimiter = detectDelimiter(text)):
 
 	row.push(field.trim());
 	if (row.some((cell) => cell.length > 0)) rows.push(row);
-	return rows;
+	return { rows, unclosedQuote: quoted };
+}
+
+export function parseDelimited(text: string, delimiter = detectDelimiter(text)): string[][] {
+	return parseDelimitedInternal(text, delimiter).rows;
 }
 
 export function parseNumeric(value: string | undefined): number | undefined {
@@ -151,8 +155,11 @@ export function parseNumeric(value: string | undefined): number | undefined {
 	let normalized = value.normalize("NFKC").trim();
 	if (!normalized || /^(?:-|—|n\/?a|null|无)$/i.test(normalized)) return undefined;
 
+	const isPercent = normalized.includes("%");
 	let multiplier = 1;
-	if (/万(?:\+)?$/u.test(normalized)) multiplier = 10_000;
+	if (/千万(?:\+)?$/u.test(normalized)) multiplier = 10_000_000;
+	else if (/亿(?:\+)?$/u.test(normalized)) multiplier = 100_000_000;
+	else if (/万(?:\+)?$/u.test(normalized)) multiplier = 10_000;
 	else if (/千(?:\+)?$/u.test(normalized)) multiplier = 1_000;
 	else if (/k(?:\+)?$/i.test(normalized)) multiplier = 1_000;
 	else if (/m(?:\+)?$/i.test(normalized)) multiplier = 1_000_000;
@@ -161,10 +168,11 @@ export function parseNumeric(value: string | undefined): number | undefined {
 		.replace(/[,，\s]/gu, "")
 		.replace(/(?:USD|US\$|RMB|CNY)/gi, "")
 		.replace(/[$¥￥€£]/gu, "")
-		.replace(/[万千kKmM+]/gu, "")
+		.replace(/[亿万千kKmM+]/gu, "")
 		.replace(/[^0-9.eE+\-]/g, "");
 	const parsed = Number(normalized);
-	return Number.isFinite(parsed) ? parsed * multiplier : undefined;
+	if (!Number.isFinite(parsed) || parsed < 0) return undefined;
+	return parsed * multiplier / (isPercent ? 100 : 1);
 }
 
 function parseBoolean(value: string | undefined): boolean | undefined {
@@ -214,9 +222,14 @@ function detectSource(headers: string[], requested?: string): string {
 function mapColumns(headers: string[]): Record<string, number> {
 	const columns: Record<string, number> = {};
 	const normalizedHeaders = headers.map(normalizeHeader);
-	for (const [field, aliases] of Object.entries(NORMALIZED_ALIASES)) {
-		const index = normalizedHeaders.findIndex((header) => aliases.has(header));
-		if (index >= 0) columns[field] = index;
+	for (const [field, aliases] of Object.entries(FIELD_ALIASES)) {
+		for (const alias of aliases) {
+			const index = normalizedHeaders.indexOf(normalizeHeader(alias));
+			if (index >= 0) {
+				columns[field] = index;
+				break;
+			}
+		}
 	}
 	return columns;
 }
@@ -231,7 +244,8 @@ export function parseMarketCsv(
 	options: { source?: string; capturedAt?: string } = {},
 ): ParsedMarketCsv {
 	const delimiter = detectDelimiter(text);
-	const rows = parseDelimited(text.replace(/^\uFEFF/, ""), delimiter);
+	const parsedDelimited = parseDelimitedInternal(text.replace(/^\uFEFF/, ""), delimiter);
+	const rows = parsedDelimited.rows;
 	if (rows.length < 2) throw new Error("CSV 至少需要表头和一行数据");
 
 	const headers = rows[0].map((header) => header.trim());
@@ -241,6 +255,7 @@ export function parseMarketCsv(
 	const listings: ListingRecord[] = [];
 	const keywords: KeywordRecord[] = [];
 	const warnings: string[] = [];
+	if (parsedDelimited.unclosedQuote) warnings.push("检测到未闭合的 CSV 引号；文件末尾内容可能被合并为同一行，请检查原文件");
 
 	for (let rowIndex = 1; rowIndex < rows.length; rowIndex++) {
 		const row = rows[rowIndex];
@@ -298,10 +313,17 @@ export function parseMarketCsv(
 	if (listings.length > 0 && !Object.hasOwn(columns, "brand")) {
 		warnings.push("未识别到品牌列，品牌集中度指标不可计算");
 	}
+	if (listings.length > 0 && !Object.hasOwn(columns, "rating")) {
+		warnings.push("未识别到评分列，低分高销数与腰部星级指标不可计算");
+	}
 	if (listings.length > 0 && !Object.hasOwn(columns, "launchDate") && !Object.hasOwn(columns, "monthsOnline")) {
 		warnings.push("未识别到上架日期/月龄，新品占比不可计算");
 	}
 	if (listings.length > 100) warnings.push(`导入 ${listings.length} 条 listing；市场指标按排名前100计算，其余行仍保留在快照中`);
+	const rankHeaders = headers.map(normalizeHeader).filter((header) => NORMALIZED_ALIASES.rank.has(header));
+	if (rankHeaders.includes(normalizeHeader("序号")) && rankHeaders.some((header) => header !== normalizeHeader("序号"))) {
+		warnings.push("同时识别到“序号”和正式排名列，已优先使用正式排名列");
+	}
 
 	const mappedFields = Object.keys(columns);
 	return {

@@ -35,3 +35,10 @@ test("percentage inputs above one are rejected", () => {
 		/0–1/,
 	);
 });
+
+test("negative CPC is rejected before it can pass the Gate", () => {
+	assert.throws(
+		() => normalizeProfitInput({ salePrice: 20, purchaseCost: 4, fbaFee: 5, cpc: -1 }),
+		/cpc.*非负/,
+	);
+});

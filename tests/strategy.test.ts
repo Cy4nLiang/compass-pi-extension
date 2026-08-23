@@ -60,4 +60,44 @@ test("unsafe or unsupported expression syntax is rejected", () => {
 		() => parseStrategyYaml(DEFAULT_STRATEGY_YAML.replace("gross_margin >= 0.40", "process.exit(1)")),
 		/不支持的策略函数/,
 	);
+	assert.throws(
+		() => parseStrategyYaml(DEFAULT_STRATEGY_YAML.replace('when: "gross_margin >= 0.40"', `when: 'cr3 > "abc"'`)),
+		/两侧必须为数字/,
+	);
+	assert.throws(
+		() => parseStrategyYaml(DEFAULT_STRATEGY_YAML.replace("display_name: 精铺 · 日均10单", "display_name: 2024")),
+		/display_name 必须是字符串/,
+	);
+	const emptyDisplay = parseStrategyYaml(DEFAULT_STRATEGY_YAML.replace("display_name: 精铺 · 日均10单", 'display_name: ""'));
+	assert.equal(emptyDisplay.meta.display_name, undefined);
+});
+
+test("strategy QRD function uses the same Top100 scope as the metric", () => {
+	const listings = Array.from({ length: 150 }, (_, index) => ({
+		rank: index + 1,
+		monthlySales: index < 15 || (index >= 100 && index < 110) ? 300 : 0,
+		sourceRow: index + 2,
+	}));
+	const metrics = calculateMarketMetrics({ listings, keywords: [], source: "generic_csv", capturedAt: "2026-08-22T00:00:00.000Z", targetMonthlyUnits: 300 });
+	const result = evaluateExpression("qualify_rank_depth(300)", { listings, metrics });
+	assert.equal(metrics.qualify_rank_depth.value, 15);
+	assert.equal(result.value, 15);
+	assert.equal(evaluateExpression("qualify_rank_depth(300) >= 20", { listings, metrics }).value, false);
+});
+
+test("screen with no market_screen rules is review rather than pass", () => {
+	const strategy = parseStrategyYaml(`
+meta:
+  name: custom
+  display_name: 自定义
+stages:
+  - stage: screening
+    rules: []
+scoring:
+  weights:
+    demand: 1
+`);
+	const result = evaluateStrategy(strategy, { metrics: {}, listings: [] }, "screen");
+	assert.equal(result.outcome, "review");
+	assert.equal(result.rules[0].status, "missing");
 });

@@ -18,6 +18,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
+function rankedTop100(listings: ListingRecord[]): ListingRecord[] {
+	return [...listings].sort((a, b) => a.rank - b.rank).slice(0, 100);
+}
+
 export function slugify(value: string): string {
 	const slug = value
 		.normalize("NFKC")
@@ -38,6 +42,9 @@ export function parseStrategyYaml(yaml: string): StrategyDefinition {
 	if (!isRecord(raw)) throw new Error("策略 YAML 顶层必须是对象");
 	if (!isRecord(raw.meta) || typeof raw.meta.name !== "string" || !raw.meta.name.trim()) {
 		throw new Error("策略 meta.name 必填");
+	}
+	if (raw.meta.display_name !== undefined && typeof raw.meta.display_name !== "string") {
+		throw new Error("策略 meta.display_name 必须是字符串");
 	}
 	if (!Array.isArray(raw.stages) || raw.stages.length === 0) throw new Error("策略 stages 至少需要一个阶段");
 	if (!isRecord(raw.scoring) || !isRecord(raw.scoring.weights)) throw new Error("策略 scoring.weights 必填");
@@ -78,8 +85,14 @@ export function parseStrategyYaml(yaml: string): StrategyDefinition {
 		throw new Error("scoring.weights 合计必须大于 0");
 	}
 
+	const meta: StrategyDefinition["meta"] = { ...raw.meta, name: raw.meta.name.trim() };
+	if (typeof meta.display_name === "string") {
+		meta.display_name = meta.display_name.trim() || undefined;
+		if (meta.display_name === undefined) delete meta.display_name;
+	}
+
 	return {
-		meta: { ...raw.meta, name: raw.meta.name.trim() },
+		meta,
 		stages,
 		scoring: {
 			weights,
@@ -102,6 +115,7 @@ interface Token {
 function tokenize(expression: string): Token[] {
 	const tokens: Token[] = [];
 	let index = 0;
+	let nesting = 0;
 	while (index < expression.length) {
 		const char = expression[index];
 		if (/\s/.test(char)) {
@@ -119,10 +133,13 @@ function tokenize(expression: string): Token[] {
 			continue;
 		}
 		if (char === "(") {
+			nesting++;
+			if (nesting > 100) throw new Error("表达式嵌套层级不能超过 100");
 			tokens.push({ type: "lparen", value: char, position: index++ });
 			continue;
 		}
 		if (char === ")") {
+			nesting = Math.max(0, nesting - 1);
 			tokens.push({ type: "rparen", value: char, position: index++ });
 			continue;
 		}
@@ -162,6 +179,7 @@ function tokenize(expression: string): Token[] {
 		}
 		throw new Error(`表达式第 ${index + 1} 位包含不支持的字符 “${char}”`);
 	}
+	if (nesting > 0) throw new Error("表达式括号未闭合");
 	tokens.push({ type: "eof", value: "", position: expression.length });
 	return tokens;
 }
@@ -186,8 +204,6 @@ const LITERALS: Record<string, unknown> = {
 	clear: "clear",
 	review: "review",
 	unknown: "unknown",
-	green: "green",
-	yellow: "yellow",
 };
 
 class ExpressionParser {
@@ -260,6 +276,11 @@ class ExpressionParser {
 		this.index++;
 		const right = this.parseUnary();
 		const references = mergeReferences(left, right);
+		const isRelational = [">", ">=", "<", "<="].includes(operator.value);
+		if (isRelational) {
+			if (!left.missing && typeof left.value !== "number") throw new Error(`操作符 ${operator.value} 两侧必须为数字`);
+			if (!right.missing && typeof right.value !== "number") throw new Error(`操作符 ${operator.value} 两侧必须为数字`);
+		}
 		if (left.missing || right.missing || left.value === null || right.value === null) {
 			return { value: undefined, missing: true, references };
 		}
@@ -272,8 +293,8 @@ class ExpressionParser {
 				value = left.value !== right.value;
 				break;
 			default: {
-				const lhs = Number(left.value);
-				const rhs = Number(right.value);
+				const lhs = left.value as number;
+				const rhs = right.value as number;
 				if (!Number.isFinite(lhs) || !Number.isFinite(rhs)) {
 					throw new Error(`操作符 ${operator.value} 两侧必须为数字`);
 				}
@@ -339,9 +360,10 @@ class ExpressionParser {
 			if (args.length !== 1) throw new Error("qualify_rank_depth(q) 需要一个参数");
 			const threshold = Number(args[0].value);
 			if (!Number.isFinite(threshold) || threshold < 0) throw new Error("qualify_rank_depth(q) 的 q 必须是非负数字");
-			const hasSales = this.context.listings.some((listing) => listing.monthlySales !== undefined);
+			const top = rankedTop100(this.context.listings);
+			const hasSales = top.some((listing) => listing.monthlySales !== undefined);
 			return {
-				value: hasSales ? qualifyRankDepth(this.context.listings, threshold) : undefined,
+				value: hasSales ? qualifyRankDepth(top, threshold) : undefined,
 				missing: !hasSales,
 				references,
 			};
@@ -440,7 +462,7 @@ export function evaluateStrategy(
 				const evaluation = evaluateExpression(rule.when, context);
 				const references = [...evaluation.references];
 				const missing = references.filter((reference) => {
-					if (reference === "qualify_rank_depth") return !context.listings.some((listing) => listing.monthlySales !== undefined);
+					if (reference === "qualify_rank_depth") return !rankedTop100(context.listings).some((listing) => listing.monthlySales !== undefined);
 					return !context.metrics[reference] || context.metrics[reference].value === null;
 				});
 				for (const name of missing) missingMetrics.add(name);
@@ -483,6 +505,22 @@ export function evaluateStrategy(
 				});
 			}
 		}
+	}
+
+	if (rules.length === 0) {
+		const screenMode = mode === "screen";
+		rules.push({
+			id: "screen_rules_present",
+			stage: screenMode ? "market_screen" : "strategy",
+			action: "require",
+			label: screenMode ? "市场粗筛规则集不能为空" : "策略规则集不能为空",
+			when: screenMode ? "market_screen.rules" : "strategy.rules",
+			condition: null,
+			status: "missing",
+			references: [],
+			evidence: {},
+			message: screenMode ? "策略没有可执行的 market_screen 规则，转人工复核" : "策略没有可执行规则，转人工复核",
+		});
 	}
 
 	const outcome = rules.some((rule) => rule.status === "veto" || rule.status === "fail")

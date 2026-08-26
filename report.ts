@@ -2,10 +2,12 @@ import type {
 	Candidate,
 	DecisionLog,
 	GateOutcome,
+	Lesson,
 	Market,
 	MarketSnapshot,
 	MetricEvidence,
 	MetricMap,
+	OutcomeCheck,
 	ProfitEstimate,
 	ReviewAnalysis,
 	RiskRecord,
@@ -146,13 +148,15 @@ export interface MarketReportData {
 	review?: ReviewAnalysis;
 	profit?: ProfitEstimate;
 	decisions: DecisionLog[];
+	outcomeChecks: OutcomeCheck[];
+	lessons: Lesson[];
 	divergences: Array<{ metric: string; values: Array<{ source: string; value: number; capturedAt: string }>; divergence: number }>;
 	attributedCostCny: number;
 	fusedBudgetSources: string[];
 }
 
 export function renderMarketReport(data: MarketReportData): GeneratedReport {
-	const { market, snapshot, strategy, metrics, evaluation, candidate, risk, review, profit, decisions, divergences, attributedCostCny, fusedBudgetSources } = data;
+	const { market, snapshot, strategy, metrics, evaluation, candidate, risk, review, profit, decisions, outcomeChecks, lessons, divergences, attributedCostCny, fusedBudgetSources } = data;
 	const ageDays = Math.max(0, Math.floor((Date.now() - Date.parse(snapshot.capturedAt)) / 86_400_000));
 	const freshness = ageDays <= 7 ? "深研新鲜" : ageDays <= 30 ? "仅适合粗筛" : "已过期，建议补数";
 	const targetMonthlyUnits = typeof strategy.definition.meta.monthly_units_q === "number" && Number.isFinite(strategy.definition.meta.monthly_units_q)
@@ -163,7 +167,7 @@ export function renderMarketReport(data: MarketReportData): GeneratedReport {
 	const lines: string[] = [
 		`# 罗盘选品报告｜${market.name}`,
 		"",
-		`> **结论：${outcomeLabel(evaluation.outcome)}** · 综合分 **${evaluation.score.toFixed(1)} / 100** · 候选阶段 **${candidate?.stage ?? "未建卡"}**`,
+		`> **结论：${outcomeLabel(evaluation.outcome)}** · 综合分 **${evaluation.score.toFixed(1)} / 100** · 候选阶段 **${candidate?.stage ?? "未建卡"}** · 最终决策 **${candidate?.decisionStatus ?? "未决策"}**`,
 		">",
 		`> 数据快照：\`${snapshot.id}\` · ${snapshot.source} · ${snapshot.capturedAt.slice(0, 10)}（${ageDays} 天前，${freshness}）`,
 		`> 策略：\`${strategy.id}@v${strategy.version}\` · 报告生成：${new Date().toISOString()}`,
@@ -172,6 +176,7 @@ export function renderMarketReport(data: MarketReportData): GeneratedReport {
 		"",
 		`- **Gate：** ${outcomeLabel(evaluation.outcome)}；${evaluation.rules.filter((rule) => rule.status === "veto" || rule.status === "fail").length} 个硬失败，${evaluation.rules.filter((rule) => ["review", "missing", "error"].includes(rule.status)).length} 个复核项。`,
 		`- **Score：** 需求 ${evaluation.dimensionScores.demand} / 竞争 ${evaluation.dimensionScores.competition} / 单位经济 ${evaluation.dimensionScores.unit_economics} / 产品力 ${evaluation.dimensionScores.product} / 风险 ${evaluation.dimensionScores.risk}（单市场报告使用有界基准；批量扫描按同批候选分位数归一化）。`,
+		`- **状态原因：** 当前阶段：${escapeCell(candidate?.stageReason ?? "—")}；Gate：${escapeCell(candidate?.gateReason ?? "—")}；最终决策：${escapeCell(candidate?.decisionReason ?? "—")}。`,
 		`- **Evidence：** 每个指标保留来源、采集时间与置信度；本市场累计数据成本 **¥${costs.toFixed(2)}**。`,
 		"",
 		"| 阶段 | 规则 | 结果 | 证据表达式 |",
@@ -251,9 +256,25 @@ export function renderMarketReport(data: MarketReportData): GeneratedReport {
 				: ["1. 进入决策评审；确认组合资金约束与样品改良证据。", "2. 通过后进入测品，并建立 30/60/90 天里程碑与退出标准。"]),
 		...(fused.length ? [`3. 预算熔断：${fused.join("、")}；付费补数前先处理预算。`] : []),
 		"",
+		"## 9. 历史与复盘",
+		"",
+	);
+	if (outcomeChecks.length) {
+		lines.push("| 时间 | OutcomeCheck | T0 决策 | verdict | 对照理由 |", "|---|---|---|---|---|");
+		for (const check of outcomeChecks.slice(0, 30)) {
+			lines.push(`| ${check.createdAt.slice(0, 10)} | \`${check.id}\` | ${check.decisionStatus ?? "策略结论"} · \`${check.baselineSnapshotId}\` | **${check.verdict}** | ${escapeCell(check.verdictReason)} |`);
+		}
+	} else lines.push("- 尚无 OutcomeCheck；go 品应录入实绩，no_go/waitlist 应在新快照到场后做对照。");
+	lines.push("");
+	if (lessons.length) {
+		lines.push("### 命中的 active lessons", "");
+		for (const lesson of lessons.slice(0, 20)) lines.push(`- **${lesson.id}｜${escapeCell(lesson.title)}**：${escapeCell(lesson.detail)}（evidence: ${lesson.evidence.join("、")}）`);
+	} else lines.push("- 当前没有命中该市场的 active lesson。");
+	lines.push(
+		"",
 		"---",
 		"",
-		"*口径：销量为第三方估算时不代表 Amazon 官方真实销量。风险核查仅作经营初筛；认证与知识产权高风险项应交由专业机构复核。*",
+		"*口径：销量为第三方估算时不代表 Amazon 官方真实销量。风险核查仅作经营初筛；认证与知识产权高风险项应交由专业机构复核。复盘结论不构成收益承诺。*",
 	);
 
 	return {

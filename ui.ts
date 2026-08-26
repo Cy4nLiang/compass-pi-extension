@@ -1,9 +1,16 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
-import { budgetStatus } from "./service.ts";
-import { CANDIDATE_STAGES, type CompassStore } from "./types.ts";
+import { budgetStatus, listRetroDue, listWorkbenchTodos } from "./service.ts";
+import { CANDIDATE_STAGES, TODO_PRIORITIES, type CompassStore, type TodoPriority, type WorkbenchTodo } from "./types.ts";
 
-const TAB_NAMES = ["总览", "市场", "候选池", "预算"] as const;
+const TAB_NAMES = ["总览", "待办", "市场", "候选池", "预算", "复盘"] as const;
+const TODO_GROUP_LABELS: Record<TodoPriority, string> = {
+	1: "P1 紧急阻塞",
+	2: "P2 漏斗阻塞",
+	3: "P3 补数据/补证据",
+	4: "P4 例行到期",
+	5: "P5 保鲜/优化",
+};
 const STAGE_LABELS: Record<string, string> = {
 	lead: "线索",
 	screen: "粗筛",
@@ -29,13 +36,23 @@ export function compactDashboardSummary(store: CompassStore): string {
 	const review = store.candidates.filter((candidate) => candidate.gateOutcome === "review").length;
 	const rejected = store.candidates.filter((candidate) => candidate.gateOutcome === "reject").length;
 	const spent = budgetStatus(store).reduce((sum, pool) => sum + pool.spentCny, 0);
-	return `${store.markets.length} 市场 · ${active} 活跃候选 · ${review} 待复核 · ${rejected} 否决 · 本月 ¥${spent.toFixed(0)}`;
+	// listWorkbenchTodos 内部会再算一次 budgetStatus/listRetroDue；<10³ 量级毫秒级双算，
+	// 换取待办口径与待办页完全一致（Task 3 review F-3 备忘：接受双算并注明）
+	const todos = listWorkbenchTodos(store);
+	const due = todos.filter((todo) => todo.kind === "retro_due").length;
+	const urgent = todos.filter((todo) => todo.priority === 1).length;
+	const conclusive = store.outcomeChecks.filter((check) => check.verdict !== "inconclusive");
+	const validationRate = conclusive.length ? `${(conclusive.filter((check) => check.verdict === "validated").length / conclusive.length * 100).toFixed(0)}%` : "—";
+	return `${store.markets.length} 市场 · ${active} 活跃候选 · ${review} 待复核 · ${rejected} 否决 · ${due} 待复盘 · ${todos.length} 待办${urgent ? `（P1 ${urgent}）` : ""} · 验证率 ${validationRate} · 本月 ¥${spent.toFixed(0)}`;
 }
 
 export class CompassDashboard {
 	private readonly store: CompassStore;
 	private readonly theme: Theme;
 	private readonly onClose: () => void;
+	// 打开工作台时推导一次，总览/待办/复盘页共用同一时刻的快照，避免跨日界切 tab 时页间计数漂移
+	private readonly todos: WorkbenchTodo[];
+	private readonly retroDue: ReturnType<typeof listRetroDue>;
 	private tab = 0;
 	private cachedWidth?: number;
 	private cachedLines?: string[];
@@ -44,6 +61,8 @@ export class CompassDashboard {
 		this.store = store;
 		this.theme = theme;
 		this.onClose = onClose;
+		this.todos = listWorkbenchTodos(store);
+		this.retroDue = listRetroDue(store);
 	}
 
 	handleInput(data: string): void {
@@ -74,9 +93,11 @@ export class CompassDashboard {
 		add(th.fg("borderMuted", "─".repeat(renderWidth)));
 
 		if (this.tab === 0) this.renderOverview(add, renderWidth);
-		else if (this.tab === 1) this.renderMarkets(add, renderWidth);
-		else if (this.tab === 2) this.renderPool(add, renderWidth);
-		else this.renderBudget(add, renderWidth);
+		else if (this.tab === 1) this.renderTodos(add);
+		else if (this.tab === 2) this.renderMarkets(add, renderWidth);
+		else if (this.tab === 3) this.renderPool(add, renderWidth);
+		else if (this.tab === 4) this.renderBudget(add, renderWidth);
+		else this.renderRetro(add);
 
 		add("");
 		for (const helpLine of wrapTextWithAnsi(th.fg("dim", " ←→ / Tab 切换 · Esc 关闭 · /compass-help 手册 · /compass-import 导入 · /compass-report 报告"), renderWidth)) {
@@ -131,7 +152,39 @@ export class CompassDashboard {
 			add(` ${row.join("│")}`);
 		}
 		add("");
+		const todoCounts = TODO_PRIORITIES.map((priority) => this.todos.filter((todo) => todo.priority === priority).length);
+		const todoParts = todoCounts.map((count, index) => {
+			const priority = index + 1;
+			const color = count === 0 ? "dim" : priority === 1 ? "error" : priority === 2 ? "warning" : "text";
+			return th.fg(color, `P${priority} ${count}`);
+		});
+		add(` ${th.fg("accent", th.bold("待办"))} ${this.todos.length ? `${th.fg("text", String(this.todos.length))} 项：${todoParts.join(" · ")}` : th.fg("success", "0 项")}`);
+		add("");
 		add(` ${th.fg("muted", `默认 Gate：QRD(${targetMonthlyUnits})≥20 · 新品占比≥15% · 毛利≥40% · CPC承受度≤0.60 · 风险非红`)}`);
+	}
+
+	private renderTodos(add: (line?: string) => void): void {
+		const th = this.theme;
+		add("");
+		add(` ${th.fg("accent", th.bold(`待办清单 · ${this.todos.length}`))}  ${th.fg("muted", "自动推导，事项解决后自动消失；逾期超 30 天升 1 级")}`);
+		if (!this.todos.length) {
+			add(` ${th.fg("success", "当前没有需要人工处理的事项")}`);
+			return;
+		}
+		for (const priority of TODO_PRIORITIES) {
+			const group = this.todos.filter((todo) => todo.priority === priority);
+			if (!group.length) continue;
+			const color = priority === 1 ? "error" : priority === 2 ? "warning" : "accent";
+			add("");
+			add(` ${th.fg(color, th.bold(`${TODO_GROUP_LABELS[priority]} (${group.length})`))}`);
+			// spec §4.3：每组最多 6 物理行 = 3 条 × 每条 2 行（主行 + 建议动作行）
+			for (const todo of group.slice(0, 3)) {
+				const name = todo.marketName ?? todo.source ?? "—";
+				add(`   ${th.fg(color, "●")} ${name} · ${todo.title} · ${th.fg("muted", todo.reason)}${todo.overdueDays ? th.fg("dim", ` · 逾期${todo.overdueDays}天`) : ""}`);
+				add(`     ${th.fg("dim", `→ ${todo.suggestedAction}`)}`);
+			}
+			if (group.length > 3) add(`   ${th.fg("dim", `… +${group.length - 3}；compass_todo priority=${priority} 查看全部`)}`);
+		}
 	}
 
 	private renderMarkets(add: (line?: string) => void, width: number): void {
@@ -167,10 +220,34 @@ export class CompassDashboard {
 			for (const candidate of candidates.slice(0, 4)) {
 				const market = this.store.markets.find((item) => item.id === candidate.marketId);
 				const badge = candidate.gateOutcome === "pass" ? th.fg("success", "✓") : candidate.gateOutcome === "reject" ? th.fg("error", "×") : candidate.gateOutcome === "review" ? th.fg("warning", "?") : th.fg("dim", "·");
-				add(`   ${badge} ${market?.name ?? candidate.marketId}${candidate.score === undefined ? "" : th.fg("dim", ` · ${candidate.score.toFixed(1)}`)}`);
+				const decision = candidate.decisionStatus ? th.fg(candidate.decisionStatus === "go" ? "success" : candidate.decisionStatus === "no_go" ? "error" : "warning", ` · ${candidate.decisionStatus}`) : "";
+				add(`   ${badge} ${market?.name ?? candidate.marketId}${candidate.score === undefined ? "" : th.fg("dim", ` · ${candidate.score.toFixed(1)}`)}${decision}`);
 			}
 			if (candidates.length > 4) add(`   ${th.fg("dim", `… +${candidates.length - 4}`)}`);
 		}
+	}
+
+	private renderRetro(add: (line?: string) => void): void {
+		const th = this.theme;
+		const due = this.retroDue;
+		const checks = [...this.store.outcomeChecks].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+		const activeLessons = this.store.lessons.filter((lesson) => lesson.status === "active");
+		add("");
+		add(` ${th.fg("accent", th.bold(`复盘闭环 · ${due.length} 到期`))}`);
+		add(` OutcomeCheck ${checks.length}  ·  ${th.fg("success", `validated ${checks.filter((check) => check.verdict === "validated").length}`)}  /  ${th.fg("warning", `challenged ${checks.filter((check) => check.verdict === "challenged").length}`)}  /  ${th.fg("muted", `inconclusive ${checks.filter((check) => check.verdict === "inconclusive").length}`)}  ·  active lessons ${activeLessons.length}`);
+		add("");
+		add(` ${th.fg("accent", th.bold("到期队列"))}`);
+		if (!due.length) add(` ${th.fg("success", "当前没有逾期复盘对象")}`);
+		for (const item of due.slice(0, 10)) add(` ${th.fg(item.overdueDays > 30 ? "error" : "warning", `${item.group} · ${item.marketName} · +${item.overdueDays}d`)}  ${th.fg("dim", item.suggestedAction)}`);
+		if (due.length > 10) add(` ${th.fg("dim", `… +${due.length - 10}；/compass-retro 查看全部`)}`);
+		add("");
+		add(` ${th.fg("accent", th.bold("最近对照"))}`);
+		for (const check of checks.slice(0, 6)) {
+			const market = this.store.markets.find((item) => item.id === check.marketId);
+			const color = check.verdict === "validated" ? "success" : check.verdict === "challenged" ? "warning" : "muted";
+			add(` ${th.fg(color, check.verdict)} · ${market?.name ?? check.marketId} · ${check.id} · ${check.createdAt.slice(0, 10)}`);
+		}
+		if (!checks.length) add(` ${th.fg("dim", "尚无复盘对照；使用 /compass-retro 开始。")}`);
 	}
 
 	private renderBudget(add: (line?: string) => void, width: number): void {
@@ -178,12 +255,15 @@ export class CompassDashboard {
 		const pools = budgetStatus(this.store);
 		add("");
 		add(` ${th.fg("accent", th.bold("数据源与预算 · 当月"))}`);
-		const sourceWidth = Math.max(16, Math.min(28, width - 38));
-		add(` ${padAnsi(th.fg("muted", "数据源"), sourceWidth)} ${padAnsi(th.fg("muted", "档位"), 6)} ${padAnsi(th.fg("muted", "已用/上限"), 18)} ${th.fg("muted", "状态")}`);
+		const sourceWidth = Math.max(14, Math.min(24, width - 50));
+		add(` ${padAnsi(th.fg("muted", "数据源"), sourceWidth)} ${padAnsi(th.fg("muted", "档位"), 6)} ${padAnsi(th.fg("muted", "已用/上限"), 16)} ${padAnsi(th.fg("muted", "调用"), 12)} ${th.fg("muted", "状态")}`);
 		for (const pool of pools) {
 			const state = pool.state === "fused" ? th.fg("error", "熔断") : pool.state === "warning" ? th.fg("warning", "80%告警") : pool.state === "free" ? th.fg("success", "免费") : th.fg("success", "正常");
 			const usage = pool.monthlyLimitCny > 0 ? `¥${pool.spentCny.toFixed(0)} / ¥${pool.monthlyLimitCny.toFixed(0)}` : `¥${pool.spentCny.toFixed(0)} / 免费`;
-			add(` ${padAnsi(pool.source, sourceWidth)} ${padAnsi(pool.tier, 6)} ${padAnsi(usage, 18)} ${state}${pool.enabled ? "" : th.fg("dim", " · 禁用")}`);
+			// 统一显示当月次数（0 次起），与 compass_budget status 的 calls=n 口径一致，
+			// 避免「计量在工作但没调用」与「不计量」在 TUI 上不可区分
+			const calls = `${pool.callCount}${pool.monthlyCallLimit !== undefined ? `/${pool.monthlyCallLimit}` : ""} 次`;
+			add(` ${padAnsi(pool.source, sourceWidth)} ${padAnsi(pool.tier, 6)} ${padAnsi(usage, 16)} ${padAnsi(calls, 12)} ${state}${pool.enabled ? "" : th.fg("dim", " · 禁用")}`);
 		}
 		const attributed = this.store.costEvents.filter((event) => event.marketId).reduce((sum, event) => sum + event.amountCny, 0);
 		const total = this.store.costEvents.reduce((sum, event) => sum + event.amountCny, 0);

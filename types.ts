@@ -11,6 +11,8 @@ export const CANDIDATE_STAGES = [
 
 export type CandidateStage = (typeof CANDIDATE_STAGES)[number];
 export type GateOutcome = "pass" | "review" | "reject";
+export type DecisionStatus = "go" | "waitlist" | "no_go";
+export type OutcomeVerdict = "validated" | "challenged" | "inconclusive";
 export type RiskStatus = "pass" | "review" | "red" | "unknown";
 export type Confidence = number;
 export type MetricScalar = number | string | boolean | null;
@@ -97,8 +99,18 @@ export interface Candidate {
 	owner?: string;
 	tags: string[];
 	gateOutcome?: GateOutcome;
+	gateReason?: string;
+	gateReasonAt?: string;
+	gateReasonActor?: string;
 	score?: number;
 	latestStrategyRunId?: string;
+	stageReason?: string;
+	stageReasonAt?: string;
+	stageReasonActor?: string;
+	decisionStatus?: DecisionStatus;
+	decisionReason?: string;
+	decisionAt?: string;
+	decisionActor?: string;
 	createdAt: string;
 	updatedAt: string;
 }
@@ -280,8 +292,9 @@ export interface DecisionLog {
 	id: string;
 	candidateId?: string;
 	marketId: string;
-	type: "lead" | "import" | "strategy" | "stage_move" | "risk" | "profit" | "review";
+	type: "lead" | "import" | "strategy" | "stage_move" | "decision" | "risk" | "profit" | "review" | "retro";
 	conclusion: string;
+	decisionStatus?: DecisionStatus;
 	reason: string;
 	snapshotId?: string;
 	strategyId?: string;
@@ -290,12 +303,67 @@ export interface DecisionLog {
 	createdAt: string;
 }
 
+export interface OutcomeActuals {
+	dailyUnits?: number;
+	tacos?: number;
+	returnRate?: number;
+	netMargin?: number;
+	note?: string;
+}
+
+export interface OutcomeDelta {
+	metric: string;
+	baseline: MetricScalar;
+	current: MetricScalar;
+	direction: "improved" | "worsened" | "flat" | "unknown";
+}
+
+export interface OutcomeCheck {
+	id: string;
+	marketId: string;
+	candidateId?: string;
+	decisionLogId?: string;
+	decisionStatus?: DecisionStatus;
+	baselineSnapshotId: string;
+	baselineRunId?: string;
+	evidenceSnapshotId?: string;
+	actuals?: OutcomeActuals;
+	deltas: OutcomeDelta[];
+	verdict: OutcomeVerdict;
+	verdictReason: string;
+	elapsedDays: number;
+	createdAt: string;
+	actor: string;
+}
+
+export interface Lesson {
+	id: string;
+	title: string;
+	detail: string;
+	scope: {
+		categories?: string[];
+		keywords?: string[];
+		metrics?: string[];
+	};
+	evidence: string[];
+	status: "active" | "retired";
+	retiredReason?: string;
+	sourceRetro?: string;
+	createdAt: string;
+	updatedAt: string;
+	actor: string;
+}
+
 export interface BudgetPool {
 	source: string;
 	tier: "A" | "B" | "C";
 	monthlyLimitCny: number;
 	enabled: boolean;
 	note?: string;
+	// MCP 计量配置：缺省/0 = 只计数不折算成本
+	costPerCallCny?: number;
+	// 当月调用次数上限；缺省 = 不限次（configure 传 0 表示清除，落库为 undefined）
+	monthlyCallLimit?: number;
 }
 
 export interface CostEvent {
@@ -304,8 +372,47 @@ export interface CostEvent {
 	marketId?: string;
 	amountCny: number;
 	description?: string;
+	// 缺省 = 手工记账；mcp_call = tool_result 自动计量
+	kind?: "mcp_call";
+	tool?: string;
+	// 本事件合并的调用次数（≥1）；缺省视为 1
+	calls?: number;
 	createdAt: string;
 	actor: string;
+}
+
+export const TODO_KINDS = [
+	"budget_fused",
+	"retro_challenged",
+	"gate_review",
+	"decision_pending",
+	"deep_missing_data",
+	"risk_missing",
+	"retro_due",
+	"budget_warning",
+	"snapshot_stale",
+	"metric_divergence",
+] as const;
+
+export type TodoKind = (typeof TODO_KINDS)[number];
+export const TODO_PRIORITIES = [1, 2, 3, 4, 5] as const;
+export type TodoPriority = (typeof TODO_PRIORITIES)[number];
+
+// 工作台待办：从 store 派生的只读视图，不持久化（条件解决即消失）
+export interface WorkbenchTodo {
+	id: string;
+	kind: TodoKind;
+	priority: TodoPriority;
+	basePriority: TodoPriority;
+	marketId?: string;
+	marketName?: string;
+	candidateId?: string;
+	source?: string;
+	title: string;
+	reason: string;
+	suggestedAction: string;
+	dueAt?: string;
+	overdueDays?: number;
 }
 
 export interface CompassStore {
@@ -321,6 +428,8 @@ export interface CompassStore {
 	strategies: StrategyVersion[];
 	strategyRuns: StrategyRun[];
 	decisionLog: DecisionLog[];
+	outcomeChecks: OutcomeCheck[];
+	lessons: Lesson[];
 	budgetPools: BudgetPool[];
 	costEvents: CostEvent[];
 }

@@ -5,6 +5,9 @@ import { setTimeout as delay } from "node:timers/promises";
 import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
 import type { CompassStore, MarketSnapshot } from "./types.ts";
 
+const STORE_NEEDS_MIGRATION_WRITE = Symbol("compass-store-needs-migration-write");
+type MigratingStore = CompassStore & { [STORE_NEEDS_MIGRATION_WRITE]?: boolean };
+
 export function createEmptyStore(now = new Date().toISOString()): CompassStore {
 	return {
 		schemaVersion: 1,
@@ -19,6 +22,8 @@ export function createEmptyStore(now = new Date().toISOString()): CompassStore {
 		strategies: [],
 		strategyRuns: [],
 		decisionLog: [],
+		outcomeChecks: [],
+		lessons: [],
 		budgetPools: [],
 		costEvents: [],
 	};
@@ -38,7 +43,8 @@ function assertString(record: Record<string, unknown>, field: string, path: stri
 	if (typeof record[field] !== "string" || !record[field]) throw new Error(`罗盘数据字段 ${path}.${field} 损坏`);
 }
 
-function assertRecordArray(record: Record<string, unknown>, field: string): Record<string, unknown>[] {
+function assertRecordArray(record: Record<string, unknown>, field: string, optional = false): Record<string, unknown>[] {
+	if (optional && record[field] === undefined) record[field] = [];
 	const value = record[field];
 	if (!Array.isArray(value)) throw new Error(`罗盘数据字段 ${field} 损坏`);
 	for (const [index, item] of value.entries()) {
@@ -68,6 +74,8 @@ function assertStore(value: unknown): asserts value is CompassStore {
 		"budgetPools",
 		"costEvents",
 	] as const) arrays[key] = assertRecordArray(record, key);
+	arrays.outcomeChecks = assertRecordArray(record, "outcomeChecks", true);
+	arrays.lessons = assertRecordArray(record, "lessons", true);
 
 	for (const [index, market] of arrays.markets.entries()) {
 		assertString(market, "id", `markets[${index}]`);
@@ -84,6 +92,11 @@ function assertStore(value: unknown): asserts value is CompassStore {
 	for (const [index, candidate] of arrays.candidates.entries()) {
 		for (const field of ["id", "marketId", "stage"]) assertString(candidate, field, `candidates[${index}]`);
 		if (!Array.isArray(candidate.tags)) throw new Error(`罗盘数据字段 candidates[${index}].tags 损坏`);
+		if (candidate.gateOutcome !== undefined && !( ["pass", "review", "reject"] as unknown[]).includes(candidate.gateOutcome)) throw new Error(`罗盘数据字段 candidates[${index}].gateOutcome 损坏`);
+		if (candidate.decisionStatus !== undefined && !( ["go", "waitlist", "no_go"] as unknown[]).includes(candidate.decisionStatus)) throw new Error(`罗盘数据字段 candidates[${index}].decisionStatus 损坏`);
+		for (const field of ["gateReason", "gateReasonAt", "gateReasonActor", "stageReason", "stageReasonAt", "stageReasonActor", "decisionReason", "decisionAt", "decisionActor"]) {
+			if (candidate[field] !== undefined && typeof candidate[field] !== "string") throw new Error(`罗盘数据字段 candidates[${index}].${field} 损坏`);
+		}
 	}
 	for (const [index, strategy] of arrays.strategies.entries()) {
 		for (const field of ["id", "name", "yaml", "createdAt", "actor"]) assertString(strategy, field, `strategies[${index}]`);
@@ -99,16 +112,66 @@ function assertStore(value: unknown): asserts value is CompassStore {
 	}
 	for (const [index, decision] of arrays.decisionLog.entries()) {
 		for (const field of ["id", "marketId", "type", "conclusion", "reason", "actor", "createdAt"]) assertString(decision, field, `decisionLog[${index}]`);
+		if (!( ["lead", "import", "strategy", "stage_move", "decision", "risk", "profit", "review", "retro"] as unknown[]).includes(decision.type)) throw new Error(`罗盘数据字段 decisionLog[${index}].type 损坏`);
+		if (decision.decisionStatus !== undefined && !( ["go", "waitlist", "no_go"] as unknown[]).includes(decision.decisionStatus)) throw new Error(`罗盘数据字段 decisionLog[${index}].decisionStatus 损坏`);
+	}
+	for (const [index, check] of arrays.outcomeChecks.entries()) {
+		for (const field of ["id", "marketId", "baselineSnapshotId", "verdict", "verdictReason", "createdAt", "actor"]) assertString(check, field, `outcomeChecks[${index}]`);
+		if (!( ["validated", "challenged", "inconclusive"] as unknown[]).includes(check.verdict)) throw new Error(`罗盘数据字段 outcomeChecks[${index}].verdict 损坏`);
+		if (check.decisionStatus !== undefined && !( ["go", "waitlist", "no_go"] as unknown[]).includes(check.decisionStatus)) throw new Error(`罗盘数据字段 outcomeChecks[${index}].decisionStatus 损坏`);
+		if (typeof check.elapsedDays !== "number" || !Number.isInteger(check.elapsedDays) || check.elapsedDays < 0) throw new Error(`罗盘数据字段 outcomeChecks[${index}].elapsedDays 损坏`);
+		if (!Array.isArray(check.deltas)) throw new Error(`罗盘数据字段 outcomeChecks[${index}].deltas 损坏`);
+		for (const [deltaIndex, delta] of check.deltas.entries()) {
+			if (!isRecord(delta)) throw new Error(`罗盘数据字段 outcomeChecks[${index}].deltas[${deltaIndex}] 损坏`);
+			assertString(delta, "metric", `outcomeChecks[${index}].deltas[${deltaIndex}]`);
+			if (!( ["improved", "worsened", "flat", "unknown"] as unknown[]).includes(delta.direction)) throw new Error(`罗盘数据字段 outcomeChecks[${index}].deltas[${deltaIndex}].direction 损坏`);
+			for (const scalar of [delta.baseline, delta.current]) {
+				if (scalar !== null && !["number", "string", "boolean"].includes(typeof scalar)) throw new Error(`罗盘数据字段 outcomeChecks[${index}].deltas[${deltaIndex}] 指标值损坏`);
+				if (typeof scalar === "number" && !Number.isFinite(scalar)) throw new Error(`罗盘数据字段 outcomeChecks[${index}].deltas[${deltaIndex}] 指标值损坏`);
+			}
+		}
+		if (check.actuals !== undefined && !isRecord(check.actuals)) throw new Error(`罗盘数据字段 outcomeChecks[${index}].actuals 损坏`);
+		const hasSnapshotEvidence = typeof check.evidenceSnapshotId === "string" && Boolean(check.evidenceSnapshotId);
+		const actuals = isRecord(check.actuals) ? check.actuals : undefined;
+		if (actuals) {
+			for (const field of ["dailyUnits", "tacos", "returnRate", "netMargin"]) if (actuals[field] !== undefined && (typeof actuals[field] !== "number" || !Number.isFinite(actuals[field] as number))) throw new Error(`罗盘数据字段 outcomeChecks[${index}].actuals.${field} 损坏`);
+			if (typeof actuals.dailyUnits === "number" && actuals.dailyUnits < 0) throw new Error(`罗盘数据字段 outcomeChecks[${index}].actuals.dailyUnits 损坏`);
+			for (const field of ["tacos", "returnRate"]) if (typeof actuals[field] === "number" && ((actuals[field] as number) < 0 || (actuals[field] as number) > 1)) throw new Error(`罗盘数据字段 outcomeChecks[${index}].actuals.${field} 损坏`);
+			if (typeof actuals.netMargin === "number" && actuals.netMargin > 1) throw new Error(`罗盘数据字段 outcomeChecks[${index}].actuals.netMargin 损坏`);
+			if (actuals.note !== undefined && typeof actuals.note !== "string") throw new Error(`罗盘数据字段 outcomeChecks[${index}].actuals.note 损坏`);
+		}
+		const hasActualEvidence = Boolean(actuals && typeof actuals.dailyUnits === "number" && Number.isFinite(actuals.dailyUnits) && typeof actuals.netMargin === "number" && Number.isFinite(actuals.netMargin));
+		if (check.verdict !== "inconclusive" && !hasSnapshotEvidence && !hasActualEvidence) throw new Error(`罗盘数据字段 outcomeChecks[${index}] 缺少支持 verdict 的新快照或完整实绩证据`);
+	}
+	for (const [index, lesson] of arrays.lessons.entries()) {
+		for (const field of ["id", "title", "detail", "status", "createdAt", "updatedAt", "actor"]) assertString(lesson, field, `lessons[${index}]`);
+		if (!( ["active", "retired"] as unknown[]).includes(lesson.status)) throw new Error(`罗盘数据字段 lessons[${index}].status 损坏`);
+		if (!isRecord(lesson.scope)) throw new Error(`罗盘数据字段 lessons[${index}].scope 损坏`);
+		for (const field of ["categories", "keywords", "metrics"]) if (lesson.scope[field] !== undefined && (!Array.isArray(lesson.scope[field]) || lesson.scope[field].some((item) => typeof item !== "string"))) throw new Error(`罗盘数据字段 lessons[${index}].scope.${field} 损坏`);
+		if (!Array.isArray(lesson.evidence) || lesson.evidence.length === 0 || lesson.evidence.some((item) => typeof item !== "string" || !item)) throw new Error(`罗盘数据字段 lessons[${index}].evidence 必须非空`);
+		if (lesson.sourceRetro !== undefined && typeof lesson.sourceRetro !== "string") throw new Error(`罗盘数据字段 lessons[${index}].sourceRetro 损坏`);
+		if (lesson.status === "retired" && (typeof lesson.retiredReason !== "string" || !lesson.retiredReason.trim())) throw new Error(`罗盘数据字段 lessons[${index}].retiredReason 损坏`);
 	}
 	for (const [index, pool] of arrays.budgetPools.entries()) {
 		assertString(pool, "source", `budgetPools[${index}]`);
-		if (!(["A", "B", "C"] as unknown[]).includes(pool.tier) || typeof pool.monthlyLimitCny !== "number" || typeof pool.enabled !== "boolean") {
+		if (!(["A", "B", "C"] as unknown[]).includes(pool.tier) || typeof pool.monthlyLimitCny !== "number" || !Number.isFinite(pool.monthlyLimitCny) || typeof pool.enabled !== "boolean") {
 			throw new Error(`罗盘数据字段 budgetPools[${index}] 损坏`);
+		}
+		if (pool.costPerCallCny !== undefined && (typeof pool.costPerCallCny !== "number" || !Number.isFinite(pool.costPerCallCny) || pool.costPerCallCny < 0)) {
+			throw new Error(`罗盘数据字段 budgetPools[${index}].costPerCallCny 损坏`);
+		}
+		if (pool.monthlyCallLimit !== undefined && (typeof pool.monthlyCallLimit !== "number" || !Number.isInteger(pool.monthlyCallLimit) || pool.monthlyCallLimit < 1)) {
+			throw new Error(`罗盘数据字段 budgetPools[${index}].monthlyCallLimit 损坏`);
 		}
 	}
 	for (const [index, event] of arrays.costEvents.entries()) {
 		for (const field of ["id", "source", "createdAt", "actor"]) assertString(event, field, `costEvents[${index}]`);
 		if (typeof event.amountCny !== "number" || !Number.isFinite(event.amountCny)) throw new Error(`罗盘数据字段 costEvents[${index}].amountCny 损坏`);
+		if (event.kind !== undefined && event.kind !== "mcp_call") throw new Error(`罗盘数据字段 costEvents[${index}].kind 损坏`);
+		if (event.tool !== undefined && typeof event.tool !== "string") throw new Error(`罗盘数据字段 costEvents[${index}].tool 损坏`);
+		if (event.calls !== undefined && (typeof event.calls !== "number" || !Number.isInteger(event.calls) || event.calls < 1)) {
+			throw new Error(`罗盘数据字段 costEvents[${index}].calls 损坏`);
+		}
 	}
 	for (const [index, estimate] of arrays.profitEstimates.entries()) {
 		for (const field of ["id", "createdAt", "actor"]) assertString(estimate, field, `profitEstimates[${index}]`);
@@ -264,7 +327,9 @@ export class CompassRepository {
 		try {
 			const text = await readFile(this.storePath, "utf8");
 			const parsed = JSON.parse(text) as unknown;
+			const needsMigrationWrite = isRecord(parsed) && (parsed.outcomeChecks === undefined || parsed.lessons === undefined);
 			assertStore(parsed);
+			if (needsMigrationWrite) Object.defineProperty(parsed, STORE_NEEDS_MIGRATION_WRITE, { value: true, configurable: true, enumerable: false, writable: true });
 			this.installLazySnapshotData(parsed);
 			return parsed;
 		} catch (error) {
@@ -385,9 +450,13 @@ export class CompassRepository {
 		options: { shouldSave?: (result: T) => boolean } = {},
 	): Promise<{ store: CompassStore; result: T }> {
 		return this.withStoreLock(async () => {
-			const store = await this.load();
+			const store = await this.load() as MigratingStore;
+			const needsMigrationWrite = store[STORE_NEEDS_MIGRATION_WRITE] === true;
 			const result = await mutator(store);
-			if (options.shouldSave?.(result) ?? true) await this.saveUnlocked(store);
+			if (needsMigrationWrite || (options.shouldSave?.(result) ?? true)) {
+				delete store[STORE_NEEDS_MIGRATION_WRITE];
+				await this.saveUnlocked(store);
+			}
 			return { store, result };
 		});
 	}

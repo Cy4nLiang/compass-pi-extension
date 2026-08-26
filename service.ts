@@ -1,9 +1,31 @@
 import { createHash, randomUUID } from "node:crypto";
 import { DEFAULT_BUDGET_POOLS, DEFAULT_STRATEGY_YAML } from "./defaults.ts";
 import { profitMetrics } from "./economics.ts";
+import {
+	calculateMetricDeltas,
+	dueRetroItems,
+	filterLessons,
+	formatDelta,
+	matchingLessonsForMarket,
+	outcomeStatistics,
+	replayOutcomeVerdict,
+	renderHistoryNote,
+	renderRetroReport,
+	retroDueConfig,
+	similarMarkets,
+	strategyReferencedMetrics,
+	actualsOutcomeVerdict,
+	buildTimeline,
+	searchDecisionHistory,
+	type HistoryTimelineItem,
+	type OutcomeStats,
+	type RetroDueItem,
+	type SimilarMarketResult,
+} from "./history.ts";
 import { calculateMarketMetrics } from "./metrics.ts";
 import { renderMarketReport, type GeneratedReport, type MarketReportData } from "./report.ts";
 import { evaluateStrategy, parseStrategyYaml, slugify, strategyToYaml, type StrategyContext } from "./strategy.ts";
+import { deriveTodos } from "./todo.ts";
 import type {
 	BudgetPool,
 	Candidate,
@@ -11,10 +33,14 @@ import type {
 	CompassStore,
 	CostEvent,
 	DecisionLog,
+	DecisionStatus,
+	Lesson,
 	Market,
 	MarketSnapshot,
 	MetricEvidence,
 	MetricMap,
+	OutcomeActuals,
+	OutcomeCheck,
 	ParsedMarketCsv,
 	ProfitEstimate,
 	ProfitInput,
@@ -27,11 +53,16 @@ import type {
 	StrategyEvaluation,
 	StrategyRun,
 	StrategyVersion,
+	WorkbenchTodo,
 } from "./types.ts";
 
 function nowIso(): string {
 	return new Date().toISOString();
 }
+
+// 模块加载时解析一次默认策略 id；完整 definition 只在缺省注入时 fresh parse，
+// 避免共享可变对象进入多个 store 实例（ensureDefaults 会被每次读库与 MCP gate 调用）
+const DEFAULT_STRATEGY_ID = slugify(parseStrategyYaml(DEFAULT_STRATEGY_YAML).meta.name);
 
 function shortId(prefix: string): string {
 	return `${prefix}_${randomUUID().replaceAll("-", "").slice(0, 12)}`;
@@ -52,13 +83,60 @@ function requireMarketName(value: string): string {
 	return name;
 }
 
+export function importContentHash(content: Uint8Array): string {
+	return createHash("sha256").update(content).digest("hex");
+}
+
+export function findDuplicateImport(store: CompassStore, fileHash: string): MarketSnapshot | undefined {
+	return store.snapshots.find((snapshot) => snapshot.fileHash === fileHash);
+}
+
+function backfillStatusReasons(store: CompassStore): boolean {
+	let changed = false;
+	for (const candidate of store.candidates) {
+		const logs = store.decisionLog
+			.filter((decision) => decision.candidateId === candidate.id)
+			.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+		const stageLog = logs.find((decision) => ["stage_move", "lead", "import"].includes(decision.type));
+		if (!candidate.stageReason?.trim()) {
+			candidate.stageReason = stageLog?.reason || "历史候选状态（详见 decisionLog）";
+			candidate.stageReasonAt = stageLog?.createdAt ?? candidate.updatedAt;
+			candidate.stageReasonActor = stageLog?.actor ?? "compass-migration";
+			changed = true;
+		}
+		if (candidate.gateOutcome && !candidate.gateReason?.trim()) {
+			const gateLog = logs.find((decision) => decision.type === "strategy");
+			candidate.gateReason = gateLog?.reason || `历史 Gate 状态：${candidate.gateOutcome}（详见 strategyRuns）`;
+			candidate.gateReasonAt = gateLog?.createdAt ?? candidate.updatedAt;
+			candidate.gateReasonActor = gateLog?.actor ?? "compass-migration";
+			changed = true;
+		}
+		if (candidate.decisionStatus && !candidate.decisionReason?.trim()) {
+			const decisionLog = logs.find((decision) => decision.type === "decision");
+			candidate.decisionReason = decisionLog?.reason || `历史最终决策：${candidate.decisionStatus}（详见 decisionLog）`;
+			candidate.decisionAt = decisionLog?.createdAt ?? candidate.updatedAt;
+			candidate.decisionActor = decisionLog?.actor ?? "compass-migration";
+			changed = true;
+		}
+	}
+	return changed;
+}
+
 export function ensureDefaults(store: CompassStore, actor = "compass"): boolean {
 	let changed = false;
-	const definition = parseStrategyYaml(DEFAULT_STRATEGY_YAML);
-	const defaultId = slugify(definition.meta.name);
-	if (!store.strategies.some((strategy) => strategy.id === defaultId)) {
+	const legacy = store as CompassStore & { outcomeChecks?: OutcomeCheck[]; lessons?: Lesson[] };
+	if (!Array.isArray(legacy.outcomeChecks)) {
+		legacy.outcomeChecks = [];
+		changed = true;
+	}
+	if (!Array.isArray(legacy.lessons)) {
+		legacy.lessons = [];
+		changed = true;
+	}
+	if (!store.strategies.some((strategy) => strategy.id === DEFAULT_STRATEGY_ID)) {
+		const definition = parseStrategyYaml(DEFAULT_STRATEGY_YAML);
 		store.strategies.push({
-			id: defaultId,
+			id: DEFAULT_STRATEGY_ID,
 			version: 1,
 			name: definition.meta.display_name ?? definition.meta.name,
 			yaml: DEFAULT_STRATEGY_YAML,
@@ -75,6 +153,7 @@ export function ensureDefaults(store: CompassStore, actor = "compass"): boolean 
 			changed = true;
 		}
 	}
+	if (backfillStatusReasons(store)) changed = true;
 	return changed;
 }
 
@@ -120,6 +199,17 @@ export function latestStrategy(store: CompassStore, strategyId = "jingpu-daily10
 		.sort((a, b) => b.version - a.version);
 	if (!versions.length) throw new Error(`未找到策略：${strategyId}`);
 	return versions[0];
+}
+
+export function findStrategyVersion(store: CompassStore, reference = "jingpu-daily10"): StrategyVersion {
+	const versionMatch = reference.match(/^(.*?)(?:@v|:v?)(\d+)$/u);
+	if (!versionMatch) return latestStrategy(store, reference);
+	const [, rawId, rawVersion] = versionMatch;
+	const normalized = normalizeLookup(rawId);
+	const version = Number(rawVersion);
+	const strategy = store.strategies.find((item) => item.version === version && (item.id === rawId || normalizeLookup(item.name) === normalized || normalizeLookup(item.definition.meta.name) === normalized));
+	if (!strategy) throw new Error(`未找到策略版本：${reference}`);
+	return strategy;
 }
 
 function appendDecision(store: CompassStore, input: Omit<DecisionLog, "id" | "createdAt">): DecisionLog {
@@ -169,12 +259,18 @@ export function createLead(
 		candidate.tags = [...new Set([...candidate.tags, ...(input.tags ?? [])])];
 		candidate.updatedAt = timestamp;
 	}
+	const leadReason = `关键词：${market.keywords.join("、") || "未填写"}${input.category ? `；类目：${input.category}` : ""}`;
+	if (!candidate.stageReason) {
+		candidate.stageReason = leadReason;
+		candidate.stageReasonAt = timestamp;
+		candidate.stageReasonActor = input.actor;
+	}
 	appendDecision(store, {
 		candidateId: candidate.id,
 		marketId: market.id,
 		type: "lead",
 		conclusion: created ? "创建市场线索" : "更新市场线索",
-		reason: `关键词：${market.keywords.join("、") || "未填写"}${input.category ? `；类目：${input.category}` : ""}`,
+		reason: leadReason,
 		actor: input.actor,
 	});
 	return { market, candidate, created };
@@ -203,6 +299,10 @@ export function importParsedMarket(
 ): { market: Market; snapshot: MarketSnapshot; candidate: Candidate; created: boolean } {
 	const timestamp = nowIso();
 	const marketName = requireMarketName(input.marketName);
+	if (input.fileHash) {
+		const duplicate = findDuplicateImport(store, input.fileHash);
+		if (duplicate) throw new Error(`重复 CSV：该文件已于 ${duplicate.importedAt} 导入为 ${duplicate.id}`);
+	}
 	const normalizedName = normalizeLookup(marketName);
 	let market = store.markets.find((item) => normalizeLookup(item.name) === normalizedName);
 	const created = !market;
@@ -255,11 +355,21 @@ export function importParsedMarket(
 			marketId: market.id,
 			stage: "lead",
 			tags: [],
+			stageReason: `${input.parsed.source} CSV 导入 ${input.parsed.rowCount} 行`,
+			stageReasonAt: timestamp,
+			stageReasonActor: input.actor,
 			createdAt: timestamp,
 			updatedAt: timestamp,
 		};
 		store.candidates.push(candidate);
-	} else candidate.updatedAt = timestamp;
+	} else {
+		candidate.updatedAt = timestamp;
+		if (!candidate.stageReason) {
+			candidate.stageReason = `${input.parsed.source} CSV 导入 ${input.parsed.rowCount} 行`;
+			candidate.stageReasonAt = timestamp;
+			candidate.stageReasonActor = input.actor;
+		}
+	}
 
 	appendDecision(store, {
 		candidateId: candidate.id,
@@ -276,14 +386,15 @@ export function importParsedMarket(
 export function importMarketAndScreen(
 	store: CompassStore,
 	input: Parameters<typeof importParsedMarket>[1] & { runScreen?: boolean },
-): ReturnType<typeof importParsedMarket> & { screenRun?: StrategyRun } {
+): ReturnType<typeof importParsedMarket> & { screenRun?: StrategyRun; outcomeCheck?: OutcomeCheck } {
 	const imported = importParsedMarket(store, input);
 	const screenRun = input.runScreen === false ? undefined : runStrategy(store, {
 		marketRef: imported.market.id,
 		mode: "screen",
 		actor: input.actor,
 	});
-	return { ...imported, screenRun };
+	const outcomeCheck = autoCheckImportedOutcome(store, imported.market.id, imported.snapshot.id);
+	return { ...imported, screenRun, outcomeCheck };
 }
 
 export function recordProfitEstimate(
@@ -480,8 +591,11 @@ function reviewMetrics(analysis: ReviewAnalysis | undefined): MetricMap {
 	};
 }
 
-export function buildStrategyContext(store: CompassStore, marketId: string): { snapshot: MarketSnapshot; context: StrategyContext } {
-	const snapshot = latestSnapshot(store, marketId);
+export function buildStrategyContextForSnapshot(store: CompassStore, marketId: string, snapshotId?: string): { snapshot: MarketSnapshot; context: StrategyContext } {
+	const snapshot = snapshotId
+		? store.snapshots.find((item) => item.id === snapshotId && item.marketId === marketId)
+		: latestSnapshot(store, marketId);
+	if (!snapshot) throw new Error(`市场 ${marketId} 未找到快照 ${snapshotId}`);
 	const metrics: MetricMap = { ...snapshot.metrics };
 	const profit = latestForMarket(store.profitEstimates, marketId);
 	if (profit) Object.assign(metrics, profitMetrics(profit.input, profit.result, profit.createdAt));
@@ -490,6 +604,10 @@ export function buildStrategyContext(store: CompassStore, marketId: string): { s
 	const review = latestForMarket(store.reviewAnalyses, marketId);
 	Object.assign(metrics, reviewMetrics(review));
 	return { snapshot, context: { metrics, listings: snapshot.listings } };
+}
+
+export function buildStrategyContext(store: CompassStore, marketId: string): { snapshot: MarketSnapshot; context: StrategyContext } {
+	return buildStrategyContextForSnapshot(store, marketId);
 }
 
 export function mainCpcForMarket(store: CompassStore, marketId: string): number | undefined {
@@ -507,6 +625,8 @@ export function runStrategy(
 	const { snapshot, context } = buildStrategyContext(store, market.id);
 	context.targetMonthlyUnits = Number(strategy.definition.meta.monthly_units_q ?? 300);
 	const result = evaluateStrategy(strategy.definition, context, input.mode);
+	const gateReason = result.rules.filter((rule) => rule.status !== "pass").map((rule) => rule.message).join("；") || "全部规则通过";
+	const runAt = nowIso();
 	const run: StrategyRun = {
 		id: shortId("run"),
 		strategyId: strategy.id,
@@ -515,13 +635,16 @@ export function runStrategy(
 		snapshotId: snapshot.id,
 		mode: input.mode,
 		result,
-		runAt: nowIso(),
+		runAt,
 		actor: input.actor,
 	};
 	store.strategyRuns.push(run);
 	const candidate = store.candidates.find((item) => item.marketId === market.id);
 	if (candidate) {
 		candidate.gateOutcome = result.outcome;
+		candidate.gateReason = gateReason;
+		candidate.gateReasonAt = run.runAt;
+		candidate.gateReasonActor = input.actor;
 		candidate.score = result.score;
 		candidate.latestStrategyRunId = run.id;
 		candidate.updatedAt = run.runAt;
@@ -531,7 +654,7 @@ export function runStrategy(
 		marketId: market.id,
 		type: "strategy",
 		conclusion: `${input.mode} Gate=${result.outcome}，Score=${result.score}`,
-		reason: result.rules.filter((rule) => rule.status !== "pass").map((rule) => rule.message).join("；") || "全部规则通过",
+		reason: gateReason,
 		snapshotId: snapshot.id,
 		strategyId: strategy.id,
 		strategyVersion: strategy.version,
@@ -540,16 +663,25 @@ export function runStrategy(
 	return run;
 }
 
+export function evaluateStrategyVersionOnSnapshot(
+	store: CompassStore,
+	marketId: string,
+	strategy: StrategyVersion,
+	mode: "screen" | "full" = "screen",
+	snapshotId?: string,
+): StrategyEvaluation {
+	const { context } = buildStrategyContextForSnapshot(store, marketId, snapshotId);
+	context.targetMonthlyUnits = Number(strategy.definition.meta.monthly_units_q ?? 300);
+	return evaluateStrategy(strategy.definition, context, mode);
+}
+
 export function evaluateMarketWithoutPersisting(
 	store: CompassStore,
 	marketId: string,
 	strategyRef = "jingpu-daily10",
 	mode: "screen" | "full" = "screen",
 ): StrategyEvaluation {
-	const strategy = latestStrategy(store, strategyRef);
-	const { context } = buildStrategyContext(store, marketId);
-	context.targetMonthlyUnits = Number(strategy.definition.meta.monthly_units_q ?? 300);
-	return evaluateStrategy(strategy.definition, context, mode);
+	return evaluateStrategyVersionOnSnapshot(store, marketId, findStrategyVersion(store, strategyRef), mode);
 }
 
 export function saveStrategyVersion(
@@ -592,12 +724,17 @@ export function moveCandidate(
 	store: CompassStore,
 	input: { candidateRef: string; stage: CandidateStage; reason: string; actor: string },
 ): Candidate {
-	if (!input.reason.trim()) throw new Error("移动候选阶段必须填写 reason，确保决策可追溯");
+	const reason = input.reason.trim();
+	if (!reason) throw new Error("移动候选阶段必须填写 reason，确保决策可追溯");
 	const candidate = findCandidate(store, input.candidateRef);
 	const previous = candidate.stage;
 	if (previous === input.stage) throw new Error(`候选已处于 ${input.stage} 阶段`);
+	const movedAt = nowIso();
 	candidate.stage = input.stage;
-	candidate.updatedAt = nowIso();
+	candidate.stageReason = reason;
+	candidate.stageReasonAt = movedAt;
+	candidate.stageReasonActor = input.actor;
+	candidate.updatedAt = movedAt;
 	const latestRun = candidate.latestStrategyRunId
 		? store.strategyRuns.find((run) => run.id === candidate.latestStrategyRunId)
 		: undefined;
@@ -606,10 +743,41 @@ export function moveCandidate(
 		marketId: candidate.marketId,
 		type: "stage_move",
 		conclusion: `${previous} → ${input.stage}`,
-		reason: input.reason,
+		reason,
 		snapshotId: store.snapshots
 			.filter((snapshot) => snapshot.marketId === candidate.marketId)
 			.sort((a, b) => b.capturedAt.localeCompare(a.capturedAt))[0]?.id,
+		strategyId: latestRun?.strategyId,
+		strategyVersion: latestRun?.strategyVersion,
+		actor: input.actor,
+	});
+	return candidate;
+}
+
+export function decideCandidate(
+	store: CompassStore,
+	input: { candidateRef: string; status: DecisionStatus; reason: string; actor: string },
+): Candidate {
+	const reason = input.reason.trim();
+	if (!reason) throw new Error("记录最终决策必须填写 reason，确保所有状态可追溯");
+	const candidate = findCandidate(store, input.candidateRef);
+	const decidedAt = nowIso();
+	candidate.decisionStatus = input.status;
+	candidate.decisionReason = reason;
+	candidate.decisionAt = decidedAt;
+	candidate.decisionActor = input.actor;
+	const latestRun = candidate.latestStrategyRunId
+		? store.strategyRuns.find((run) => run.id === candidate.latestStrategyRunId)
+		: undefined;
+	const labels: Record<DecisionStatus, string> = { go: "Go", waitlist: "Waitlist", no_go: "No Go" };
+	appendDecision(store, {
+		candidateId: candidate.id,
+		marketId: candidate.marketId,
+		type: "decision",
+		decisionStatus: input.status,
+		conclusion: `最终决策：${labels[input.status]}`,
+		reason,
+		snapshotId: latestSnapshotIfPresent(store, candidate.marketId)?.id,
 		strategyId: latestRun?.strategyId,
 		strategyVersion: latestRun?.strategyVersion,
 		actor: input.actor,
@@ -621,20 +789,28 @@ function monthPrefix(date = new Date()): string {
 	return date.toISOString().slice(0, 7);
 }
 
-export function budgetStatus(store: CompassStore, month = monthPrefix()): Array<BudgetPool & { spentCny: number; remainingCny: number; utilization: number | null; state: "ok" | "warning" | "fused" | "free" }> {
+export function budgetStatus(
+	store: CompassStore,
+	month = monthPrefix(),
+	pendingCalls?: Record<string, number>,
+): Array<BudgetPool & { spentCny: number; remainingCny: number; utilization: number | null; callCount: number; callUtilization: number | null; state: "ok" | "warning" | "fused" | "free" }> {
 	return store.budgetPools.map((pool) => {
-		const spentCny = store.costEvents
-			.filter((event) => event.source === pool.source && event.createdAt.startsWith(month))
-			.reduce((sum, event) => sum + event.amountCny, 0);
+		const monthEvents = store.costEvents.filter((event) => event.source === pool.source && event.createdAt.startsWith(month));
+		// pending 为会话内尚未落盘的计量次数；并入次数与折算金额，避免告警/熔断判断滞后于 flush
+		const pending = pendingCalls?.[pool.source] ?? 0;
+		const spentCny = monthEvents.reduce((sum, event) => sum + event.amountCny, 0) + pending * (pool.costPerCallCny ?? 0);
+		const callCount = monthEvents.reduce((sum, event) => sum + (event.kind === "mcp_call" ? event.calls ?? 1 : 0), 0) + pending;
 		const utilization = pool.monthlyLimitCny > 0 ? spentCny / pool.monthlyLimitCny : null;
-		const state = pool.monthlyLimitCny === 0
-			? "free"
-			: spentCny >= pool.monthlyLimitCny ? "fused" : spentCny >= pool.monthlyLimitCny * 0.8 ? "warning" : "ok";
+		const callUtilization = pool.monthlyCallLimit !== undefined && pool.monthlyCallLimit > 0 ? callCount / pool.monthlyCallLimit : null;
+		const ratios = [utilization, callUtilization].filter((ratio): ratio is number => ratio !== null);
+		const state = ratios.length === 0 ? "free" : ratios.some((ratio) => ratio >= 1) ? "fused" : ratios.some((ratio) => ratio >= 0.8) ? "warning" : "ok";
 		return {
 			...pool,
 			spentCny: Math.round(spentCny * 100) / 100,
 			remainingCny: Math.max(0, Math.round((pool.monthlyLimitCny - spentCny) * 100) / 100),
 			utilization: utilization === null ? null : Math.round(utilization * 1000) / 1000,
+			callCount,
+			callUtilization: callUtilization === null ? null : Math.round(callUtilization * 1000) / 1000,
 			state,
 		};
 	});
@@ -671,29 +847,168 @@ export function recordCost(
 
 export function configureBudget(
 	store: CompassStore,
-	input: { source: string; tier?: "A" | "B" | "C"; monthlyLimitCny?: number; enabled?: boolean; note?: string },
+	input: { source: string; tier?: "A" | "B" | "C"; monthlyLimitCny?: number; enabled?: boolean; note?: string; costPerCallCny?: number; monthlyCallLimit?: number },
 ): BudgetPool {
 	if (input.monthlyLimitCny !== undefined && (!Number.isFinite(input.monthlyLimitCny) || input.monthlyLimitCny < 0)) {
 		throw new Error("monthlyLimitCny 必须为非负数字");
 	}
-	let pool = store.budgetPools.find((item) => item.source === input.source);
+	if (input.costPerCallCny !== undefined && (!Number.isFinite(input.costPerCallCny) || input.costPerCallCny < 0)) {
+		throw new Error("costPerCallCny 必须为非负数字（0 表示只计数不折算成本）");
+	}
+	if (input.monthlyCallLimit !== undefined && (!Number.isInteger(input.monthlyCallLimit) || input.monthlyCallLimit < 0)) {
+		throw new Error("monthlyCallLimit 必须为非负整数（0 表示清除次数上限）");
+	}
+	// trim 与计量/拦截侧口径一致：带空白的 source 会建出永不计量、不拦截的幽灵池
+	const source = input.source.trim();
+	if (!source) throw new Error("source 不能为空");
+	let pool = store.budgetPools.find((item) => item.source === source);
 	if (!pool) {
 		if (!input.tier || input.monthlyLimitCny === undefined) throw new Error("新预算池需要 tier 与 monthlyLimitCny");
 		pool = {
-			source: input.source,
+			source,
 			tier: input.tier,
 			monthlyLimitCny: input.monthlyLimitCny,
 			enabled: input.enabled ?? true,
 			note: input.note,
 		};
 		store.budgetPools.push(pool);
-		return pool;
+	} else {
+		if (input.tier !== undefined) pool.tier = input.tier;
+		if (input.monthlyLimitCny !== undefined) pool.monthlyLimitCny = input.monthlyLimitCny;
+		if (input.enabled !== undefined) pool.enabled = input.enabled;
+		if (input.note !== undefined) pool.note = input.note;
 	}
-	if (input.tier !== undefined) pool.tier = input.tier;
-	if (input.monthlyLimitCny !== undefined) pool.monthlyLimitCny = input.monthlyLimitCny;
-	if (input.enabled !== undefined) pool.enabled = input.enabled;
-	if (input.note !== undefined) pool.note = input.note;
+	if (input.costPerCallCny !== undefined) pool.costPerCallCny = input.costPerCallCny;
+	// 0 与 undefined 双义在存储层被 assertStore 封死：清除动作在此归一为字段删除
+	if (input.monthlyCallLimit !== undefined) {
+		if (input.monthlyCallLimit === 0) delete pool.monthlyCallLimit;
+		else pool.monthlyCallLimit = input.monthlyCallLimit;
+	}
 	return pool;
+}
+
+export interface McpCallSample {
+	server: string;
+	tool: string;
+	billable: boolean;
+}
+
+// tool_result 计量分类器：识别 MCP 调用结果并判定是否计费。
+// 计费口径（spec 4.2.5）：已到达服务端的调用消耗点数——成功（无 error）与服务端业务错误
+// （error === "tool_error"）计；认证/连接/退避/中止等未到达服务端的失败不计。
+// direct 工具的 details 无 mode 字段；mcp 代理为 mode==="call"，其余 mode（search/describe/
+// status/script…）不是对服务端工具的调用。返回 undefined 表示与 MCP 计量无关。
+export function classifyMcpToolResult(toolName: string, details: unknown): McpCallSample | undefined {
+	if (toolName.startsWith("compass_")) return undefined;
+	if (!details || typeof details !== "object" || Array.isArray(details)) return undefined;
+	const record = details as Record<string, unknown>;
+	// trim 与 recordMcpUsage 的池名匹配口径保持一致，避免 pending 键与落账键分裂
+	const server = typeof record.server === "string" ? record.server.trim() : "";
+	if (!server) return undefined;
+	if (record.mode !== undefined && record.mode !== "call") return undefined;
+	if (record.error !== undefined && typeof record.error !== "string") return undefined;
+	const billable = record.error === undefined || record.error === "tool_error";
+	const tool = typeof record.tool === "string" && record.tool
+		? record.tool
+		: typeof record.resourceUri === "string" && record.resourceUri ? record.resourceUri : "unknown";
+	return { server, tool, billable };
+}
+
+// 计量落账：事后记账，钱已花出，绝不因熔断/禁用丢账（与 recordCost 的事前拦截语义相反）。
+// 只有与预算池同名的 server 才计量；非法条目（hook 侧数据）静默跳过。
+export function recordMcpUsage(
+	store: CompassStore,
+	usage: Array<{ server: string; tool: string; calls: number }>,
+	actor: string,
+): CostEvent[] {
+	const merged = new Map<string, { server: string; tool: string; calls: number }>();
+	for (const entry of usage) {
+		if (!Number.isSafeInteger(entry.calls) || entry.calls < 1) continue;
+		const server = typeof entry.server === "string" ? entry.server.trim() : "";
+		if (!server || !store.budgetPools.some((pool) => pool.source === server)) continue;
+		const tool = (typeof entry.tool === "string" && entry.tool.trim()) || "unknown";
+		// NUL 分隔避免与含下划线等常规字符的池名/工具名歧义拼接；必须保持 \u0000 转义写法，
+		// 源码中出现原始 0x00 字节会让 grep 把整个文件当二进制
+		const key = `${server}\u0000${tool}`;
+		const existing = merged.get(key);
+		if (existing) existing.calls += entry.calls;
+		else merged.set(key, { server, tool, calls: entry.calls });
+	}
+	const events: CostEvent[] = [];
+	for (const { server, tool, calls } of merged.values()) {
+		const unitPrice = store.budgetPools.find((pool) => pool.source === server)?.costPerCallCny ?? 0;
+		const event: CostEvent = {
+			id: shortId("cost"),
+			source: server,
+			amountCny: Math.round(unitPrice * calls * 100) / 100,
+			description: `MCP 自动计量：${tool} × ${calls}`,
+			kind: "mcp_call",
+			tool,
+			calls,
+			createdAt: nowIso(),
+			actor,
+		};
+		store.costEvents.push(event);
+		events.push(event);
+	}
+	return events;
+}
+
+function mcpCallTargetServers(store: CompassStore, call: { toolName: string; input?: Record<string, unknown> }): string[] {
+	// 最长前缀优先，防止短池名抢占长池名的工具（与 pi-mcp-adapter 的 server 解析口径一致）
+	const byLength = [...store.budgetPools].sort((a, b) => b.source.length - a.source.length);
+	for (const pool of byLength) {
+		if (call.toolName.startsWith(`${pool.source}_`)) return [pool.source];
+	}
+	if (call.toolName === "mcp") {
+		if (typeof call.input?.server === "string" && call.input.server) return [call.input.server];
+		const tool = call.input?.tool;
+		if (typeof tool === "string") {
+			for (const pool of byLength) {
+				if (tool === pool.source || tool.startsWith(`${pool.source}_`)) return [pool.source];
+			}
+		}
+		return [];
+	}
+	if (call.toolName === "mcpScript") {
+		// 脚本内部调用不逐条上报，无法精确归因；按池名子串做提示性匹配（spec 2.1 非目标）。
+		// 返回全部命中池：任一熔断即拦截，避免 first-match 归因到未熔断池而漏拦
+		const code = call.input?.code;
+		if (typeof code !== "string") return [];
+		const lowered = code.toLowerCase();
+		return store.budgetPools.filter((pool) => lowered.includes(pool.source.toLowerCase())).map((pool) => pool.source);
+	}
+	return [];
+}
+
+// tool_call 熔断拦截判定：只读，不写 store。仅对「配置了上限」（monthlyCallLimit 或
+// monthlyLimitCny>0）且当月已熔断的池返回拦截理由；默认 sorftime 池（¥0、无次数上限）
+// 永不拦截——无惊吓原则。返回 undefined 表示放行。
+export function evaluateMcpGate(
+	store: CompassStore,
+	call: { toolName: string; input?: Record<string, unknown> },
+	pendingCalls?: Record<string, number>,
+): { server: string; reason: string } | undefined {
+	const servers = mcpCallTargetServers(store, call);
+	if (!servers.length) return undefined;
+	const budgets = budgetStatus(store, undefined, pendingCalls);
+	for (const server of servers) {
+		const pool = budgets.find((item) => item.source === server);
+		if (!pool) continue;
+		if (pool.monthlyCallLimit === undefined && pool.monthlyLimitCny <= 0) continue;
+		if (pool.state !== "fused") continue;
+		const callsText = pool.monthlyCallLimit !== undefined
+			? `本月 ${pool.callCount} 次 / 限 ${pool.monthlyCallLimit} 次`
+			: `本月 ${pool.callCount} 次`;
+		const amountText = pool.monthlyLimitCny > 0
+			? `¥${pool.spentCny.toFixed(2)} / ¥${pool.monthlyLimitCny.toFixed(0)}`
+			: `¥${pool.spentCny.toFixed(2)}`;
+		return {
+			server,
+			reason: `${server} 预算已熔断：${callsText}（${amountText}）。解除：compass_budget configure source=${server} 提高 monthly_call_limit（0=清除）或 monthly_limit_cny，次月自动恢复。`,
+		};
+	}
+	return undefined;
 }
 
 export interface MarketScanResult {
@@ -802,6 +1117,469 @@ export function listStrategies(store: CompassStore): StrategyVersion[] {
 	return [...latest.values()].sort((a, b) => String(a.name).localeCompare(String(b.name)));
 }
 
+interface RetroBaseline {
+	candidate?: Candidate;
+	decision?: DecisionLog;
+	decisionStatus?: DecisionStatus;
+	snapshot: MarketSnapshot;
+	run?: StrategyRun;
+}
+
+function snapshotCapturedTime(snapshot: MarketSnapshot): number {
+	const parsed = Date.parse(snapshot.capturedAt);
+	return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function findRetroBaseline(store: CompassStore, marketId: string, beforeSnapshot?: MarketSnapshot, requiredStatus?: DecisionStatus): RetroBaseline | undefined {
+	const cutoff = beforeSnapshot ? snapshotCapturedTime(beforeSnapshot) : Number.POSITIVE_INFINITY;
+	const candidate = store.candidates.find((item) => item.marketId === marketId);
+	const decisions = store.decisionLog
+		.filter((item) => item.marketId === marketId && item.type === "decision" && (!requiredStatus || item.decisionStatus === requiredStatus))
+		.map((decision) => ({ decision, snapshot: decision.snapshotId ? store.snapshots.find((item) => item.id === decision.snapshotId) : undefined }))
+		.filter((item): item is { decision: DecisionLog; snapshot: MarketSnapshot } => Boolean(item.snapshot && snapshotCapturedTime(item.snapshot) < cutoff))
+		.sort((a, b) => b.decision.createdAt.localeCompare(a.decision.createdAt));
+	const decisionAnchor = decisions[0];
+	if (decisionAnchor) {
+		const run = store.strategyRuns
+			.filter((item) => item.marketId === marketId && item.snapshotId === decisionAnchor.snapshot.id)
+			.filter((item) => !decisionAnchor.decision.strategyId || item.strategyId === decisionAnchor.decision.strategyId)
+			.filter((item) => decisionAnchor.decision.strategyVersion === undefined || item.strategyVersion === decisionAnchor.decision.strategyVersion)
+			.sort((a, b) => b.runAt.localeCompare(a.runAt))[0];
+		return { candidate, decision: decisionAnchor.decision, decisionStatus: decisionAnchor.decision.decisionStatus ?? candidate?.decisionStatus, snapshot: decisionAnchor.snapshot, run };
+	}
+	if (requiredStatus) return undefined;
+	const run = store.strategyRuns
+		.map((item) => ({ run: item, snapshot: store.snapshots.find((snapshot) => snapshot.id === item.snapshotId) }))
+		.filter((item): item is { run: StrategyRun; snapshot: MarketSnapshot } => Boolean(item.snapshot && item.run.marketId === marketId && snapshotCapturedTime(item.snapshot) < cutoff))
+		.sort((a, b) => b.run.runAt.localeCompare(a.run.runAt))[0];
+	return run ? { candidate, decisionStatus: candidate?.decisionStatus, snapshot: run.snapshot, run: run.run } : undefined;
+}
+
+function exactStrategyForRun(store: CompassStore, run: StrategyRun | undefined): StrategyVersion | undefined {
+	if (!run) return undefined;
+	return store.strategies.find((strategy) => strategy.id === run.strategyId && strategy.version === run.strategyVersion);
+}
+
+function appendRetroDecision(store: CompassStore, check: OutcomeCheck): DecisionLog {
+	const baselineRun = check.baselineRunId ? store.strategyRuns.find((run) => run.id === check.baselineRunId) : undefined;
+	return appendDecision(store, {
+		candidateId: check.candidateId,
+		marketId: check.marketId,
+		type: "retro",
+		conclusion: `复盘对照：${check.verdict}`,
+		decisionStatus: check.decisionStatus,
+		reason: `${check.id} · ${check.verdictReason}`,
+		snapshotId: check.evidenceSnapshotId ?? check.baselineSnapshotId,
+		strategyId: baselineRun?.strategyId,
+		strategyVersion: baselineRun?.strategyVersion,
+		actor: check.actor,
+	});
+}
+
+function createSnapshotOutcomeCheck(
+	store: CompassStore,
+	baseline: RetroBaseline,
+	evidence: MarketSnapshot,
+	actor: string,
+): OutcomeCheck {
+	const strategy = exactStrategyForRun(store, baseline.run);
+	let currentEvaluation: StrategyEvaluation | undefined;
+	if (strategy) currentEvaluation = evaluateStrategyVersionOnSnapshot(store, evidence.marketId, strategy, baseline.run?.mode ?? "screen", evidence.id);
+	const metricNames = [...new Set([...strategyReferencedMetrics(baseline.run), ...Object.keys(baseline.snapshot.metrics).filter((name) => ["price_p50", "category_monthly_sales", "waist_monthly_sales", "qualify_rank_depth", "cr3", "amz_share", "new_listing_share_12m", "main_cpc"].includes(name))])];
+	const baselineMetrics: MetricMap = { ...baseline.snapshot.metrics };
+	for (const rule of baseline.run?.result.rules ?? []) for (const [name, metric] of Object.entries(rule.evidence)) if (metric) baselineMetrics[name] = metric;
+	const currentMetrics: MetricMap = { ...evidence.metrics };
+	for (const rule of currentEvaluation?.rules ?? []) for (const [name, metric] of Object.entries(rule.evidence)) if (metric) currentMetrics[name] = metric;
+	const deltas = calculateMetricDeltas(baselineMetrics, currentMetrics, metricNames);
+	const replayableReject = baseline.decisionStatus === "no_go" || (!baseline.decisionStatus && baseline.run?.result.outcome === "reject");
+	const staleReplayEvidence = baseline.run?.result.rules
+		.filter((rule) => rule.status === "veto" || rule.status === "fail")
+		.flatMap((rule) => rule.references.map((reference) => ({
+			rule: rule.id,
+			reference,
+			baselineEvidence: rule.evidence[reference],
+			currentEvidence: currentEvaluation?.rules.find((item) => item.id === rule.id)?.evidence[reference],
+		})))
+		.filter((item) => {
+			const baselineCaptured = item.baselineEvidence ? Date.parse(item.baselineEvidence.capturedAt) : Number.NaN;
+			const currentCaptured = item.currentEvidence ? Date.parse(item.currentEvidence.capturedAt) : Number.NaN;
+			return !Number.isFinite(baselineCaptured) || !Number.isFinite(currentCaptured) || currentCaptured <= baselineCaptured;
+		}) ?? [];
+	const replay = replayableReject
+		? staleReplayEvidence.length
+			? { verdict: "inconclusive" as const, reason: `重放证据没有晚于 T0：${staleReplayEvidence.slice(0, 5).map((item) => `${item.rule}/${item.reference}`).join("、")}` }
+			: replayOutcomeVerdict(baseline.run, currentEvaluation, deltas)
+		: { verdict: "inconclusive" as const, reason: baseline.decisionStatus === "go" ? "市场快照变化不能替代 go 品经营实绩，需录入 actuals" : "waitlist/未决策对象仅记录市场变化，需人工判断" };
+	const check: OutcomeCheck = {
+		id: shortId("chk"),
+		marketId: evidence.marketId,
+		candidateId: baseline.candidate?.id,
+		decisionLogId: baseline.decision?.id,
+		decisionStatus: baseline.decisionStatus,
+		baselineSnapshotId: baseline.snapshot.id,
+		baselineRunId: baseline.run?.id,
+		evidenceSnapshotId: evidence.id,
+		deltas,
+		verdict: replay.verdict,
+		verdictReason: replay.reason,
+		elapsedDays: Math.max(0, Math.floor((snapshotCapturedTime(evidence) - snapshotCapturedTime(baseline.snapshot)) / 86_400_000)),
+		createdAt: nowIso(),
+		actor,
+	};
+	store.outcomeChecks.push(check);
+	appendRetroDecision(store, check);
+	return check;
+}
+
+export function autoCheckImportedOutcome(store: CompassStore, marketId: string, evidenceSnapshotId: string): OutcomeCheck | undefined {
+	const evidence = store.snapshots.find((snapshot) => snapshot.id === evidenceSnapshotId && snapshot.marketId === marketId);
+	if (!evidence) return undefined;
+	if (store.outcomeChecks.some((check) => check.marketId === marketId && check.evidenceSnapshotId === evidence.id)) return undefined;
+	const baseline = findRetroBaseline(store, marketId, evidence);
+	if (!baseline) return undefined;
+	const elapsedDays = Math.floor((snapshotCapturedTime(evidence) - snapshotCapturedTime(baseline.snapshot)) / 86_400_000);
+	if (elapsedDays < 7) return undefined;
+	return createSnapshotOutcomeCheck(store, baseline, evidence, "compass-auto");
+}
+
+export function performRetroCheck(
+	store: CompassStore,
+	input: { marketRef?: string; candidateRef?: string; evidenceSnapshotId?: string; actor: string },
+): OutcomeCheck {
+	const candidate = input.candidateRef ? findCandidate(store, input.candidateRef) : undefined;
+	const market = candidate ? findMarket(store, candidate.marketId) : input.marketRef ? findMarket(store, input.marketRef) : undefined;
+	if (!market) throw new Error("check 需要 market_ref 或 candidate_ref");
+	const evidence = input.evidenceSnapshotId
+		? store.snapshots.find((snapshot) => snapshot.id === input.evidenceSnapshotId && snapshot.marketId === market.id)
+		: latestSnapshotIfPresent(store, market.id);
+	if (!evidence) throw new Error(`市场 ${market.id} 尚无可用于复盘的快照`);
+	if (store.outcomeChecks.some((check) => check.marketId === market.id && check.evidenceSnapshotId === evidence.id)) throw new Error(`快照 ${evidence.id} 已有 OutcomeCheck，避免重复统计`);
+	const baseline = findRetroBaseline(store, market.id, evidence);
+	if (!baseline) throw new Error(`市场 ${market.id} 没有早于 ${evidence.id} 的决策/策略基线`);
+	return createSnapshotOutcomeCheck(store, baseline, evidence, input.actor);
+}
+
+function validateActuals(actuals: OutcomeActuals): void {
+	if (!["dailyUnits", "tacos", "returnRate", "netMargin"].some((field) => typeof actuals[field as keyof OutcomeActuals] === "number")) throw new Error("record_actuals 至少需要一项数字实绩");
+	if (actuals.dailyUnits !== undefined && (!Number.isFinite(actuals.dailyUnits) || actuals.dailyUnits < 0)) throw new Error("daily_units 必须为非负数字");
+	for (const [name, value] of [["tacos", actuals.tacos], ["return_rate", actuals.returnRate]] as const) {
+		if (value !== undefined && (!Number.isFinite(value) || value < 0 || value > 1)) throw new Error(`${name} 必须在 0–1 之间`);
+	}
+	if (actuals.netMargin !== undefined && (!Number.isFinite(actuals.netMargin) || actuals.netMargin > 1)) throw new Error("net_margin 必须为不高于 1 的数字，可为负数");
+}
+
+export function recordRetroActuals(
+	store: CompassStore,
+	input: { candidateRef: string; actuals: OutcomeActuals; actor: string },
+): OutcomeCheck {
+	validateActuals(input.actuals);
+	const candidate = findCandidate(store, input.candidateRef);
+	if (candidate.decisionStatus !== "go") throw new Error(`候选 ${candidate.id} 当前不是 go，不能走 go 品实绩复盘`);
+	const baseline = findRetroBaseline(store, candidate.marketId, undefined, "go");
+	if (!baseline) throw new Error(`候选 ${candidate.id} 没有可锚定的 go 决策与基线快照`);
+	const strategy = exactStrategyForRun(store, baseline.run);
+	const target = Number(strategy?.definition.meta.target_daily_units ?? 10);
+	const verdict = actualsOutcomeVerdict(input.actuals, Number.isFinite(target) && target > 0 ? target : 10);
+	const check: OutcomeCheck = {
+		id: shortId("chk"),
+		marketId: candidate.marketId,
+		candidateId: candidate.id,
+		decisionLogId: baseline.decision?.id,
+		decisionStatus: "go",
+		baselineSnapshotId: baseline.snapshot.id,
+		baselineRunId: baseline.run?.id,
+		actuals: { ...input.actuals, note: input.actuals.note?.trim() || undefined },
+		deltas: [],
+		verdict: verdict.verdict,
+		verdictReason: verdict.reason,
+		elapsedDays: Math.max(0, Math.floor((Date.now() - snapshotCapturedTime(baseline.snapshot)) / 86_400_000)),
+		createdAt: nowIso(),
+		actor: input.actor,
+	};
+	store.outcomeChecks.push(check);
+	appendRetroDecision(store, check);
+	return check;
+}
+
+function evidenceMarketId(store: CompassStore, evidence: string[]): string | undefined {
+	for (const id of evidence) {
+		const check = store.outcomeChecks.find((item) => item.id === id);
+		if (check) return check.marketId;
+		const decision = store.decisionLog.find((item) => item.id === id);
+		if (decision) return decision.marketId;
+		const run = store.strategyRuns.find((item) => item.id === id);
+		if (run) return run.marketId;
+	}
+	return undefined;
+}
+
+function assertLessonEvidence(store: CompassStore, evidence: string[]): string {
+	const normalized = [...new Set(evidence.map((item) => item.trim()).filter(Boolean))];
+	if (!normalized.length) throw new Error("Lesson 必须挂非空 evidence（chk_*/dec_*/run_*）");
+	const known = new Set([...store.outcomeChecks.map((item) => item.id), ...store.decisionLog.map((item) => item.id), ...store.strategyRuns.map((item) => item.id)]);
+	const unknown = normalized.filter((id) => !known.has(id));
+	if (unknown.length) throw new Error(`Lesson evidence 不存在：${unknown.join("、")}`);
+	return normalized.join("\n");
+}
+
+export function saveLesson(
+	store: CompassStore,
+	input: {
+		title: string;
+		detail: string;
+		scope?: { categories?: string[]; keywords?: string[]; metrics?: string[] };
+		evidence: string[];
+		sourceRetro?: string;
+		actor: string;
+	},
+): Lesson {
+	const title = input.title.trim();
+	const detail = input.detail.trim();
+	if (!title || !detail) throw new Error("Lesson title 与 detail 必填");
+	const evidence = assertLessonEvidence(store, input.evidence).split("\n");
+	const timestamp = nowIso();
+	const lesson: Lesson = {
+		id: shortId("les"),
+		title,
+		detail,
+		scope: {
+			categories: input.scope?.categories?.map((item) => item.trim()).filter(Boolean),
+			keywords: input.scope?.keywords?.map((item) => item.trim()).filter(Boolean),
+			metrics: input.scope?.metrics?.map((item) => item.trim()).filter(Boolean),
+		},
+		evidence,
+		status: "active",
+		sourceRetro: input.sourceRetro,
+		createdAt: timestamp,
+		updatedAt: timestamp,
+		actor: input.actor,
+	};
+	store.lessons.push(lesson);
+	const marketId = evidenceMarketId(store, evidence);
+	if (!marketId) throw new Error("Lesson evidence 无法关联市场");
+	appendDecision(store, {
+		candidateId: store.candidates.find((candidate) => candidate.marketId === marketId)?.id,
+		marketId,
+		type: "retro",
+		conclusion: `保存经验卡 ${lesson.id}`,
+		reason: `${lesson.title}；evidence=${evidence.join("、")}`,
+		actor: input.actor,
+	});
+	return lesson;
+}
+
+export function retireLesson(store: CompassStore, input: { lessonRef: string; reason: string; actor: string }): Lesson {
+	const reason = input.reason.trim();
+	if (!reason) throw new Error("退役 Lesson 必须填写 reason");
+	const lesson = store.lessons.find((item) => item.id === input.lessonRef);
+	if (!lesson) throw new Error(`未找到 Lesson：${input.lessonRef}`);
+	if (lesson.status === "retired") throw new Error(`Lesson ${lesson.id} 已退役`);
+	lesson.status = "retired";
+	lesson.retiredReason = reason;
+	lesson.updatedAt = nowIso();
+	lesson.actor = input.actor;
+	const marketId = evidenceMarketId(store, lesson.evidence);
+	if (!marketId) throw new Error(`Lesson ${lesson.id} evidence 无法关联市场`);
+	appendDecision(store, {
+		candidateId: store.candidates.find((candidate) => candidate.marketId === marketId)?.id,
+		marketId,
+		type: "retro",
+		conclusion: `退役经验卡 ${lesson.id}`,
+		reason,
+		actor: input.actor,
+	});
+	return lesson;
+}
+
+export function listRetroDue(store: CompassStore, now = nowIso()): RetroDueItem[] {
+	const strategy = store.strategies.filter((item) => item.id === "jingpu-daily10").sort((a, b) => b.version - a.version)[0];
+	return dueRetroItems(store, now, retroDueConfig(strategy?.definition.meta));
+}
+
+// 工作台待办：组合预算态、复盘到期、深研指标与多源偏差后委托 todo.ts 纯函数推导
+export function listWorkbenchTodos(store: CompassStore, now = nowIso()): WorkbenchTodo[] {
+	// 非法 now 统一回退当前时钟，避免预算月界与时间类待办各用一套时钟
+	const resolvedNow = Number.isFinite(Date.parse(now)) ? now : nowIso();
+	const budgets = budgetStatus(store, monthPrefix(new Date(resolvedNow)));
+	const retroDue = listRetroDue(store, resolvedNow);
+	const deepResearchMetrics = store.candidates
+		.filter((candidate) => candidate.stage === "deep_research")
+		.map((candidate): { marketId: string; metrics: MetricMap } => {
+			// 仅「无快照」按全缺处理；其余异常（如 store 局部损坏）照常抛出，不伪装成缺数据
+			const snapshot = latestSnapshotIfPresent(store, candidate.marketId);
+			return { marketId: candidate.marketId, metrics: snapshot ? buildStrategyContext(store, candidate.marketId).context.metrics : {} };
+		});
+	const divergentMarkets = [...new Set(store.candidates.filter((candidate) => candidate.stage !== "archived").map((candidate) => candidate.marketId))]
+		.map((marketId) => ({ marketId, metrics: metricDivergences(store, marketId).map((item) => item.metric) }))
+		.filter((item) => item.metrics.length > 0);
+	return deriveTodos({ store, budgets, retroDue, deepResearchMetrics, divergentMarkets, now: resolvedNow });
+}
+
+export function historyTimeline(store: CompassStore, marketRef: string, candidateRef?: string): HistoryTimelineItem[] {
+	const candidate = candidateRef ? findCandidate(store, candidateRef) : undefined;
+	const market = candidate ? findMarket(store, candidate.marketId) : findMarket(store, marketRef);
+	return buildTimeline(store, market.id, candidate?.id);
+}
+
+export function historySearch(store: CompassStore, input: Parameters<typeof searchDecisionHistory>[1]): DecisionLog[] {
+	return searchDecisionHistory(store, input);
+}
+
+export function historySimilar(
+	store: CompassStore,
+	input: { marketRef?: string; name?: string; keywords?: string[]; category?: string; limit?: number },
+): SimilarMarketResult[] {
+	const market = input.marketRef ? findMarket(store, input.marketRef) : undefined;
+	return similarMarkets(store, { marketId: market?.id, name: input.name, keywords: input.keywords, category: input.category, limit: input.limit });
+}
+
+export function historyOutcomes(store: CompassStore, marketRef?: string): { checks: OutcomeCheck[]; stats: OutcomeStats } {
+	const marketId = marketRef ? findMarket(store, marketRef).id : undefined;
+	const checks = store.outcomeChecks.filter((check) => !marketId || check.marketId === marketId).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+	return { checks, stats: outcomeStatistics(store, checks) };
+}
+
+export function historyLessons(
+	store: CompassStore,
+	input: { category?: string; keywords?: string[]; metric?: string; includeRetired?: boolean; limit?: number },
+): Lesson[] {
+	return filterLessons(store, input);
+}
+
+export interface BacktestMarketRow {
+	marketId: string;
+	marketName: string;
+	snapshotId: string;
+	baselineOutcome: StrategyEvaluation["outcome"];
+	strategyOutcome: StrategyEvaluation["outcome"];
+	baselineScore: number;
+	strategyScore: number;
+}
+
+export interface BacktestResult {
+	strategy: string;
+	baselineStrategy: string;
+	matrix: Record<string, number>;
+	flips: BacktestMarketRow[];
+	rows: BacktestMarketRow[];
+	alignment: { strategy: number | null; baseline: number | null; comparableChecks: number };
+}
+
+function desiredOutcomeForCheck(check: OutcomeCheck): "pass" | "reject" | undefined {
+	if (check.verdict === "inconclusive") return undefined;
+	if (check.decisionStatus === "go") return check.verdict === "validated" ? "pass" : "reject";
+	if (check.decisionStatus === "no_go") return check.verdict === "validated" ? "reject" : "pass";
+	return undefined;
+}
+
+export function backtestStrategies(store: CompassStore, strategyRef: string, baselineStrategyRef?: string): BacktestResult {
+	const strategy = findStrategyVersion(store, strategyRef);
+	const baseline = findStrategyVersion(store, baselineStrategyRef ?? "jingpu-daily10");
+	const rows: BacktestMarketRow[] = [];
+	for (const market of store.markets) {
+		const snapshot = latestSnapshotIfPresent(store, market.id);
+		if (!snapshot) continue;
+		const baselineEvaluation = evaluateStrategyVersionOnSnapshot(store, market.id, baseline, "full", snapshot.id);
+		const strategyEvaluation = evaluateStrategyVersionOnSnapshot(store, market.id, strategy, "full", snapshot.id);
+		rows.push({
+			marketId: market.id,
+			marketName: market.name,
+			snapshotId: snapshot.id,
+			baselineOutcome: baselineEvaluation.outcome,
+			strategyOutcome: strategyEvaluation.outcome,
+			baselineScore: baselineEvaluation.score,
+			strategyScore: strategyEvaluation.score,
+		});
+	}
+	const matrix: Record<string, number> = {};
+	for (const before of ["pass", "review", "reject"] as const) for (const after of ["pass", "review", "reject"] as const) matrix[`${before}→${after}`] = 0;
+	for (const row of rows) {
+		const key = `${row.baselineOutcome}→${row.strategyOutcome}`;
+		matrix[key] = (matrix[key] ?? 0) + 1;
+	}
+	const latestComparable = new Map<string, OutcomeCheck>();
+	for (const check of [...store.outcomeChecks].sort((a, b) => b.createdAt.localeCompare(a.createdAt))) {
+		if (desiredOutcomeForCheck(check) && !latestComparable.has(check.marketId)) latestComparable.set(check.marketId, check);
+	}
+	let strategyCorrect = 0;
+	let baselineCorrect = 0;
+	let comparable = 0;
+	for (const [marketId, check] of latestComparable) {
+		const row = rows.find((item) => item.marketId === marketId);
+		const desired = desiredOutcomeForCheck(check);
+		if (!row || !desired) continue;
+		comparable++;
+		if (row.strategyOutcome === desired) strategyCorrect++;
+		if (row.baselineOutcome === desired) baselineCorrect++;
+	}
+	return {
+		strategy: `${strategy.id}@v${strategy.version}`,
+		baselineStrategy: `${baseline.id}@v${baseline.version}`,
+		matrix,
+		flips: rows.filter((row) => row.baselineOutcome !== row.strategyOutcome),
+		rows,
+		alignment: {
+			strategy: comparable ? strategyCorrect / comparable : null,
+			baseline: comparable ? baselineCorrect / comparable : null,
+			comparableChecks: comparable,
+		},
+	};
+}
+
+export function generateRetroReport(store: CompassStore, generatedAt = nowIso()): string {
+	return renderRetroReport(store, generatedAt);
+}
+
+export function leadHistoryNote(store: CompassStore, marketId: string): string[] {
+	const similar = similarMarkets(store, { marketId, limit: 1 })[0];
+	if (!similar) return [];
+	return renderHistoryNote([`与 ${similar.market.id}「${similar.market.name}」相似度 ${(similar.score * 100).toFixed(0)}%（关键词重合 ${similar.keywordOverlap}）；历史结论 ${similar.finalDecision ?? "未决策"}${similar.latestVerdict ? ` / 复盘 ${similar.latestVerdict}` : ""}。`, `先用 compass_history action=timeline market_ref=${similar.market.id} 查看证据，再决定是否重复立项。`]);
+}
+
+export function importHistoryNote(store: CompassStore, marketId: string, snapshotId: string, check?: OutcomeCheck): string[] {
+	const snapshots = store.snapshots.filter((item) => item.marketId === marketId).sort((a, b) => b.capturedAt.localeCompare(a.capturedAt));
+	const current = store.snapshots.find((item) => item.id === snapshotId);
+	const previous = snapshots.find((item) => item.id !== snapshotId && current && item.capturedAt < current.capturedAt);
+	const lines: string[] = [];
+	if (previous && current) {
+		const deltas = calculateMetricDeltas(previous.metrics, current.metrics).filter((item) => item.baseline !== item.current).slice(0, 5);
+		if (deltas.length) lines.push(`快照对照 ${previous.id}→${current.id}：${deltas.map(formatDelta).join("；")}`);
+	}
+	const decision = store.decisionLog.filter((item) => item.marketId === marketId && item.type === "decision").sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+	if (decision) lines.push(`既往决策：${decision.decisionStatus ?? "—"} · ${decision.reason}`);
+	if (check) lines.push(`已生成 ${check.id}：${check.verdict} · ${check.verdictReason}${check.verdict === "challenged" ? "；建议重跑 compass_strategy_run" : ""}`);
+	return renderHistoryNote(lines);
+}
+
+export function strategyHistoryNote(store: CompassStore, run: StrategyRun): string[] {
+	const previous = store.strategyRuns.filter((item) => item.marketId === run.marketId && item.id !== run.id).sort((a, b) => b.runAt.localeCompare(a.runAt))[0];
+	const lines: string[] = [];
+	if (previous) {
+		const previousVeto = previous.result.rules.filter((rule) => rule.status === "veto").length;
+		const currentVeto = run.result.rules.filter((rule) => rule.status === "veto").length;
+		const changedRules = run.result.rules.filter((rule) => previous.result.rules.find((item) => item.id === rule.id)?.status !== rule.status).map((rule) => `${rule.id}:${previous.result.rules.find((item) => item.id === rule.id)?.status ?? "—"}→${rule.status}`);
+		lines.push(`上次 ${previous.id}→本次 ${run.id}：outcome ${previous.result.outcome}→${run.result.outcome}，Score ${previous.result.score}→${run.result.score}，veto ${previousVeto}→${currentVeto}。`);
+		if (changedRules.length) lines.push(`规则变化：${changedRules.slice(0, 5).join("；")}`);
+	}
+	const stats = outcomeStatistics(store);
+	const accuracy = stats.byStrategy.find((item) => item.strategy === `${run.strategyId}@v${run.strategyVersion}`);
+	if (accuracy) lines.push(`该策略版本历史准确率 ${accuracy.accuracy === null ? "—" : `${(accuracy.accuracy * 100).toFixed(0)}%`}（validated ${accuracy.validated} / challenged ${accuracy.challenged} / inconclusive ${accuracy.inconclusive}）。`);
+	return renderHistoryNote(lines);
+}
+
+export function decisionHistoryNote(store: CompassStore, candidate: Candidate): string[] {
+	const market = store.markets.find((item) => item.id === candidate.marketId);
+	const chain = store.decisionLog.filter((item) => item.candidateId === candidate.id);
+	const lines = [`决策链：${chain.length} 条留痕；当前 ${candidate.decisionStatus ?? "未决策"}，stage=${candidate.stage}。`];
+	if (market) {
+		const peers = similarMarkets(store, { marketId: market.id, limit: 3 });
+		const peerChecks = peers.flatMap((peer) => store.outcomeChecks.filter((check) => check.marketId === peer.market.id && check.decisionStatus === "go" && check.verdict !== "inconclusive"));
+		if (peerChecks.length) lines.push(`相似市场 go 品实绩达成率 ${(peerChecks.filter((check) => check.verdict === "validated").length / peerChecks.length * 100).toFixed(0)}%（${peerChecks.length} 条可判定复盘）。`);
+		for (const lesson of matchingLessonsForMarket(store, market.id, 2)) lines.push(`命中经验 ${lesson.id}：${lesson.title}（evidence: ${lesson.evidence.slice(0, 3).join("、")}）`);
+	}
+	return renderHistoryNote(lines);
+}
+
 export function generateMarketReport(
 	store: CompassStore,
 	marketRef: string,
@@ -809,7 +1587,7 @@ export function generateMarketReport(
 ): GeneratedReport {
 	const market = findMarket(store, marketRef);
 	const snapshot = latestSnapshot(store, market.id);
-	const strategy = latestStrategy(store, strategyRef);
+	const strategy = findStrategyVersion(store, strategyRef);
 	const { context } = buildStrategyContext(store, market.id);
 	context.targetMonthlyUnits = Number(strategy.definition.meta.monthly_units_q ?? 300);
 	const evaluation = evaluateStrategy(strategy.definition, context, "full");
@@ -831,6 +1609,8 @@ export function generateMarketReport(
 		review,
 		profit,
 		decisions,
+		outcomeChecks: store.outcomeChecks.filter((item) => item.marketId === market.id).sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
+		lessons: matchingLessonsForMarket(store, market.id),
 		divergences: metricDivergences(store, market.id),
 		attributedCostCny,
 		fusedBudgetSources,

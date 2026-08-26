@@ -9,6 +9,11 @@ meta:
   target_daily_units: 10
   monthly_units_q: 300
   margin_scope: no_ads_no_returns
+  retro_go_days: 30
+  retro_testing_stale_days: 60
+  retro_waitlist_days: 45
+  retro_no_go_days: 90
+  retro_review_days: 30
 
 stages:
   - stage: market_screen
@@ -105,6 +110,7 @@ export const DEFAULT_BUDGET_POOLS: BudgetPool[] = [
 	{ source: "manual_csv", tier: "C", monthlyLimitCny: 0, enabled: true, note: "CSV/人工导入，零增量成本" },
 	{ source: "compass_browser", tier: "C", monthlyLimitCny: 0, enabled: true, note: "用户触发的浏览器伴侣采集" },
 	{ source: "sellersprite", tier: "A", monthlyLimitCny: 500, enabled: true, note: "关键词、CPC、销量估算" },
+	{ source: "sorftime", tier: "A", monthlyLimitCny: 0, enabled: true, note: "Sorftime MCP 在线调用（自动计量）" },
 	{ source: "keepa", tier: "A", monthlyLimitCny: 400, enabled: true, note: "价格、BSR、评论历史" },
 	{ source: "sp_api", tier: "A", monthlyLimitCny: 0, enabled: true, note: "官方费用与自有数据" },
 	{ source: "rainforest", tier: "A", monthlyLimitCny: 300, enabled: false, note: "SERP API 降级源" },

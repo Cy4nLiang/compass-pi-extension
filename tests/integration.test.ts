@@ -8,16 +8,21 @@ import { parseMarketCsv } from "../csv.ts";
 import { DEFAULT_STRATEGY_YAML } from "../defaults.ts";
 import { estimateProfit, normalizeProfitInput } from "../economics.ts";
 import {
+	backtestStrategies,
 	configureBudget,
 	createLead,
+	decideCandidate,
 	ensureDefaults,
 	generateMarketReport,
+	importMarketAndScreen,
 	importParsedMarket,
 	moveCandidate,
 	recordProfitEstimate,
+	recordRetroActuals,
 	recordReviewAnalysis,
 	recordRisk,
 	runStrategy,
+	saveLesson,
 	saveStrategyVersion,
 	scanMarkets,
 } from "../service.ts";
@@ -117,6 +122,7 @@ test("snapshot → economics → review/risk → full GSE → report remains rep
 			const full = runStrategy(store, { marketRef: imported.market.id, mode: "full", actor: "tester" });
 			assert.equal(full.result.outcome, "pass");
 			moveCandidate(store, { candidateRef: imported.candidate.id, stage: "deep_research", reason: "粗筛与完整 Gate 均通过", actor: "tester" });
+			decideCandidate(store, { candidateRef: imported.candidate.id, status: "go", reason: "完整 Gate 通过，利润与风险证据已复核", actor: "tester" });
 			const report = generateMarketReport(store, imported.market.id);
 			assert.match(report.markdown, /罗盘选品报告/);
 			assert.match(report.markdown, /决策回放/);
@@ -134,7 +140,12 @@ test("snapshot → economics → review/risk → full GSE → report remains rep
 		assert.equal(loaded.strategyRuns.length, 2);
 		assert.ok(loaded.decisionLog.length >= 7);
 		assert.equal(loaded.candidates[0].stage, "deep_research");
+		assert.equal(loaded.candidates[0].decisionStatus, "go");
+		assert.match(loaded.candidates[0].decisionReason ?? "", /Gate 通过/);
+		assert.match(loaded.candidates[0].gateReason ?? "", /规则通过/);
+		assert.equal(loaded.candidates[0].stageReason, "粗筛与完整 Gate 均通过");
 		assert.ok(loaded.decisionLog.find((decision) => decision.type === "stage_move")?.strategyVersion);
+		assert.equal(loaded.decisionLog.find((decision) => decision.type === "decision")?.decisionStatus, "go");
 		assert.equal(result.full.result.outcome, "pass");
 		assert.equal(result.report.snapshotId, result.imported.snapshot.id);
 	} finally {
@@ -214,6 +225,98 @@ test("report labels QRD with the active strategy threshold", async () => {
 	saveStrategyVersion(store, { yaml: DEFAULT_STRATEGY_YAML.replace("monthly_units_q: 300", "monthly_units_q: 500"), actor: "tester" });
 	const report = generateMarketReport(store, imported.market.id);
 	assert.match(report.markdown, /QRD\(500\)/);
+});
+
+test("automatic retro closes no_go replay branches, actuals, lessons, report, and backtest", async () => {
+	const csv = await readFile(join(here, "../examples/demo-market.csv"), "utf8");
+	const parsed = parseMarketCsv(csv, { source: "sellersprite", capturedAt: "2026-01-01T00:00:00.000Z" });
+	const oldMarket = structuredClone(parsed);
+	for (const listing of oldMarket.listings) {
+		listing.monthsOnline = 24;
+		listing.launchDate = undefined;
+	}
+	const improved = structuredClone(parsed);
+	for (const listing of improved.listings) {
+		listing.monthsOnline = 1;
+		listing.launchDate = undefined;
+	}
+	const missing = structuredClone(parsed);
+	for (const listing of missing.listings) {
+		listing.monthsOnline = undefined;
+		listing.launchDate = undefined;
+	}
+	const store = createEmptyStore();
+	ensureDefaults(store, "tester");
+
+	const seedNoGo = (name: string) => {
+		const baseline = importMarketAndScreen(store, { marketName: name, parsed: structuredClone(oldMarket), capturedAt: "2026-01-01T00:00:00.000Z", actor: "tester" });
+		assert.equal(baseline.screenRun?.result.outcome, "reject");
+		decideCandidate(store, { candidateRef: baseline.candidate.id, status: "no_go", reason: "新品占比未达门槛", actor: "tester" });
+		return baseline;
+	};
+
+	const challengedBase = seedNoGo("retro challenged");
+	const challenged = importMarketAndScreen(store, { marketName: challengedBase.market.name, parsed: structuredClone(improved), capturedAt: "2026-01-11T00:00:00.000Z", actor: "tester" }).outcomeCheck;
+	assert.equal(challenged?.verdict, "challenged");
+
+	const validatedBase = seedNoGo("retro validated");
+	const validated = importMarketAndScreen(store, { marketName: validatedBase.market.name, parsed: structuredClone(oldMarket), capturedAt: "2026-01-11T00:00:00.000Z", actor: "tester" }).outcomeCheck;
+	assert.equal(validated?.verdict, "validated");
+
+	const inconclusiveBase = seedNoGo("retro inconclusive");
+	const inconclusive = importMarketAndScreen(store, { marketName: inconclusiveBase.market.name, parsed: structuredClone(missing), capturedAt: "2026-01-11T00:00:00.000Z", actor: "tester" }).outcomeCheck;
+	assert.equal(inconclusive?.verdict, "inconclusive");
+
+	const go = importMarketAndScreen(store, { marketName: "retro go actuals", parsed: structuredClone(improved), capturedAt: "2026-01-01T00:00:00.000Z", actor: "tester" });
+	decideCandidate(store, { candidateRef: go.candidate.id, status: "go", reason: "粗筛通过并批准测试", actor: "tester" });
+	const actuals = recordRetroActuals(store, { candidateRef: go.candidate.id, actuals: { dailyUnits: 8, tacos: 0.15, returnRate: 0.04, netMargin: 0.08 }, actor: "tester" });
+	assert.equal(actuals.verdict, "validated");
+	assert.throws(() => saveLesson(store, { title: "无证据", detail: "不允许", evidence: [], actor: "tester" }), /evidence/);
+	const lesson = saveLesson(store, { title: "新品占比回升后需重评", detail: "no_go 的活动度前提翻转时先重跑 Gate", scope: { keywords: ["retro"] }, evidence: [challenged!.id], actor: "tester" });
+	assert.equal(lesson.status, "active");
+	assert.equal(store.decisionLog.at(-1)?.type, "retro");
+	const report = generateMarketReport(store, challengedBase.market.id);
+	assert.match(report.markdown, /## 9\. 历史与复盘/);
+	assert.match(report.markdown, new RegExp(challenged!.id));
+
+	const strategyV1 = `meta:\n  name: retro-threshold\n  display_name: Retro Threshold\nstages:\n  - stage: market_screen\n    rules:\n      - id: activity\n        when: "new_listing_share_12m >= 0.15"\n        action: require\n        label: activity\nscoring:\n  weights:\n    demand: 1\n`;
+	const strategyV2 = strategyV1.replace(">= 0.15", ">= 0.0");
+	saveStrategyVersion(store, { yaml: strategyV1, actor: "tester" });
+	saveStrategyVersion(store, { yaml: strategyV2, actor: "tester" });
+	const backtest = backtestStrategies(store, "retro-threshold@v2", "retro-threshold@v1");
+	assert.ok(backtest.flips.some((row) => row.baselineOutcome === "reject" && row.strategyOutcome === "pass"));
+	assert.equal(backtest.matrix["reject→pass"] >= 1, true);
+});
+
+test("identical file hashes are rejected before duplicate snapshots pollute history", async () => {
+	const csv = await readFile(join(here, "../examples/demo-market.csv"), "utf8");
+	const parsed = parseMarketCsv(csv, { source: "sellersprite", capturedAt: "2026-01-01T00:00:00.000Z" });
+	const store = createEmptyStore();
+	ensureDefaults(store, "tester");
+	importParsedMarket(store, { marketName: "duplicate market", parsed, capturedAt: "2026-01-01T00:00:00.000Z", fileHash: "same-hash", actor: "tester" });
+	assert.throws(() => importParsedMarket(store, { marketName: "duplicate market", parsed, capturedAt: "2026-02-01T00:00:00.000Z", fileHash: "same-hash", actor: "tester" }), /重复 CSV/);
+	assert.equal(store.snapshots.length, 1);
+});
+
+test("legacy schemaVersion 1 stores gain retro collections and write them back lazily", async () => {
+	const root = await mkdtemp(join(tmpdir(), "compass-retro-migration-"));
+	try {
+		const repo = new CompassRepository(root);
+		const legacy = createEmptyStore() as unknown as Record<string, unknown>;
+		delete legacy.outcomeChecks;
+		delete legacy.lessons;
+		await mkdir(dirname(repo.storePath), { recursive: true });
+		await writeFile(repo.storePath, JSON.stringify(legacy), "utf8");
+		const loaded = await repo.load();
+		assert.deepEqual(loaded.outcomeChecks, []);
+		assert.deepEqual(loaded.lessons, []);
+		await repo.update(() => false, { shouldSave: () => false });
+		const persisted = JSON.parse(await readFile(repo.storePath, "utf8")) as Record<string, unknown>;
+		assert.deepEqual(persisted.outcomeChecks, []);
+		assert.deepEqual(persisted.lessons, []);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
 });
 
 test("corrupted store elements fail with a path-aware diagnostic", async () => {

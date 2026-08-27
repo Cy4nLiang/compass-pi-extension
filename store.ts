@@ -385,9 +385,11 @@ export class CompassRepository {
 					if ((statError as NodeJS.ErrnoException).code !== "ENOENT") throw statError;
 				}
 				if (Date.now() >= deadline) throw new StoreIoError(`罗盘数据文件被其他进程锁定超过 10 秒：${this.storePath}`);
-				// ref:false —— 抢锁重试不持有 event loop 引用，否则宿主关闭时会被这条
-				// 最长 10 秒的自旋拖住退出（Web 服务关停后仍在等锁的写就是这种情形）
-				await delay(50, undefined, { ref: false });
+				// 重试定时器必须持有 event loop 引用（默认 ref）：调用方正在 await 这次写入，
+				// unref 会让 loop 一空进程就退，pending 的写静默丢失（CI 上两个锁测试
+				// 正是死于「Promise resolution is still pending but the event loop has
+				// already resolved」）。代价是进程退出最多被在途写拖 10 秒，属正确语义
+				await delay(50);
 			}
 		}
 		try {

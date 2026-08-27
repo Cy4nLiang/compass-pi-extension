@@ -22,6 +22,8 @@ description: Amazon US 中小卖家精铺选品工作流。用于市场 CSV 导�
 
 阶段移动必须调用 `compass_pool(action="move", reason=...)`，写明为什么移动。最终决策必须调用 `compass_pool(action="decide", decision_status="go|waitlist|no_go", reason=...)`；阶段、Gate 和最终决策的每一种状态都必须有原因。否决品也保留，不删除。
 
+替用户汇报候选详情或征询最终决策时，`compass_pool(action="get")` 输出自带该市场的 Amazon 搜索链接与 Top5 竞品链接，可直接转给用户点开核对实况（数字来自本地快照，非实时）；Web 工作台候选池的单品决策页含同一套链接。
+
 ## 推荐执行顺序
 
 ### 1. 线索、导入与粗筛
@@ -117,7 +119,7 @@ description: Amazon US 中小卖家精铺选品工作流。用于市场 CSV 导�
 ## 常用入口
 
 - `/compass`：六页 TUI（总览/待办/市场/候选池/预算/复盘）；
-- `/compass-web [端口|stop]`：浏览器版工作台（多市场档案、导入向导两页），仅本机可访问，不要转发到局域网/公网；也可脱离 pi 用 `npm run web` 独立启动；
+- `/compass-web [端口|stop]`：浏览器版工作台（多市场档案、导入向导、候选卡全屏决策页），仅本机可访问，不要转发到局域网/公网；也可脱离 pi 用 `npm run web` 独立启动；
 - `/compass-import <csv>`：交互导入；
 - `/compass-report [market]`：生成并在会话中展示报告；
 - `/compass-strategy`：版本化编辑 YAML；

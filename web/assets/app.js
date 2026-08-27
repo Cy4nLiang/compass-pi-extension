@@ -1263,14 +1263,11 @@ const DECISION_OPTIONS = [
 	{ key: "no_go", label: "不做" },
 ];
 
-const ICON_CLOSE = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M6 6 L18 18 M18 6 L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"></path></svg>`;
-
-function poolCandidateCardHtml(item, openId) {
-	const isOpen = item.id === openId;
+function poolCandidateCardHtml(item) {
 	const gate = item.gateOutcome
 		? `<span class="pool-gate-badge ${GATE_TONES[item.gateOutcome]}">${gateIconFor(item.gateOutcome)}${escapeHtml(item.gateOutcome)}</span>`
 		: "";
-	const score = item.score !== null ? `<span class="mono pool-card-score ${isOpen ? "is-open" : ""}">${item.score.toFixed(1)}</span>` : "";
+	const score = item.score !== null ? `<span class="mono pool-card-score">${item.score.toFixed(1)}</span>` : "";
 	const decision = item.decisionStatus
 		? `<span class="pool-card-decision ${DECISION_TONES[item.decisionStatus] || ""}">${escapeHtml(DECISION_LABELS[item.decisionStatus] || item.decisionStatus)}</span>`
 		: item.stage === "decision" || item.stage === "testing"
@@ -1282,7 +1279,7 @@ function poolCandidateCardHtml(item, openId) {
 	const contextLine = item.stageReason ? `<div class="pool-card-context">${escapeHtml(item.stageReason)}</div>` : "";
 	const tags = item.tags && item.tags.length ? `<div class="pool-card-tags">${item.tags.map((t) => `<span class="tag-pill">${escapeHtml(t)}</span>`).join("")}</div>` : "";
 	return `
-		<a class="pool-card ${isOpen ? "is-open" : ""}" href="#/pool/${encodeURIComponent(item.id)}">
+		<a class="pool-card" href="#/pool/${encodeURIComponent(item.id)}">
 			<div class="pool-card-title cell-truncate">${escapeHtml(item.marketName || item.marketId)}</div>
 			<div class="pool-card-row">${gate}${score}${decision}</div>
 			${snapshotMeta}
@@ -1292,15 +1289,14 @@ function poolCandidateCardHtml(item, openId) {
 	`;
 }
 
-function poolLaneColumnHtml(lane, openId) {
-	const isOpenLane = lane.items.some((item) => item.id === openId);
+function poolLaneColumnHtml(lane) {
 	const countCls = lane.count === 0 ? "is-empty" : "";
 	const cards = lane.items.length
-		? lane.items.map((item) => poolCandidateCardHtml(item, openId)).join("")
+		? lane.items.map((item) => poolCandidateCardHtml(item)).join("")
 		: `<div class="pool-empty-slot">${escapeHtml(POOL_LANE_EMPTY_TEXT[lane.stage] || "暂无候选")}</div>`;
 	return `
 		<div class="pool-lane">
-			<div class="pool-lane-head ${isOpenLane ? "is-open" : ""}">
+			<div class="pool-lane-head">
 				<span class="pool-lane-label">${escapeHtml(lane.label)}</span>
 				<span class="mono pool-lane-count ${countCls}">${lane.count}</span>
 			</div>
@@ -1309,9 +1305,9 @@ function poolLaneColumnHtml(lane, openId) {
 	`;
 }
 
-function poolCollapsedColumnHtml(lanes, openId) {
+function poolCollapsedColumnHtml(lanes) {
 	const rows = lanes.map((lane) => `
-		<div class="pool-collapsed-row ${lane.stage === "archived" ? "is-archived" : ""} ${lane.items.some((item) => item.id === openId) ? "is-open" : ""}">
+		<div class="pool-collapsed-row ${lane.stage === "archived" ? "is-archived" : ""}">
 			<span>${escapeHtml(lane.label)}</span>
 			<span class="mono">${lane.count}</span>
 		</div>
@@ -1327,13 +1323,13 @@ function poolCollapsedColumnHtml(lanes, openId) {
 	`;
 }
 
-function buildPoolBoardHtml(lanes, openId) {
+function buildPoolBoardHtml(lanes) {
 	const standardLanes = POOL_STANDARD_STAGES.map((stage) => lanes.find((l) => l.stage === stage));
 	const collapsedLanes = POOL_COLLAPSED_STAGES.map((stage) => lanes.find((l) => l.stage === stage));
 	return `
 		<div class="pool-board" id="pool-board">
-			${standardLanes.map((lane) => poolLaneColumnHtml(lane, openId)).join("")}
-			${poolCollapsedColumnHtml(collapsedLanes, openId)}
+			${standardLanes.map((lane) => poolLaneColumnHtml(lane)).join("")}
+			${poolCollapsedColumnHtml(collapsedLanes)}
 		</div>
 	`;
 }
@@ -1364,12 +1360,12 @@ function filterPoolLanes(data, state) {
 	return data.lanes.map((lane) => ({ ...lane, items: lane.items.filter(matches) }));
 }
 
-function bindPoolFilters(content, data, state, openId) {
+function bindPoolFilters(content, data, state) {
 	const bar = content.querySelector("#pool-filter-bar");
 	if (!bar) return;
 	const rerenderBoard = () => {
 		const boardEl = content.querySelector("#pool-board");
-		if (boardEl) boardEl.outerHTML = buildPoolBoardHtml(filterPoolLanes(data, state), openId);
+		if (boardEl) boardEl.outerHTML = buildPoolBoardHtml(filterPoolLanes(data, state));
 	};
 	for (const chip of bar.querySelectorAll(".pool-gate-chip")) {
 		chip.addEventListener("click", () => {
@@ -1393,29 +1389,6 @@ function bindPoolFilters(content, data, state, openId) {
 	}
 }
 
-function buildDrawerHeaderHtml(candidate) {
-	const gate = candidate.gateOutcome
-		? `<span class="badge-pill ${toneToPillClass(GATE_TONES[candidate.gateOutcome])}" style="display:inline-flex; align-items:center; gap:4px;">${gateIconFor(candidate.gateOutcome)}Gate ${escapeHtml(candidate.gateOutcome)}</span>`
-		: `<span class="badge-pill pill-muted">Gate —</span>`;
-	const decision = candidate.decisionStatus
-		? `<span class="badge-pill ${toneToPillClass(DECISION_TONES[candidate.decisionStatus])}">决策 ${escapeHtml(DECISION_LABELS[candidate.decisionStatus] || candidate.decisionStatus)}</span>`
-		: `<span class="badge-pill pill-muted">待决策</span>`;
-	return `
-		<div class="drawer-header">
-			<div class="drawer-header-row">
-				<div class="drawer-title cell-truncate">${escapeHtml(candidate.marketName || candidate.marketId)}</div>
-				<a href="#/pool" class="drawer-close" title="关闭">${ICON_CLOSE}</a>
-			</div>
-			<div class="drawer-badges">
-				<span class="badge-pill pill-accent">阶段 ${escapeHtml(candidate.stageLabel)}</span>
-				${gate}
-				${decision}
-				<span class="mono drawer-score">${candidate.score !== null ? candidate.score.toFixed(1) : "—"}</span>
-			</div>
-		</div>
-	`;
-}
-
 function gateRuleListHtml(rules) {
 	return `<div class="gate-rule-list">${rules.map((rule) => `
 		<div class="gate-rule-row">
@@ -1424,26 +1397,6 @@ function gateRuleListHtml(rules) {
 			<span class="mono cell-right ${ruleStatusTone(rule.status)}" style="font-size:11px;">${escapeHtml(rule.message || "—")}</span>
 		</div>
 	`).join("")}</div>`;
-}
-
-function buildDrawerBodyHtml(detail) {
-	const run = detail.latestRun;
-	const ruleSummary = run && run.rules.length ? gateRuleListHtml(run.rules) : `<div class="empty-note">尚无策略评估</div>`;
-	const decisionsHtml = detail.decisions.length
-		? `<div class="decision-timeline">${detail.decisions.map(decisionTimelineItemHtml).join("")}</div>`
-		: `<div class="empty-note">暂无决策记录</div>`;
-	return `
-		<div class="drawer-body">
-			<div class="drawer-section">
-				<div class="drawer-section-title">Gate 规则摘要${run ? ` <span class="cell-muted" style="font-weight:400;">· ${escapeHtml(run.strategyRef)}</span>` : ""}</div>
-				${ruleSummary}
-			</div>
-			<div class="drawer-section">
-				<div class="drawer-section-title">决策日志</div>
-				${decisionsHtml}
-			</div>
-		</div>
-	`;
 }
 
 function buildMoveStageFormHtml(candidate) {
@@ -1484,19 +1437,6 @@ function buildDecideFormHtml() {
 	`;
 }
 
-function buildDrawerHtml(detail) {
-	return `
-		<div class="drawer" id="pool-drawer">
-			${buildDrawerHeaderHtml(detail.candidate)}
-			${buildDrawerBodyHtml(detail)}
-			<div class="drawer-footer">
-				${buildMoveStageFormHtml(detail.candidate)}
-				${buildDecideFormHtml()}
-			</div>
-		</div>
-	`;
-}
-
 // 写操作失败原样展示后端中文错误（含「候选已处于 X 阶段」「阶段移动必须填写理由」等）；
 // 成功与失败都不在这里决定下一步——调用方决定成功后如何刷新
 async function submitPoolWrite(path, payload, formEl, errorEl) {
@@ -1515,7 +1455,7 @@ async function submitPoolWrite(path, payload, formEl, errorEl) {
 	}
 }
 
-function bindDrawerForms(content, candidateId, onSuccess) {
+function bindDecisionForms(content, candidateId, onSuccess) {
 	const moveForm = content.querySelector("#pool-move-form");
 	const decideForm = content.querySelector("#pool-decide-form");
 	if (!moveForm || !decideForm) return;
@@ -1569,11 +1509,206 @@ function bindDrawerForms(content, candidateId, onSuccess) {
 	});
 }
 
-function buildPoolEmptyDrawerHtml() {
-	return `<div class="drawer drawer-empty"><div class="empty-note">点击左侧候选卡查看详情</div></div>`;
+
+// ── 单品决策页：点候选卡后全屏聚焦该产品（看板退场），链接/证据/操作一屏完成 ──
+
+function buildDecisionBreadcrumbHtml(candidate) {
+	return `
+		<div class="breadcrumb-row">
+			<div class="breadcrumb">
+				<a href="#/pool" class="breadcrumb-back" title="返回候选池">${ICON_BACK}</a>
+				<span class="cell-muted">候选池</span>
+				<span class="cell-dim">/</span>
+				<span class="breadcrumb-current cell-truncate">${escapeHtml(candidate.marketName || candidate.marketId)}</span>
+			</div>
+			<div class="breadcrumb-actions">
+				<a href="#/market/${encodeURIComponent(candidate.marketId)}" class="btn btn-outline">查看市场档案 →</a>
+			</div>
+		</div>
+	`;
+}
+
+function buildDecisionHeaderHtml(candidate) {
+	const badges = [
+		`<span class="badge-pill pill-accent">阶段 ${escapeHtml(candidate.stageLabel)}</span>`,
+		candidate.gateOutcome
+			? `<span class="badge-pill ${toneToPillClass(GATE_TONES[candidate.gateOutcome])}" style="display:inline-flex; align-items:center; gap:4px;">${gateIconFor(candidate.gateOutcome)}Gate <span class="mono">${escapeHtml(candidate.gateOutcome.toUpperCase())}</span></span>`
+			: `<span class="badge-pill pill-muted">Gate —</span>`,
+		candidate.decisionStatus
+			? `<span class="badge-pill ${toneToPillClass(DECISION_TONES[candidate.decisionStatus])}">决策 ${escapeHtml(DECISION_LABELS[candidate.decisionStatus] || candidate.decisionStatus)}</span>`
+			: `<span class="badge-pill pill-muted">待决策</span>`,
+		`Score <span class="mono" style="font-size:15px; font-weight:600;">${candidate.score !== null ? candidate.score.toFixed(1) : "—"}</span>`,
+	];
+	const metaParts = [`建卡 ${escapeHtml(candidate.createdAt.slice(0, 10))}`, `更新 ${escapeHtml(candidate.updatedAt.slice(0, 10))}`];
+	if (candidate.owner) metaParts.push(`负责人 ${escapeHtml(candidate.owner)}`);
+	if (candidate.tags.length) metaParts.push(candidate.tags.map((tag) => `#${escapeHtml(tag)}`).join(" "));
+	return `
+		<div class="dossier-header">
+			<div class="dossier-title cell-truncate">${escapeHtml(candidate.marketName || candidate.marketId)}</div>
+			<div class="dossier-badges">${badges.join(`<span class="cell-dim">·</span>`)}</div>
+			<div class="dossier-meta mono cell-dim">${metaParts.join(" · ")}</div>
+		</div>
+	`;
+}
+
+function decisionListingRowHtml(row) {
+	const price = row.price !== null ? `$${row.price.toFixed(2)}` : "—";
+	const rating = row.rating !== null ? `★${row.rating.toFixed(1)}` : "—";
+	const sales = row.monthlySales !== null ? `月销 ${row.monthlySales.toLocaleString("zh-CN")}` : "月销 —";
+	// url 为 null（无/非法 ASIN）时行保留参考数据但不带链接（spec 4.2.5）
+	const open = row.url
+		? `<a class="btn btn-outline listing-open" href="${escapeHtml(row.url)}" target="_blank" rel="noopener noreferrer">打开 ↗</a>`
+		: `<span class="cell-dim" style="font-size:11px;">无链接</span>`;
+	return `
+		<div class="listing-row">
+			<span class="mono cell-dim">#${row.rank}</span>
+			<span class="cell-truncate" title="${escapeHtml(row.title || "")}">${escapeHtml(row.title || row.asin || "（无标题）")}</span>
+			<span class="mono cell-right">${escapeHtml(price)}</span>
+			<span class="mono cell-right">${escapeHtml(rating)}</span>
+			<span class="mono cell-right">${escapeHtml(sales)}</span>
+			${open}
+		</div>
+	`;
+}
+
+function buildDecisionLinksPanelHtml(links) {
+	const searches = links.searches.length
+		? `<div class="chip-row" style="margin-bottom:10px;">${links.searches.map((item) => `<a class="chip" href="${escapeHtml(item.url)}" target="_blank" rel="noopener noreferrer">搜索：${escapeHtml(item.keyword)} ↗</a>`).join("")}</div>`
+		: "";
+	const listings = links.topListings.length
+		? `<div class="listing-rows">${links.topListings.map(decisionListingRowHtml).join("")}</div>`
+		: `<div class="empty-note">尚无可核对的竞品 listing——先导入市场 CSV</div>`;
+	return `
+		<div class="panel">
+			<div class="panel-title">Amazon 实况核对</div>
+			${searches}
+			${listings}
+			<div class="panel-footnote">链接在新标签页打开你自己的浏览器会话；行内数字来自本地快照，非实时</div>
+		</div>
+	`;
+}
+
+function buildDecisionMetricsPanelHtml(keyMetrics) {
+	const cards = keyMetrics.map((row) => {
+		const missing = row.value === null;
+		const sub = row.source
+			? [escapeHtml(row.source), row.capturedAt ? escapeHtml(row.capturedAt.slice(5, 10)) : null].filter(Boolean).join(" · ")
+			: "—";
+		return `
+			<div class="kpi-card">
+				<div class="kpi-label">${escapeHtml(row.label)}</div>
+				<div class="kpi-value ${missing ? "tone-warning" : ""}">${escapeHtml(row.display)}</div>
+				<div class="kpi-sub mono">${sub}</div>
+			</div>
+		`;
+	}).join("");
+	return `
+		<div class="panel">
+			<div class="panel-title">关键指标 <span class="cell-muted" style="font-weight:400;">Gate 口径</span></div>
+			<div class="kpi-grid">${cards}</div>
+			<div class="panel-footnote">与策略引擎同口径：无快照或未测算时按「缺」展示，不回填估算值</div>
+		</div>
+	`;
+}
+
+function buildDecisionScorePanelHtml(latestRun) {
+	if (!latestRun) return `<div class="panel"><div class="panel-title">五维评分</div><div class="empty-note" style="margin-top:10px;">尚无策略评估</div></div>`;
+	const rows = latestRun.dimensionScores.map((dimension) => {
+		const score = dimension.score;
+		const pct = score === null ? 0 : Math.max(0, Math.min(100, score));
+		const fillTone = score === null ? "" : score >= 75 ? "tone-success-fill" : "tone-warning-fill";
+		return `
+			<div class="score-row">
+				<div class="score-label">${escapeHtml(dimension.label)}</div>
+				<div class="score-track"><div class="score-fill ${fillTone}" style="width:${pct}%;"></div></div>
+				<div class="score-value mono cell-right">${score === null ? "—" : score.toFixed(1)}</div>
+			</div>
+		`;
+	}).join("");
+	return `<div class="panel"><div class="panel-title">五维评分</div><div class="score-rows">${rows}</div></div>`;
+}
+
+function buildDecisionProfitPanelHtml(profit) {
+	if (!profit) return `<div class="panel"><div class="panel-title">利润测算</div><div class="empty-note" style="margin-top:10px;">尚无测算——在 pi 里说「给这个市场做利润测算」</div></div>`;
+	const rows = [
+		["毛利率", `${(profit.grossMargin * 100).toFixed(1)}%`],
+		["BE-CPC", `${profit.breakEvenCpc.toFixed(2)} ${profit.currency}`],
+		["CPC 承受度", profit.cpcRatio !== null ? profit.cpcRatio.toFixed(2) : "—"],
+		["启动资金", `${profit.startupCapital.toFixed(0)} ${profit.currency}`],
+	].map(([label, value]) => `<div class="fact-row"><span class="cell-muted">${escapeHtml(label)}</span><span class="mono cell-right">${escapeHtml(value)}</span></div>`).join("");
+	return `<div class="panel"><div class="panel-title">利润测算 <span class="mono cell-muted" style="font-weight:400;">${escapeHtml(profit.createdAt.slice(0, 10))}</span></div>${rows}</div>`;
+}
+
+const RISK_FLAG_LABELS = { certStatus: "认证", ipRiskLevel: "知识产权", seasonFlag: "季节", policyFlag: "政策", logisticsRisk: "物流" };
+const RISK_VALUE_TONES = { pass: "tone-success", clear: "tone-success", review: "tone-warning", strong: "tone-warning", unknown: "tone-warning", red: "tone-error" };
+
+function buildDecisionRiskPanelHtml(risk) {
+	if (!risk) return `<div class="panel"><div class="panel-title">风险核查</div><div class="empty-note" style="margin-top:10px;">尚未核查——五类风险需官方证据留痕</div></div>`;
+	const overallTone = RISK_VALUE_TONES[risk.overall] || "tone-muted";
+	const flags = Object.entries(RISK_FLAG_LABELS)
+		.map(([key, label]) => `<div class="fact-row"><span class="cell-muted">${escapeHtml(label)}</span><span class="mono cell-right ${RISK_VALUE_TONES[risk[key]] || ""}">${escapeHtml(risk[key])}</span></div>`)
+		.join("");
+	return `<div class="panel"><div class="panel-title">风险核查 <span class="badge-pill ${toneToPillClass(overallTone)}">${escapeHtml(risk.overall)}</span></div>${flags}</div>`;
+}
+
+function buildDecisionRulesPanelHtml(latestRun) {
+	const body = latestRun && latestRun.rules.length ? gateRuleListHtml(latestRun.rules) : `<div class="empty-note">尚无策略评估</div>`;
+	return `<div class="panel"><div class="panel-title">Gate 规则摘要${latestRun ? ` <span class="mono cell-muted" style="font-weight:400;">${escapeHtml(latestRun.strategyRef)}</span>` : ""}</div>${body}</div>`;
+}
+
+function buildDecisionHistoryPanelHtml(decisions) {
+	const shown = decisions.slice(0, 8);
+	const body = shown.length
+		? `<div class="decision-timeline">${shown.map(decisionTimelineItemHtml).join("")}</div>`
+		: `<div class="empty-note">暂无决策记录</div>`;
+	// API 对 decisions 封顶 50 条（web/data.ts）：满 50 时真实总数可能更多，措辞用「50+」防自述失真
+	const countLabel = decisions.length >= 50 ? "50+" : String(decisions.length);
+	const more = decisions.length > 8 ? `<div class="panel-footnote">仅显示最近 8 条 / 共 ${countLabel} 条；完整历史可在 pi 中用 compass_history 查询</div>` : "";
+	return `<div class="panel"><div class="panel-title">决策日志 <span class="mono cell-muted">${countLabel}</span></div>${body}${more}</div>`;
+}
+
+function buildDecisionPageHtml(detail) {
+	return `
+		<div class="decide-page">
+			${buildDecisionBreadcrumbHtml(detail.candidate)}
+			${buildDecisionHeaderHtml(detail.candidate)}
+			${buildDecisionLinksPanelHtml(detail.links)}
+			${buildDecisionMetricsPanelHtml(detail.keyMetrics)}
+			<div class="decide-grid-3">
+				${buildDecisionScorePanelHtml(detail.latestRun)}
+				${buildDecisionProfitPanelHtml(detail.profitSummary)}
+				${buildDecisionRiskPanelHtml(detail.riskSummary)}
+			</div>
+			${buildDecisionRulesPanelHtml(detail.latestRun)}
+			${buildDecisionHistoryPanelHtml(detail.decisions)}
+			<div class="panel decide-actions">
+				<div class="panel-title">决策操作</div>
+				${buildMoveStageFormHtml(detail.candidate)}
+				${buildDecideFormHtml()}
+			</div>
+		</div>
+	`;
+}
+
+async function renderPoolDecision(content, isCurrent, candidateRef) {
+	refreshGlobalChrome(isCurrent);
+	let detail;
+	try {
+		detail = await fetchApi(`/api/pool/${encodeURIComponent(candidateRef)}`);
+	} catch (error) {
+		if (!isCurrent()) return;
+		content.innerHTML = `<div class="error-panel">加载候选详情失败：${escapeHtml(error.message)} <a href="#/pool">← 返回候选池</a></div>`;
+		return;
+	}
+	if (!isCurrent()) return;
+	content.innerHTML = buildDecisionPageHtml(detail);
+	// 决策/移动成功即完成聚焦页的任务，回看板（spec 4.3）。
+	// isCurrent 必须校验：POST 挂起期间用户可导航离开，成功回调不得把人从别的页面拽回看板
+	bindDecisionForms(content, detail.candidate.id, () => { if (isCurrent()) location.hash = "#/pool"; });
 }
 
 async function renderPool(content, isCurrent, candidateRef) {
+	if (candidateRef) return renderPoolDecision(content, isCurrent, candidateRef);
 	refreshGlobalChrome(isCurrent);
 	let data;
 	try {
@@ -1584,40 +1719,19 @@ async function renderPool(content, isCurrent, candidateRef) {
 		return;
 	}
 	if (!isCurrent()) return;
-
-	let detail = null;
-	let detailError = null;
-	if (candidateRef) {
-		try {
-			detail = await fetchApi(`/api/pool/${encodeURIComponent(candidateRef)}`);
-		} catch (error) {
-			detailError = error.message;
-		}
-		if (!isCurrent()) return;
-	}
-
-	const drawerHtml = detail
-		? buildDrawerHtml(detail)
-		: detailError
-			? `<div class="drawer"><div class="error-panel">加载候选详情失败：${escapeHtml(detailError)}</div></div>`
-			: buildPoolEmptyDrawerHtml();
-
 	content.innerHTML = `
-		<div class="pool-layout">
-			<div class="pool-main">
-				${buildPoolFilterBarHtml(data)}
-				${buildPoolBoardHtml(data.lanes, candidateRef ?? null)}
-			</div>
-			${drawerHtml}
+		<div class="pool-main">
+			${buildPoolFilterBarHtml(data)}
+			${buildPoolBoardHtml(data.lanes)}
 		</div>
 	`;
-
 	const state = { gate: "all", decisions: new Set() };
-	bindPoolFilters(content, data, state, candidateRef ?? null);
-	if (detail) bindDrawerForms(content, detail.candidate.id, () => renderPool(content, isCurrent, candidateRef));
+	bindPoolFilters(content, data, state);
 }
 
 // ── 导入 CSV 向导 ──────────────────────────────────────────────────────
+
+const ICON_CLOSE = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M6 6 L18 18 M18 6 L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"></path></svg>`;
 
 // 与 types.ts SNAPSHOT_SOURCES 同口径的前端小份复制（见候选池段落顶部注释的说明）
 const SNAPSHOT_SOURCES_CLIENT = ["auto", "sellersprite", "sorftime", "keepa", "compass_browser", "manual_csv", "generic_csv"];

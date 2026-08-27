@@ -46,6 +46,7 @@ import {
 	listRetroDue,
 	listWorkbenchTodos,
 	mainCpcForMarket,
+	marketAmazonLinks,
 	generateMarketReport,
 	listStrategies,
 	moveCandidate,
@@ -166,7 +167,7 @@ const TOOL_CATALOG: Array<{ name: (typeof DOMAIN_TOOLS)[number]; keywords: strin
 	{ name: "compass_profit_estimate", keywords: "profit economics 利润 毛利 cpc fba 回本 资金", description: "计算毛利、BE-CPC、三情景净利和启动资金" },
 	{ name: "compass_strategy_run", keywords: "strategy run gate score gse 策略 执行 评分", description: "运行版本化 GSE 策略" },
 	{ name: "compass_strategy_manage", keywords: "strategy yaml edit clone 策略 编辑 复制 版本", description: "列出、读取、保存、复制策略 YAML" },
-	{ name: "compass_pool", keywords: "pool kanban candidate stage decision go waitlist no_go 候选池 看板 移动 决策", description: "管理候选池并记录阶段、Gate 与最终 go/waitlist/no_go 状态及原因" },
+	{ name: "compass_pool", keywords: "pool kanban candidate stage decision go waitlist no_go amazon 候选池 看板 移动 决策 链接 竞品", description: "管理候选池并记录阶段、Gate 与最终 go/waitlist/no_go 状态及原因；get 输出附 Amazon 搜索与竞品链接" },
 	{ name: "compass_risk_check", keywords: "risk patent trademark cert policy 风险 专利 商标 认证 擦边 季节", description: "记录五类风险清单与官方证据链接" },
 	{ name: "compass_reviews_record", keywords: "review pain kano 差评 评论 痛点 聚类 产品力", description: "保存差评主题、可改良性和预估星级差" },
 	{ name: "compass_budget", keywords: "budget cost quota source 预算 成本 配额 数据源 熔断 计量 调用次数", description: "查看、配置预算池并按市场记账；MCP 计量源可配单价与次数上限" },
@@ -708,8 +709,21 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			if (params.action === "get") {
 				if (!params.candidate_ref) throw new Error("get 需要 candidate_ref");
 				const { candidate, marketName, decisions } = candidateDetail(store, params.candidate_ref);
-				const output = [`${candidate.id} | ${marketName} | ${candidate.stage} | Gate=${candidate.gateOutcome ?? "—"} | Score=${candidate.score ?? "—"} | Decision=${candidate.decisionStatus ?? "—"}`, `当前阶段原因：${candidate.stageReason ?? "—"}`, `Gate原因：${candidate.gateReason ?? "—"}`, `决策原因：${candidate.decisionReason ?? "—"}`, ...decisions.map((decision) => `${decision.createdAt} | ${decision.type} | ${decision.conclusion} | ${decision.actor} | ${decision.reason}`)];
-				return textResult(output.join("\n"), details({ title: marketName ?? candidate.id, status: "success", summary: `${candidate.stage} · ${decisions.length} 条决策记录`, lines: output.slice(1, 11) }));
+				// 决策链正文与 Web API 同口径 ≤50 条（newest-first）：无上限的长决策链会把末尾链接行挤出 45KB 截断窗
+				const decisionLines = decisions.slice(0, 50).map((decision) => `${decision.createdAt} | ${decision.type} | ${decision.conclusion} | ${decision.actor} | ${decision.reason}`);
+				if (decisions.length > 50) decisionLines.push(`（仅显示最近 50 条 / 共 ${decisions.length} 条，完整决策链用 compass_history 查询）`);
+				const body = [`${candidate.id} | ${marketName ?? candidate.marketId} | ${candidate.stage} | Gate=${candidate.gateOutcome ?? "—"} | Score=${candidate.score ?? "—"} | Decision=${candidate.decisionStatus ?? "—"}`, `当前阶段原因：${candidate.stageReason ?? "—"}`, `Gate原因：${candidate.gateReason ?? "—"}`, `决策原因：${candidate.decisionReason ?? "—"}`, ...decisionLines];
+				// Amazon 实况核对链接（≤3 搜索 + ≤5 竞品）：与 Web 决策页共用 service helper，不自行拼 URL。
+				// asin 是不可信 CSV/sidecar 文本（helper 契约：原文透传、sink 侧中和）——折叠空白防内嵌换行断行伪造输出
+				const links = marketAmazonLinks(store, candidate.marketId);
+				const linkLines = [
+					...links.searches.map((item) => `Amazon 搜索：${item.url}`),
+					...(links.topListings.length
+						? links.topListings.map((row) => `Top竞品：#${row.rank} ${row.asin ? row.asin.replace(/\s+/g, " ") : "—"} ${row.price !== undefined ? `$${row.price.toFixed(2)}` : "$—"} ${row.rating !== undefined ? `★${row.rating.toFixed(1)}` : "★—"} 月销${row.monthlySales ?? "—"} ${row.url ?? "（无链接）"}`)
+						: ["（尚无可核对的竞品 listing，无链接）"]),
+				];
+				// details 预览有界：理由 3 行 + 最近决策 ≤4 行 + 链接 ≤8 行；完整决策链在正文
+				return textResult([...body, ...linkLines].join("\n"), details({ title: marketName ?? candidate.id, status: "success", summary: `${candidate.stage} · ${decisions.length} 条决策记录`, lines: [...body.slice(1, 8), ...linkLines] }));
 			}
 			const items = listPoolCandidates(store, { stage: params.stage, outcome: params.outcome, decisionStatus: params.decision_status });
 			const lines = items.map(({ candidate, marketName }) => `${candidate.id} | ${marketName ?? candidate.marketId} | ${candidate.stage} | ${candidate.gateOutcome ?? "—"} | ${candidate.score ?? "—"} | ${candidate.decisionStatus ?? "—"}`);

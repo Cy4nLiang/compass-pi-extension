@@ -10,6 +10,7 @@ import {
 	listPoolCandidates,
 	listRetroDue,
 	listWorkbenchTodos,
+	marketAmazonLinks,
 	metricDivergences,
 	targetMonthlyUnits,
 } from "../service.ts";
@@ -31,8 +32,10 @@ import {
 } from "../types.ts";
 
 // Web API 的 DTO 组装层：全部为只读纯函数 (store, ...) => JSON 安全对象。
-// 红线：绝不序列化 snapshot.listings / snapshot.keywords —— 它们是懒加载 getter，
-// 展开会触发全量快照明细的磁盘读取；本层只显式挑选标量字段与 metrics。
+// 红线：列表类 DTO 绝不序列化 snapshot.listings / snapshot.keywords —— 它们是懒加载
+// getter，展开会触发全量快照明细的磁盘读取；本层只显式挑选标量字段与 metrics。
+// 唯一豁免：单品详情（poolCandidateData）经 service.marketAmazonLinks 有界读取一个市场
+// 最新快照的前 N 条 listing 生成链接——不得在任何列表类 DTO 复制该模式。
 
 const DIMENSION_SCORE_LABELS: Array<{ key: string; label: string }> = [
 	{ key: "demand", label: "需求" },
@@ -427,24 +430,72 @@ export function poolData(store: CompassStore, now = new Date().toISOString()) {
 	};
 }
 
+// 决策页的核心指标：与粗筛/深研 Gate 口径一致的五个决策锚点
+const KEY_DECISION_METRICS = ["qualify_rank_depth", "cr3", "new_listing_share_12m", "gross_margin", "cpc_ratio"] as const;
+
 export function poolCandidateData(store: CompassStore, reference: string) {
 	const { candidate, marketName, decisions } = candidateDetail(store, reference);
 	const linkedRun = candidate.latestStrategyRunId ? store.strategyRuns.find((run) => run.id === candidate.latestStrategyRunId) : undefined;
 	const run = linkedRun ?? latestRunForMarket(store, candidate.marketId);
+	const units = targetMonthlyUnits(store);
+	// 决策证据：与深研/待办同口径的完整指标上下文（无快照时全部按缺失展示）
+	const metrics = latestSnapshotIfPresent(store, candidate.marketId)
+		? buildStrategyContext(store, candidate.marketId).context.metrics
+		: {};
+	const profit = [...store.profitEstimates]
+		.filter((item) => item.marketId === candidate.marketId)
+		.sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+	const risk = [...store.riskRecords]
+		.filter((item) => item.marketId === candidate.marketId)
+		.sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+	const links = marketAmazonLinks(store, candidate.marketId);
 	return {
 		candidate: pickCandidate(candidate, marketName),
 		decisions: decisions.slice(0, 50).map(pickDecision),
+		// helper 侧保持 optional（工具面 TS 惯用形态）；DTO 出口把可选字段归一为 null，
+		// 与本层「JSON 安全对象」惯例一致——前端既有判空惯例是严格 !== null
+		links: {
+			searches: links.searches,
+			topListings: links.topListings.map((row) => ({
+				rank: row.rank,
+				asin: row.asin ?? null,
+				url: row.url ?? null,
+				title: row.title ?? null,
+				price: row.price ?? null,
+				rating: row.rating ?? null,
+				monthlySales: row.monthlySales ?? null,
+			})),
+		},
+		keyMetrics: KEY_DECISION_METRICS.map((key) => metricRow(key, metrics[key], units)),
+		profitSummary: profit
+			? {
+				grossMargin: profit.result.grossMargin,
+				breakEvenCpc: profit.result.breakEvenCpc,
+				cpcRatio: profit.result.cpcRatio ?? null,
+				startupCapital: profit.result.startupCapital,
+				currency: profit.input.currency,
+				createdAt: profit.createdAt,
+			}
+			: null,
+		riskSummary: risk
+			? {
+				overall: risk.overall,
+				certStatus: risk.certStatus,
+				ipRiskLevel: risk.ipRiskLevel,
+				seasonFlag: risk.seasonFlag,
+				policyFlag: risk.policyFlag,
+				logisticsRisk: risk.logisticsRisk,
+				createdAt: risk.createdAt,
+			}
+			: null,
 		latestRun: run
 			? {
 				id: run.id,
 				mode: run.mode,
 				runAt: run.runAt,
 				strategyRef: `${run.strategyId}@v${run.strategyVersion}`,
-				outcome: run.result.outcome,
-				outcomeLabel: outcomeLabel(run.result.outcome),
-				score: run.result.score,
-				rules: run.result.rules.map(pickRule),
-				missingMetrics: run.result.missingMetrics,
+				// mapEvaluation 是原手工字段的严格超集（多 dimensionScores）——决策页五维分的唯一来源
+				...mapEvaluation(run.result),
 			}
 			: null,
 	};

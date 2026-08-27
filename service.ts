@@ -861,6 +861,78 @@ export function candidateDetail(store: CompassStore, reference: string): Candida
 	};
 }
 
+// ── Amazon 链接生成：Web 决策页与 compass_pool 输出共用的单一真相源 ──
+// ASIN/关键词来自外部 CSV，属不可信输入：ASIN 白名单校验、关键词 URL 编码后才进入 href
+const ASIN_PATTERN = /^[A-Z0-9]{10}$/;
+
+export function amazonProductUrl(asin: string | undefined): string | undefined {
+	if (typeof asin !== "string") return undefined;
+	// CSV 中的 ASIN 可能为小写；归一为大写后再过白名单
+	const normalized = asin.trim().toUpperCase();
+	return ASIN_PATTERN.test(normalized) ? `https://www.amazon.com/dp/${normalized}` : undefined;
+}
+
+export function amazonSearchUrl(keyword: string): string {
+	return `https://www.amazon.com/s?k=${encodeURIComponent(keyword.trim())}`;
+}
+
+// 契约：url/keyword/title 均为原文透传（url 已过白名单/编码，keyword/title 完全未清洗）。
+// 进入 HTML 时消费方必须做含引号的全量转义（沿用 web/assets/app.js 的 escapeHtml，
+// 其已覆盖 ' 与 "）且属性一律用双引号——encodeURIComponent 不编码单引号。
+export interface MarketAmazonLinks {
+	searches: Array<{ keyword: string; url: string }>;
+	topListings: Array<{
+		rank: number;
+		asin?: string;
+		url?: string;
+		title?: string;
+		price?: number;
+		rating?: number;
+		monthlySales?: number;
+	}>;
+}
+
+// 负数会让 slice(0, n) 语义反转成「除末 n 条外全部」；NaN 会让 Math.max 失效——先 isFinite
+function clampCount(value: number, fallback: number): number {
+	return Number.isFinite(value) ? Math.max(0, Math.floor(value)) : fallback;
+}
+
+// 读取该市场最新快照 listings 的前 topN 条（rank 升序）。会触碰快照明细懒加载——
+// 仅限单品详情类消费方调用，列表类 DTO 禁止（web/data.ts 红线）
+export function marketAmazonLinks(
+	store: CompassStore,
+	marketId: string,
+	options?: { topN?: number; maxKeywords?: number },
+): MarketAmazonLinks {
+	const topN = clampCount(options?.topN ?? 5, 5);
+	const maxKeywords = clampCount(options?.maxKeywords ?? 3, 3);
+	const market = store.markets.find((item) => item.id === marketId);
+	const searches = (market?.keywords ?? [])
+		// 手改 store 可能混入非字符串词条：过滤降级而非让整个详情页抛错
+		.filter((keyword): keyword is string => typeof keyword === "string")
+		.map((keyword) => keyword.trim())
+		.filter(Boolean)
+		.slice(0, maxKeywords)
+		.map((keyword) => ({ keyword, url: amazonSearchUrl(keyword) }));
+	const snapshot = latestSnapshotIfPresent(store, marketId);
+	const topListings = (snapshot ? [...snapshot.listings] : [])
+		// sidecar 强转无逐条校验：坏 rank（NaN）会按原位挤占 top-N 席位，先过滤
+		.filter((listing) => Number.isFinite(listing.rank))
+		.sort((a, b) => a.rank - b.rank)
+		.slice(0, topN)
+		.map((listing) => ({
+			rank: listing.rank,
+			asin: listing.asin,
+			url: amazonProductUrl(listing.asin),
+			title: listing.title,
+			// 与上方 keywords/rank 同级防御：手改 sidecar 的字符串数值会让前端 toFixed 抛错，非有限数值一律降级为缺失
+			price: Number.isFinite(listing.price) ? listing.price : undefined,
+			rating: Number.isFinite(listing.rating) ? listing.rating : undefined,
+			monthlySales: Number.isFinite(listing.monthlySales) ? listing.monthlySales : undefined,
+		}));
+	return { searches, topListings };
+}
+
 function monthPrefix(date = new Date()): string {
 	return date.toISOString().slice(0, 7);
 }

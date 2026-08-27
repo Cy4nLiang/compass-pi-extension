@@ -4,7 +4,8 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { parseMarketCsv } from "../csv.ts";
-import { createLead, ensureDefaults, importMarketAndScreen } from "../service.ts";
+import { estimateProfit, normalizeProfitInput } from "../economics.ts";
+import { createLead, ensureDefaults, importMarketAndScreen, recordProfitEstimate, recordRisk } from "../service.ts";
 import { createEmptyStore } from "../store.ts";
 import type { CompassStore } from "../types.ts";
 import {
@@ -150,6 +151,9 @@ test("serialized DTOs never leak lazy snapshot detail arrays", async () => {
 	for (const payload of payloads) {
 		assert.ok(!payload.includes('"listings"'), "DTO 序列化结果不得包含快照明细 listings");
 	}
+	// 红线豁免面本身必须有界：单品详情的链接区最多 5 条 listing 摘要
+	const detail = poolCandidateData(store, "fresh market");
+	assert.ok(detail.links.topListings.length <= 5, "topListings 必须 ≤5（有界读取）");
 });
 
 test("lead-only market (no snapshot, no run) stays safe across all DTO functions", async () => {
@@ -179,6 +183,10 @@ test("lead-only market (no snapshot, no run) stays safe across all DTO functions
 
 	const detail = poolCandidateData(store, "lead only market");
 	assert.equal(detail.latestRun, null);
+	assert.deepEqual(detail.links.topListings, []);
+	assert.equal(detail.profitSummary, null);
+	assert.equal(detail.riskSummary, null);
+	assert.ok(detail.keyMetrics.every((row) => row.display === "缺"), "无快照时核心指标全部按缺失展示");
 });
 
 test("all clock-derived data follows the injected now, and invalid now falls back to the real clock", async () => {
@@ -203,4 +211,60 @@ test("budget data aggregates month events and totals", async () => {
 	assert.equal(budget.totals.attributedCny, 12.5);
 	const sellersprite = budget.pools.find((pool) => pool.source === "sellersprite");
 	assert.equal(sellersprite?.spentCny, 12.5);
+});
+
+test("pool candidate detail carries decision evidence: links, key metrics, profit and risk summaries", async () => {
+	const store = await seededStore();
+	const input = normalizeProfitInput({
+		marketId: "fresh market",
+		salePrice: 25.99,
+		purchaseCost: 3.5,
+		firstMileCost: 0.9,
+		referralRate: 0.15,
+		fbaFee: 5.2,
+		cvr: 0.12,
+		cpc: 0.85,
+	});
+	recordProfitEstimate(store, input, estimateProfit(input), "tester");
+	const risk = recordRisk(store, {
+		marketRef: "fresh market",
+		certStatus: "pass",
+		ipRiskLevel: "pass",
+		seasonFlag: "clear",
+		policyFlag: "clear",
+		logisticsRisk: "pass",
+		evidence: [{ category: "cert", url: "https://example.gov/doc" }],
+		actor: "tester",
+	});
+	const detail = poolCandidateData(store, "fresh market");
+	// 链接区：Top 竞品按 rank 升序、URL 出自白名单 helper；搜索链接全部指向 amazon 搜索
+	assert.ok(detail.links.topListings.length > 0 && detail.links.topListings.length <= 5);
+	assert.equal(detail.links.topListings[0].rank, 1);
+	assert.match(detail.links.topListings[0].url ?? "", /^https:\/\/www\.amazon\.com\/dp\/[A-Z0-9]{10}$/);
+	assert.ok(detail.links.searches.every((item) => item.url.startsWith("https://www.amazon.com/s?k=")));
+	// 核心指标卡：五个决策锚点，顺序稳定，含格式化展示
+	assert.deepEqual(detail.keyMetrics.map((row) => row.key), ["qualify_rank_depth", "cr3", "new_listing_share_12m", "gross_margin", "cpc_ratio"]);
+	assert.ok(detail.keyMetrics.every((row) => typeof row.display === "string" && row.display.length > 0));
+	// 利润/风险摘要
+	assert.ok(detail.profitSummary && detail.profitSummary.grossMargin > 0.4);
+	assert.equal(detail.riskSummary?.overall, risk.overall);
+	// 五维分随 latestRun 序列化（决策页唯一来源）
+	assert.equal(detail.latestRun?.dimensionScores.length, 5);
+	assert.ok(detail.latestRun?.dimensionScores.every((row) => typeof row.key === "string" && typeof row.label === "string"));
+	// 旧字段保留（增量兼容）
+	assert.ok(detail.candidate.id && Array.isArray(detail.decisions) && detail.latestRun);
+});
+
+test("pool candidate detail normalizes optional listing fields to null at the DTO boundary", async () => {
+	const store = await seededStore();
+	const marketId = store.markets.find((market) => market.name === "fresh market")?.id;
+	const snapshot = store.snapshots.find((item) => item.marketId === marketId);
+	assert.ok(snapshot);
+	// 制造设计内常态：排名第一的 listing 无合法 ASIN（spec §4.2.5：行保留但不带链接）
+	snapshot.listings[0].asin = "bad asin!!";
+	const raw = JSON.parse(JSON.stringify(poolCandidateData(store, "fresh market")));
+	const first = raw.links.topListings[0];
+	assert.ok("url" in first, "可选字段必须以 null 出现而非丢键（前端严格 !== null 判空惯例）");
+	assert.equal(first.url, null);
+	assert.equal(first.asin, "bad asin!!");
 });

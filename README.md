@@ -55,7 +55,7 @@ Agent 会先调用 `compass_tools`，按需动态激活相关工具。
 | `compass_profit_estimate` | 毛利、BE-CPC、三情景净利、启动资金、回本 |
 | `compass_strategy_run` | 执行 screen/full GSE 策略 |
 | `compass_strategy_manage` | YAML 策略 list/get/save/clone，自动版本化 |
-| `compass_pool` | 候选池管理；阶段、Gate 和最终 `go/waitlist/no_go` 状态均强制记录原因 |
+| `compass_pool` | 候选池管理；阶段、Gate 和最终 `go/waitlist/no_go` 状态均强制记录原因；`get` 输出附市场 Amazon 搜索链接与 Top5 竞品链接 |
 | `compass_risk_check` | 认证/IP/季节/政策/物流风险及官方证据 |
 | `compass_reviews_record` | 差评主题、Kano 可改良性、星级差 |
 | `compass_budget` | 数据源预算与 MCP 调用计量（`cost_per_call_cny` 单价、`monthly_call_limit` 次数上限）、80% 告警、100% 熔断、市场归因 |
@@ -80,6 +80,8 @@ Agent 会先调用 `compass_tools`，按需动态激活相关工具。
 ## Web 工作台
 
 不想用 TUI 也可以用浏览器：在 pi 会话里输入 `/compass-web`，会打印本机访问地址（默认 `http://127.0.0.1:4780`，浏览器打开即可）；`/compass-web 5000` 指定端口；`/compass-web stop` 关闭。会话结束（含正常退出、`/reload` 等触发的会话重建）会自动兜底关闭。
+
+候选池页点开候选卡即进入**全屏单品决策页**：Amazon 搜索链接（≤3）与 Top5 竞品链接可直接点开实况核对，关键指标、五维分、利润测算、风险状态、Gate 规则与决策日志齐屏，move/decide 表单同页完成、成功后自动返回看板。
 
 也可以完全脱离 pi 独立启动：
 

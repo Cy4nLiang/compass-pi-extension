@@ -1204,7 +1204,7 @@ a.data-table-row:hover {
 	font-size: 11px;
 }
 
-/* ── 市场档案页 / 候选池抽屉：Gate 规则表 ───────────────────────── */
+/* ── 市场档案页 / 单品决策页：Gate 规则表 ───────────────────────── */
 
 .gate-rule-list {
 	margin-top: 10px;
@@ -1225,7 +1225,7 @@ a.data-table-row:hover {
 	min-width: 0;
 }
 
-/* ── 市场档案页 / 候选池抽屉：决策回放时间轴 ───────────────────────── */
+/* ── 市场档案页 / 单品决策页：决策回放时间轴 ───────────────────────── */
 
 .decision-timeline {
 	border-left: 2px solid var(--c-border);
@@ -1300,13 +1300,6 @@ a.data-table-row:hover {
 }
 
 /* ── 候选池页：整体布局 / 筛选条 ───────────────────────── */
-
-.pool-layout {
-	flex: 1 1 auto;
-	min-height: 0;
-	display: flex;
-	margin: -16px -20px;
-}
 
 .pool-main {
 	flex: 1 1 auto;
@@ -1390,15 +1383,6 @@ a.data-table-row:hover {
 	color: var(--c-text-muted);
 }
 
-.pool-lane-head.is-open .pool-lane-label {
-	color: var(--c-text);
-}
-
-.pool-lane-head.is-open .pool-lane-count {
-	color: var(--c-accent);
-	font-weight: 600;
-}
-
 .pool-lane-body {
 	display: flex;
 	flex-direction: column;
@@ -1418,10 +1402,6 @@ a.data-table-row:hover {
 
 .pool-card:hover {
 	border-color: var(--c-text-muted);
-}
-
-.pool-card.is-open {
-	border-color: var(--c-accent);
 }
 
 .pool-card-title {
@@ -1452,11 +1432,6 @@ a.data-table-row:hover {
 .pool-card-score {
 	font-size: 12px;
 	color: var(--c-text-secondary);
-}
-
-.pool-card-score.is-open {
-	font-weight: 600;
-	color: var(--c-text);
 }
 
 .pool-card-decision {
@@ -1518,10 +1493,6 @@ a.data-table-row:hover {
 	color: var(--c-text);
 }
 
-.pool-collapsed-row.is-open {
-	border-color: var(--c-accent);
-}
-
 .pool-collapsed-note {
 	font-size: 10px;
 	color: var(--c-text-muted);
@@ -1529,42 +1500,7 @@ a.data-table-row:hover {
 	padding: 0 2px;
 }
 
-/* ── 候选池页：详情抽屉 ───────────────────────── */
-
-.drawer {
-	flex: 0 0 auto;
-	width: 420px;
-	background: var(--c-bg-header);
-	border-left: 1px solid var(--c-border);
-	display: flex;
-	flex-direction: column;
-	min-height: 0;
-}
-
-.drawer-empty {
-	align-items: center;
-	justify-content: center;
-	padding: 20px;
-}
-
-.drawer-header {
-	flex: 0 0 auto;
-	padding: 14px 20px 12px;
-	border-bottom: 1px solid var(--c-divider);
-}
-
-.drawer-header-row {
-	display: flex;
-	align-items: center;
-	justify-content: space-between;
-	gap: 10px;
-}
-
-.drawer-title {
-	font-size: 15px;
-	font-weight: 700;
-	line-height: 1.3;
-}
+/* ── 单品决策页表单 / 导入向导：关闭按钮与表单行 ───────────────────────── */
 
 .drawer-close {
 	flex: 0 0 auto;
@@ -1573,44 +1509,6 @@ a.data-table-row:hover {
 
 .drawer-close:hover {
 	color: var(--c-text);
-}
-
-.drawer-badges {
-	margin-top: 10px;
-	display: flex;
-	align-items: center;
-	gap: 8px;
-	font-size: 12px;
-}
-
-.drawer-score {
-	margin-left: auto;
-	font-size: 15px;
-	font-weight: 600;
-	color: var(--c-text);
-}
-
-.drawer-body {
-	flex: 1 1 auto;
-	min-height: 0;
-	overflow-y: auto;
-	padding: 14px 20px;
-	display: flex;
-	flex-direction: column;
-	gap: 16px;
-}
-
-.drawer-section-title {
-	font-size: 12px;
-	font-weight: 600;
-	color: var(--c-text);
-}
-
-.drawer-footer {
-	flex: 0 0 auto;
-	padding: 14px 20px;
-	background: var(--c-bg-strip);
-	border-top: 1px solid var(--c-divider);
 }
 
 .drawer-form-label {
@@ -1642,7 +1540,7 @@ a.data-table-row:hover {
 .decide-status-chip[data-status="waitlist"].is-active { border-color: var(--c-warning); color: var(--c-warning); }
 .decide-status-chip[data-status="no_go"].is-active { border-color: var(--c-error); color: var(--c-error); }
 
-/* ── 表单控件（候选池抽屉 / 导入向导共用） ───────────────────────── */
+/* ── 表单控件（单品决策页 / 导入向导共用） ───────────────────────── */
 
 .field {
 	display: flex;
@@ -1870,4 +1768,67 @@ a.data-table-row:hover {
 
 .import-result-row:last-child {
 	border-bottom: none;
+}
+
+/* ── 候选池 · 单品决策页 ─────────────────────────────────────────── */
+
+.decide-page {
+	max-width: 1040px;
+	margin: 0 auto;
+	display: flex;
+	flex-direction: column;
+	gap: 14px;
+}
+
+.decide-grid-3 {
+	display: grid;
+	grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+	gap: 14px;
+}
+
+.listing-rows {
+	display: flex;
+	flex-direction: column;
+}
+
+.listing-row {
+	display: grid;
+	grid-template-columns: 40px minmax(0, 1fr) 76px 56px 96px auto;
+	gap: 10px;
+	align-items: center;
+	padding: 7px 0;
+	border-bottom: 1px solid var(--c-divider);
+	font-size: 12px;
+}
+
+.listing-row:last-child {
+	border-bottom: none;
+}
+
+.listing-open {
+	padding: 3px 10px;
+	font-size: 11px;
+}
+
+/* 搜索链接以 chip 形态出现在 <a> 上 */
+a.chip {
+	text-decoration: none;
+}
+
+.fact-row {
+	display: flex;
+	justify-content: space-between;
+	gap: 10px;
+	padding: 6px 0;
+	border-bottom: 1px solid var(--c-divider);
+	font-size: 12px;
+}
+
+.fact-row:last-child {
+	border-bottom: none;
+}
+
+/* 操作面板用主色描边突出「这一屏的目的」 */
+.decide-actions {
+	border-color: var(--c-accent);
 }

@@ -28,7 +28,7 @@ const PERCENT_METRICS = new Set([
 	"pain_fixability",
 ]);
 
-const METRIC_LABELS: Record<string, string> = {
+export const METRIC_LABELS: Record<string, string> = {
 	category_monthly_sales: "类目月销量",
 	category_monthly_revenue: "类目月销售额",
 	waist_monthly_sales: "腰部月销",
@@ -64,7 +64,7 @@ const METRIC_LABELS: Record<string, string> = {
 	logistics_risk: "物流风险",
 };
 
-const DIMENSIONS: Array<{ title: string; question: string; metrics: string[] }> = [
+export const DIMENSIONS: Array<{ title: string; question: string; metrics: string[] }> = [
 	{
 		title: "D1 市场需求",
 		question: "能不能装下目标量？",
@@ -100,7 +100,7 @@ function formatNumber(value: number): string {
 	return new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 }).format(value);
 }
 
-function formatMetric(name: string, metric: MetricEvidence | undefined): string {
+export function formatMetric(name: string, metric: MetricEvidence | undefined): string {
 	if (!metric || metric.value === null) return "—";
 	if (typeof metric.value === "number") {
 		return PERCENT_METRICS.has(name) ? `${(metric.value * 100).toFixed(1)}%` : formatNumber(metric.value);
@@ -108,11 +108,11 @@ function formatMetric(name: string, metric: MetricEvidence | undefined): string 
 	return String(metric.value);
 }
 
-function outcomeLabel(outcome: GateOutcome): string {
+export function outcomeLabel(outcome: GateOutcome): string {
 	return outcome === "pass" ? "通过" : outcome === "review" ? "待人工复核" : "否决";
 }
 
-function confidenceLabel(value: number): string {
+export function confidenceLabel(value: number): string {
 	return value >= 0.85 ? "高" : value >= 0.65 ? "中" : value > 0 ? "低" : "缺失";
 }
 

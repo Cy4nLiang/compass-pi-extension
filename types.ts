@@ -10,8 +10,24 @@ export const CANDIDATE_STAGES = [
 ] as const;
 
 export type CandidateStage = (typeof CANDIDATE_STAGES)[number];
+
+// 终局决策三态与数据来源：运行时常量 + 由它派生类型，让入口层的校验与类型互相守护
+export const DECISION_STATUSES = ["go", "waitlist", "no_go"] as const;
+export const SNAPSHOT_SOURCES = ["auto", "sellersprite", "sorftime", "keepa", "compass_browser", "manual_csv", "generic_csv"] as const;
+
+// 阶段中文标签：TUI 与 Web 共用的领域词汇（七个工作阶段 + archived 归档）
+export const STAGE_LABELS: Record<CandidateStage, string> = {
+	lead: "线索",
+	screen: "粗筛",
+	deep_research: "深研",
+	risk: "风控",
+	decision: "决策",
+	testing: "测品",
+	review: "复盘",
+	archived: "归档",
+};
 export type GateOutcome = "pass" | "review" | "reject";
-export type DecisionStatus = "go" | "waitlist" | "no_go";
+export type DecisionStatus = (typeof DECISION_STATUSES)[number];
 export type OutcomeVerdict = "validated" | "challenged" | "inconclusive";
 export type RiskStatus = "pass" | "review" | "red" | "unknown";
 export type Confidence = number;
@@ -397,6 +413,15 @@ export const TODO_KINDS = [
 export type TodoKind = (typeof TODO_KINDS)[number];
 export const TODO_PRIORITIES = [1, 2, 3, 4, 5] as const;
 export type TodoPriority = (typeof TODO_PRIORITIES)[number];
+
+// 待办优先级分组标签：TUI 与 Web 共用
+export const TODO_GROUP_LABELS: Record<TodoPriority, string> = {
+	1: "P1 紧急阻塞",
+	2: "P2 漏斗阻塞",
+	3: "P3 补数据/补证据",
+	4: "P4 例行到期",
+	5: "P5 保鲜/优化",
+};
 
 // 工作台待办：从 store 派生的只读视图，不持久化（条件解决即消失）
 export interface WorkbenchTodo {

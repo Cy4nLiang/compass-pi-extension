@@ -8,6 +8,16 @@ import type { CompassStore, MarketSnapshot } from "./types.ts";
 const STORE_NEEDS_MIGRATION_WRITE = Symbol("compass-store-needs-migration-write");
 type MigratingStore = CompassStore & { [STORE_NEEDS_MIGRATION_WRITE]?: boolean };
 
+// 罗盘数据的读写/加锁故障：与「用户输入被业务规则拒绝」区分开。
+// 调用方（如 Web 层的 HTTP 状态码分级）应按类型判定，而不是匹配错误文案——
+// 底层 fs 错误的措辞由运行时决定，正则白名单必然漏判。
+export class StoreIoError extends Error {
+	constructor(message: string, options?: { cause?: unknown }) {
+		super(message, options);
+		this.name = "StoreIoError";
+	}
+}
+
 export function createEmptyStore(now = new Date().toISOString()): CompassStore {
 	return {
 		schemaVersion: 1,
@@ -335,7 +345,7 @@ export class CompassRepository {
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") return createEmptyStore();
 			const reason = error instanceof Error ? error.message : String(error);
-			throw new Error(`读取罗盘数据失败（${this.storePath}）：${reason}`);
+			throw new StoreIoError(`读取罗盘数据失败（${this.storePath}）：${reason}`, { cause: error });
 		}
 	}
 
@@ -374,8 +384,10 @@ export class CompassRepository {
 				} catch (statError) {
 					if ((statError as NodeJS.ErrnoException).code !== "ENOENT") throw statError;
 				}
-				if (Date.now() >= deadline) throw new Error(`罗盘数据文件被其他进程锁定超过 10 秒：${this.storePath}`);
-				await delay(50);
+				if (Date.now() >= deadline) throw new StoreIoError(`罗盘数据文件被其他进程锁定超过 10 秒：${this.storePath}`);
+				// ref:false —— 抢锁重试不持有 event loop 引用，否则宿主关闭时会被这条
+				// 最长 10 秒的自旋拖住退出（Web 服务关停后仍在等锁的写就是这种情形）
+				await delay(50, undefined, { ref: false });
 			}
 		}
 		try {
@@ -392,7 +404,8 @@ export class CompassRepository {
 			await rename(tempPath, path);
 		} catch (error) {
 			await unlink(tempPath).catch(() => undefined);
-			throw error;
+			// 磁盘满、只读挂载、权限错乱都在这里：包成 StoreIoError 让调用方能识别为系统故障
+			throw new StoreIoError(`写入罗盘数据失败（${path}）：${error instanceof Error ? error.message : String(error)}`, { cause: error });
 		}
 	}
 
@@ -414,7 +427,7 @@ export class CompassRepository {
 		try {
 			const current = JSON.parse(await readFile(this.storePath, "utf8")) as unknown;
 			if (!isRecord(current) || current.updatedAt !== store.updatedAt) {
-				throw new Error(`罗盘数据在本次读取后已被其他进程更新：${this.storePath}`);
+				throw new StoreIoError(`罗盘数据在本次读取后已被其他进程更新：${this.storePath}`);
 			}
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
@@ -490,7 +503,9 @@ export class CompassRepository {
 	async writeReport(outputPath: string, markdown: string): Promise<void> {
 		const safePath = this.resolveOutputPath(outputPath);
 		await mkdir(dirname(safePath), { recursive: true, mode: 0o700 });
-		await writeFile(safePath, markdown, { encoding: "utf8", mode: 0o600 });
+		// 与 store.json 同样走临时文件 + rename：同市场同日重复生成会命中同一路径，
+		// 裸 writeFile 的「先截断后写」会让并发写方读到截断内容、失败时毁掉上一份好报告
+		await this.writeAtomic(safePath, markdown, 0o600);
 		await chmod(safePath, 0o600).catch(() => undefined);
 	}
 }

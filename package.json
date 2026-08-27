@@ -17,7 +17,8 @@
 	],
 	"scripts": {
 		"test": "node --experimental-strip-types --test tests/*.test.ts",
-		"check": "tsc --noEmit"
+		"check": "tsc --noEmit",
+		"web": "node --experimental-strip-types web/standalone.ts"
 	},
 	"pi": {
 		"extensions": [

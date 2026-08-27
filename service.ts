@@ -34,6 +34,7 @@ import type {
 	CostEvent,
 	DecisionLog,
 	DecisionStatus,
+	GateOutcome,
 	Lesson,
 	Market,
 	MarketSnapshot,
@@ -93,10 +94,17 @@ export function findDuplicateImport(store: CompassStore, fileHash: string): Mark
 
 function backfillStatusReasons(store: CompassStore): boolean {
 	let changed = false;
+	// 先按 candidateId 建一次索引：ensureDefaults 在 Web 层每请求都会跑，
+	// 逐候选全量 filter 整个 decisionLog 会让开销随两者乘积增长
+	const logsByCandidate = new Map<string, DecisionLog[]>();
+	for (const decision of store.decisionLog) {
+		if (!decision.candidateId) continue;
+		const bucket = logsByCandidate.get(decision.candidateId);
+		if (bucket) bucket.push(decision);
+		else logsByCandidate.set(decision.candidateId, [decision]);
+	}
 	for (const candidate of store.candidates) {
-		const logs = store.decisionLog
-			.filter((decision) => decision.candidateId === candidate.id)
-			.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+		const logs = (logsByCandidate.get(candidate.id) ?? []).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 		const stageLog = logs.find((decision) => ["stage_move", "lead", "import"].includes(decision.type));
 		if (!candidate.stageReason?.trim()) {
 			candidate.stageReason = stageLog?.reason || "历史候选状态（详见 decisionLog）";
@@ -174,16 +182,27 @@ export function findMarket(store: CompassStore, reference: string): Market {
 export function findCandidate(store: CompassStore, reference: string): Candidate {
 	const direct = store.candidates.find((candidate) => candidate.id === reference);
 	if (direct) return direct;
-	const market = findMarket(store, reference);
+	let market: Market;
+	try {
+		market = findMarket(store, reference);
+	} catch (error) {
+		// 按市场找不到时，错误应说的是「候选」——报「未找到市场」会把排障方向带偏
+		if (error instanceof Error && error.message.startsWith("未找到市场：")) throw new Error(`未找到候选：${reference}`);
+		throw error;
+	}
 	const candidate = store.candidates.find((item) => item.marketId === market.id);
 	if (!candidate) throw new Error(`市场 ${market.id} 尚无候选卡`);
 	return candidate;
 }
 
 export function latestSnapshotIfPresent(store: CompassStore, marketId: string): MarketSnapshot | undefined {
-	return store.snapshots
-		.filter((snapshot) => snapshot.marketId === marketId)
-		.sort((a, b) => b.capturedAt.localeCompare(a.capturedAt))[0];
+	// 单趟线性取最大：Web 层按市场逐个调用，filter+sort 会让整体退化成 O(市场数 × 快照数 log)
+	let latest: MarketSnapshot | undefined;
+	for (const snapshot of store.snapshots) {
+		if (snapshot.marketId !== marketId) continue;
+		if (!latest || snapshot.capturedAt.localeCompare(latest.capturedAt) > 0) latest = snapshot;
+	}
+	return latest;
 }
 
 export function latestSnapshot(store: CompassStore, marketId: string): MarketSnapshot {
@@ -603,7 +622,15 @@ export function buildStrategyContextForSnapshot(store: CompassStore, marketId: s
 	Object.assign(metrics, riskMetrics(risk));
 	const review = latestForMarket(store.reviewAnalyses, marketId);
 	Object.assign(metrics, reviewMetrics(review));
-	return { snapshot, context: { metrics, listings: snapshot.listings } };
+	// listings 用惰性 getter 委托：只有策略表达式真正引用榜单数据时才触发快照明细的磁盘读；
+	// 只消费 metrics 的路径（市场档案、待办推导）不再产生无谓 I/O。
+	// enumerable:false 与 store.ts 的快照懒属性对齐：spread / JSON.stringify 不会静默触发读盘
+	const context = Object.defineProperty({ metrics } as StrategyContext, "listings", {
+		enumerable: false,
+		configurable: true,
+		get: () => snapshot.listings,
+	});
+	return { snapshot, context };
 }
 
 export function buildStrategyContext(store: CompassStore, marketId: string): { snapshot: MarketSnapshot; context: StrategyContext } {
@@ -720,6 +747,17 @@ export function cloneStrategy(
 	});
 }
 
+export function targetMonthlyUnits(store: CompassStore): number {
+	const versions = store.strategies.filter((strategy) => strategy.id === "jingpu-daily10").sort((a, b) => b.version - a.version);
+	const value = versions[0]?.definition?.meta?.monthly_units_q;
+	return typeof value === "number" && Number.isFinite(value) ? value : 300;
+}
+
+// TUI 总览与 Web 总览共用同一行默认 Gate 文案，避免阈值调整时两处静默漂移
+export function gateDefaultsLine(store: CompassStore): string {
+	return `默认 Gate：QRD(${targetMonthlyUnits(store)})≥20 · 新品占比≥15% · 毛利≥40% · CPC承受度≤0.60 · 风险非红`;
+}
+
 export function moveCandidate(
 	store: CompassStore,
 	input: { candidateRef: string; stage: CandidateStage; reason: string; actor: string },
@@ -783,6 +821,44 @@ export function decideCandidate(
 		actor: input.actor,
 	});
 	return candidate;
+}
+
+export interface PoolCandidateItem {
+	candidate: Candidate;
+	marketName?: string;
+}
+
+export function listPoolCandidates(
+	store: CompassStore,
+	filter: { stage?: CandidateStage; outcome?: GateOutcome; decisionStatus?: DecisionStatus } = {},
+): PoolCandidateItem[] {
+	const marketNames = new Map(store.markets.map((market) => [market.id, market.name]));
+	return store.candidates
+		.filter(
+			(candidate) =>
+				(!filter.stage || candidate.stage === filter.stage) &&
+				(!filter.outcome || candidate.gateOutcome === filter.outcome) &&
+				(!filter.decisionStatus || candidate.decisionStatus === filter.decisionStatus),
+		)
+		.map((candidate) => ({ candidate, marketName: marketNames.get(candidate.marketId) }));
+}
+
+export interface CandidateDetail {
+	candidate: Candidate;
+	marketName?: string;
+	decisions: DecisionLog[];
+}
+
+export function candidateDetail(store: CompassStore, reference: string): CandidateDetail {
+	const candidate = findCandidate(store, reference);
+	const decisions = store.decisionLog
+		.filter((item) => item.candidateId === candidate.id)
+		.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+	return {
+		candidate,
+		marketName: store.markets.find((market) => market.id === candidate.marketId)?.name,
+		decisions,
+	};
 }
 
 function monthPrefix(date = new Date()): string {

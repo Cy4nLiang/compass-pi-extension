@@ -10,7 +10,8 @@ import type {
 
 export interface StrategyContext {
 	metrics: MetricMap;
-	listings: ListingRecord[];
+	// readonly：service 层以惰性 getter 提供（无 setter），赋值在编译期即拦截
+	readonly listings: ListingRecord[];
 	targetMonthlyUnits?: number;
 }
 

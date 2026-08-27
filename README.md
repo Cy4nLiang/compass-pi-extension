@@ -70,11 +70,28 @@ Agent 会先调用 `compass_tools`，按需动态激活相关工具。
 
 - `/compass-help`：在 pi 会话中显示运营使用手册
 - `/compass`：六页 TUI（总览 / 待办 / 市场 / 候选池 / 预算 / 复盘）
+- `/compass-web [端口|stop]`：启动本地浏览器版工作台（八页：总览/待办/市场/市场档案/候选池/预算/复盘/导入），无参复用已在跑的服务，数字参数指定端口，`stop` 关闭
 - `/compass-import <csv>`：交互导入
 - `/compass-report [market_id|市场名]`：生成报告并作为 TUI 会话条目显示
 - `/compass-strategy [strategy_id]`：编辑 YAML 并保存新版本
 - `/compass-retro`：交互式复盘会（到期项 → 对照/实绩 → 报告 → Lesson）
 - `/compass-history-brief on|off`：切换本会话自动历史速览与工具尾注
+
+## Web 工作台
+
+不想用 TUI 也可以用浏览器：在 pi 会话里输入 `/compass-web`，会打印本机访问地址（默认 `http://127.0.0.1:4780`，浏览器打开即可）；`/compass-web 5000` 指定端口；`/compass-web stop` 关闭。会话结束（含正常退出、`/reload` 等触发的会话重建）会自动兜底关闭。
+
+也可以完全脱离 pi 独立启动：
+
+```bash
+cd .pi/extensions/compass
+npm run web                          # 默认端口 4780
+COMPASS_WEB_PORT=5000 npm run web    # 或 npm run web -- --port 5000
+```
+
+`COMPASS_ROOT` 环境变量指定宿主项目根目录（默认当前目录）；`Ctrl+C` 优雅退出。
+
+**仅绑定 `127.0.0.1`，不做鉴权（本机单用户模型）：不要用端口转发把它暴露到局域网或公网**——工作台能读写全部选品经营数据。
 
 ## 数据与安全
 

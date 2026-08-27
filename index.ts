@@ -1,6 +1,6 @@
 import { realpathSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
@@ -14,13 +14,14 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Box, Markdown, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { decodeCsvBuffer, parseMarketCsv } from "./csv.ts";
 import { estimateProfit, normalizeProfitInput } from "./economics.ts";
 import { capHistoryLines, marketMatchesPrompt, renderHistoryBrief, renderSessionLedger, type SessionLedgerItem } from "./history.ts";
+import { performCsvImport } from "./importer.ts";
 import {
 	backtestStrategies,
 	budgetStatus,
 	buildStrategyContext,
+	candidateDetail,
 	classifyMcpToolResult,
 	cloneStrategy,
 	configureBudget,
@@ -39,9 +40,9 @@ import {
 	historyTimeline,
 	importContentHash,
 	importHistoryNote,
-	importMarketAndScreen,
 	latestStrategy,
 	leadHistoryNote,
+	listPoolCandidates,
 	listRetroDue,
 	listWorkbenchTodos,
 	mainCpcForMarket,
@@ -65,8 +66,9 @@ import {
 } from "./service.ts";
 import { CompassRepository } from "./store.ts";
 import { DEEP_RESEARCH_REQUIRED_FIELDS } from "./todo.ts";
-import { CANDIDATE_STAGES, TODO_KINDS, type CandidateStage, type CompassStore, type DecisionLog, type DecisionStatus, type OutcomeActuals, type ReviewTheme } from "./types.ts";
+import { CANDIDATE_STAGES, DECISION_STATUSES, SNAPSHOT_SOURCES, TODO_KINDS, type CandidateStage, type CompassStore, type DecisionLog, type DecisionStatus, type OutcomeActuals, type ReviewTheme } from "./types.ts";
 import { compactDashboardSummary, CompassDashboard } from "./ui.ts";
+import { startCompassWebServer, type CompassWebServer } from "./web/server.ts";
 
 const baseDir = dirname(fileURLToPath(import.meta.url));
 const TOOL_DETAILS_KIND = "compass-result";
@@ -180,13 +182,6 @@ function actorName(explicit?: string): string {
 	return explicit?.trim() || process.env.USER || process.env.USERNAME || "pi-user";
 }
 
-function normalizeCapturedAt(value?: string): string {
-	if (!value) return new Date().toISOString();
-	const date = new Date(value);
-	if (!Number.isFinite(date.getTime())) throw new Error(`captured_at 无效：${value}；请使用合法的 ISO 时间`);
-	return date.toISOString();
-}
-
 function details(input: Omit<CompassDetails, "kind">): CompassDetails {
 	return { kind: TOOL_DETAILS_KIND, ...input };
 }
@@ -254,6 +249,12 @@ export default function compassExtension(pi: ExtensionAPI): void {
 	const pendingUsage = new Map<string, Map<string, number>>();
 	// tool_call 拦截的廉价预过滤缓存：避免为每个无关工具调用做 repo.load()
 	let cachedPoolSources: string[] = [];
+	// 当前会话持有的 Web 工作台句柄：/compass-web 启动、session_shutdown 兜底关闭。
+	// 存 Promise 而非 resolve 后的结果——在 startCompassWebServer 尚未 resolve 时赋值，
+	// 使 session_shutdown（可能在 quit/reload/new/resume/fork 时于此期间触发）与并发的
+	// 第二次 /compass-web 调用都能看到"启动已在进行中"而不是误判为空，等它一起 await，
+	// 不会留下一个谁都关不掉的孤儿监听服务
+	let webServerPromise: Promise<CompassWebServer> | undefined;
 
 	function rememberPools(store: CompassStore): void {
 		cachedPoolSources = store.budgetPools.map((pool) => pool.source);
@@ -378,28 +379,12 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			runScreen?: boolean;
 		},
 	) {
-		const repo = repository(ctx);
-		const path = repo.resolveInputPath(input.path);
-		const buffer = await readFile(path);
-		const fileHash = importContentHash(buffer);
-		const duplicate = findDuplicateImport(await readStore(ctx), fileHash);
-		if (duplicate) throw new Error(`重复 CSV：该文件已于 ${duplicate.importedAt} 导入为 ${duplicate.id}`);
-		const capturedAt = normalizeCapturedAt(input.capturedAt);
-		const parsed = parseMarketCsv(decodeCsvBuffer(buffer), { source: input.source, capturedAt });
-		const archivedFile = await repo.archiveRaw(basename(path), buffer, capturedAt);
-		const actor = actorName(input.actor);
-		const { result, store } = await mutateStore(ctx, (data) => importMarketAndScreen(data, {
-			marketName: input.marketName,
-			keywords: input.keywords,
-			parsed,
-			capturedAt,
-			fileName: relative(ctx.cwd, path),
-			archivedFile,
-			fileHash,
-			actor,
-			runScreen: input.runScreen,
-		}));
-		return { ...result, store, parsed, archivedFile };
+		// 信任检查前置：未受信任项目在读文件/归档之前就拒绝（原实现在查重读 store 时才触发）
+		assertTrusted(ctx);
+		return performCsvImport(
+			{ repo: repository(ctx), mutate: <T,>(mutator: (store: CompassStore) => T) => mutateStore(ctx, mutator) },
+			{ ...input, actor: actorName(input.actor) },
+		);
 	}
 
 	pi.registerTool({
@@ -443,7 +428,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 		parameters: Type.Object({
 			path: Type.String({ description: "项目内 CSV 路径；可带前导 @" }),
 			market_name: Type.String({ minLength: 1, description: "细分市场/关键词族名称" }),
-			source: Type.Optional(StringEnum(["auto", "sellersprite", "sorftime", "keepa", "compass_browser", "manual_csv", "generic_csv"] as const)),
+			source: Type.Optional(StringEnum(SNAPSHOT_SOURCES)),
 			keywords: Type.Optional(Type.Array(Type.String())),
 			captured_at: Type.Optional(Type.String({ description: "ISO 时间；默认当前时间" })),
 			run_screen: Type.Optional(Type.Boolean({ description: "导入后运行默认粗筛 Gate；默认 true" })),
@@ -688,7 +673,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			candidate_ref: Type.Optional(Type.String({ description: "candidate_id、market_id 或唯一市场名" })),
 			stage: Type.Optional(StringEnum(CANDIDATE_STAGES)),
 			outcome: Type.Optional(StringEnum(["pass", "review", "reject"] as const)),
-			decision_status: Type.Optional(StringEnum(["go", "waitlist", "no_go"] as const)),
+			decision_status: Type.Optional(StringEnum(DECISION_STATUSES)),
 			reason: Type.Optional(Type.String()),
 			actor: Type.Optional(Type.String()),
 		}),
@@ -722,18 +707,13 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			const store = await readStore(ctx);
 			if (params.action === "get") {
 				if (!params.candidate_ref) throw new Error("get 需要 candidate_ref");
-				const candidate = findCandidate(store, params.candidate_ref);
-				const market = store.markets.find((item) => item.id === candidate.marketId);
-				const decisions = store.decisionLog.filter((item) => item.candidateId === candidate.id).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-				const output = [`${candidate.id} | ${market?.name} | ${candidate.stage} | Gate=${candidate.gateOutcome ?? "—"} | Score=${candidate.score ?? "—"} | Decision=${candidate.decisionStatus ?? "—"}`, `当前阶段原因：${candidate.stageReason ?? "—"}`, `Gate原因：${candidate.gateReason ?? "—"}`, `决策原因：${candidate.decisionReason ?? "—"}`, ...decisions.map((decision) => `${decision.createdAt} | ${decision.type} | ${decision.conclusion} | ${decision.actor} | ${decision.reason}`)];
-				return textResult(output.join("\n"), details({ title: market?.name ?? candidate.id, status: "success", summary: `${candidate.stage} · ${decisions.length} 条决策记录`, lines: output.slice(1, 11) }));
+				const { candidate, marketName, decisions } = candidateDetail(store, params.candidate_ref);
+				const output = [`${candidate.id} | ${marketName} | ${candidate.stage} | Gate=${candidate.gateOutcome ?? "—"} | Score=${candidate.score ?? "—"} | Decision=${candidate.decisionStatus ?? "—"}`, `当前阶段原因：${candidate.stageReason ?? "—"}`, `Gate原因：${candidate.gateReason ?? "—"}`, `决策原因：${candidate.decisionReason ?? "—"}`, ...decisions.map((decision) => `${decision.createdAt} | ${decision.type} | ${decision.conclusion} | ${decision.actor} | ${decision.reason}`)];
+				return textResult(output.join("\n"), details({ title: marketName ?? candidate.id, status: "success", summary: `${candidate.stage} · ${decisions.length} 条决策记录`, lines: output.slice(1, 11) }));
 			}
-			const candidates = store.candidates.filter((candidate) => (!params.stage || candidate.stage === params.stage) && (!params.outcome || candidate.gateOutcome === params.outcome) && (!params.decision_status || candidate.decisionStatus === params.decision_status));
-			const lines = candidates.map((candidate) => {
-				const market = store.markets.find((item) => item.id === candidate.marketId);
-				return `${candidate.id} | ${market?.name ?? candidate.marketId} | ${candidate.stage} | ${candidate.gateOutcome ?? "—"} | ${candidate.score ?? "—"} | ${candidate.decisionStatus ?? "—"}`;
-			});
-			return textResult(lines.join("\n") || "候选池为空", details({ title: "候选池", status: "success", summary: `${candidates.length} 张候选卡`, lines: lines.slice(0, 12) }));
+			const items = listPoolCandidates(store, { stage: params.stage, outcome: params.outcome, decisionStatus: params.decision_status });
+			const lines = items.map(({ candidate, marketName }) => `${candidate.id} | ${marketName ?? candidate.marketId} | ${candidate.stage} | ${candidate.gateOutcome ?? "—"} | ${candidate.score ?? "—"} | ${candidate.decisionStatus ?? "—"}`);
+			return textResult(lines.join("\n") || "候选池为空", details({ title: "候选池", status: "success", summary: `${items.length} 张候选卡`, lines: lines.slice(0, 12) }));
 		},
 		renderCall: renderCallLabel("compass_pool"),
 		renderResult: renderCompassResult,
@@ -953,7 +933,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			keywords: Type.Optional(Type.Array(Type.String())),
 			category: Type.Optional(Type.String()),
 			metric: Type.Optional(Type.String()),
-			decision_status: Type.Optional(StringEnum(["go", "waitlist", "no_go"] as const)),
+			decision_status: Type.Optional(StringEnum(DECISION_STATUSES)),
 			types: Type.Optional(Type.Array(StringEnum(["lead", "import", "strategy", "stage_move", "decision", "risk", "profit", "review", "retro"] as const))),
 			actor: Type.Optional(Type.String()),
 			since: Type.Optional(Type.String()),
@@ -1269,6 +1249,51 @@ export default function compassExtension(pi: ExtensionAPI): void {
 		},
 	});
 
+	pi.registerCommand("compass-web", {
+		description: "启动本地罗盘 Web 工作台：/compass-web [端口|stop]——无参启动或复用现有服务，数字指定端口，stop 关闭",
+		handler: async (args, ctx) => {
+			const arg = args.trim();
+			if (arg === "stop") {
+				// 同步读取并清空：中间不 await，与其余分支之间不存在交错窗口
+				const pending = webServerPromise;
+				webServerPromise = undefined;
+				if (!pending) {
+					ctx.ui.notify("罗盘 Web 工作台当前未运行", "info");
+					return;
+				}
+				try {
+					const server = await pending;
+					await server.close();
+				} catch {
+					// 启动本身失败，或关闭失败：都已经没有句柄可管理，忽略即可
+				}
+				ctx.ui.notify("罗盘 Web 工作台已关闭", "info");
+				return;
+			}
+			let port: number | undefined;
+			if (arg) {
+				port = Number(arg);
+				if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error(`端口参数无效：${arg}`);
+			}
+			if (webServerPromise) {
+				const server = await webServerPromise;
+				const portNote = port !== undefined ? `（端口参数 ${port} 已忽略——服务已在运行，如需切换端口请先 /compass-web stop）` : "";
+				ctx.ui.notify(`罗盘 Web 工作台已在运行：${server.url}${portNote}`, "info");
+				return;
+			}
+			if (!ctx.isProjectTrusted()) throw new Error("罗盘拒绝在未受信任项目中启动 Web 工作台");
+			webServerPromise = startCompassWebServer({ projectRoot: ctx.cwd, ...(port !== undefined ? { port } : {}) });
+			let server: CompassWebServer;
+			try {
+				server = await webServerPromise;
+			} catch (error) {
+				webServerPromise = undefined;
+				throw error;
+			}
+			ctx.ui.notify(`罗盘 Web 工作台已启动：${server.url}（仅本机可访问，不要转发到局域网）`, "info");
+		},
+	});
+
 	pi.registerCommand("compass-strategy", {
 		description: "交互式编辑策略 YAML；每次保存自动生成新版本",
 		handler: async (args, ctx) => {
@@ -1507,6 +1532,20 @@ export default function compassExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
+		// 会话结束时兜底关闭 Web 工作台；用户忘记 /compass-web stop 也不留孤儿进程句柄。
+		// 同步读取并清空 webServerPromise（中间不 await）：即使这次 shutdown 恰好发生在
+		// /compass-web 的 startCompassWebServer 还没 resolve 时，也会等它一起完成再关闭，
+		// 而不是看到 undefined 就什么都不做、让新起的服务器脱离清理路径
+		const pending = webServerPromise;
+		webServerPromise = undefined;
+		if (pending) {
+			try {
+				const server = await pending;
+				await server.close();
+			} catch {
+				// 进程即将退出，尽力关闭即可，不阻塞其余关停逻辑
+			}
+		}
 		// 尽力落盘剩余计量（与 session_start 的写入同为生命周期事件，不在热路径 hook 禁写范围）
 		if (ctx.isProjectTrusted() && pendingUsage.size) {
 			let drained: Array<{ server: string; tool: string; calls: number }> = [];

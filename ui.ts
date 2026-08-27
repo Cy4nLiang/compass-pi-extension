@@ -1,26 +1,9 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
-import { budgetStatus, listRetroDue, listWorkbenchTodos } from "./service.ts";
-import { CANDIDATE_STAGES, TODO_PRIORITIES, type CompassStore, type TodoPriority, type WorkbenchTodo } from "./types.ts";
+import { budgetStatus, gateDefaultsLine, listRetroDue, listWorkbenchTodos } from "./service.ts";
+import { CANDIDATE_STAGES, STAGE_LABELS, TODO_GROUP_LABELS, TODO_PRIORITIES, type CompassStore, type TodoPriority, type WorkbenchTodo } from "./types.ts";
 
 const TAB_NAMES = ["总览", "待办", "市场", "候选池", "预算", "复盘"] as const;
-const TODO_GROUP_LABELS: Record<TodoPriority, string> = {
-	1: "P1 紧急阻塞",
-	2: "P2 漏斗阻塞",
-	3: "P3 补数据/补证据",
-	4: "P4 例行到期",
-	5: "P5 保鲜/优化",
-};
-const STAGE_LABELS: Record<string, string> = {
-	lead: "线索",
-	screen: "粗筛",
-	deep_research: "深研",
-	risk: "风控",
-	decision: "决策",
-	testing: "测品",
-	review: "复盘",
-	archived: "归档",
-};
 
 function ageDays(date: string): number {
 	return Math.max(0, Math.floor((Date.now() - Date.parse(date)) / 86_400_000));
@@ -129,12 +112,6 @@ export class CompassDashboard {
 		}).length;
 		const budgets = budgetStatus(this.store);
 		const spent = budgets.reduce((sum, pool) => sum + pool.spentCny, 0);
-		const defaultStrategy = this.store.strategies
-			.filter((strategy) => strategy.id === "jingpu-daily10")
-			.sort((a, b) => b.version - a.version)[0];
-		const targetMonthlyUnits = typeof defaultStrategy?.definition.meta.monthly_units_q === "number" && Number.isFinite(defaultStrategy.definition.meta.monthly_units_q)
-			? defaultStrategy.definition.meta.monthly_units_q
-			: 300;
 		const fused = budgets.filter((pool) => pool.state === "fused").length;
 
 		add("");
@@ -160,7 +137,7 @@ export class CompassDashboard {
 		});
 		add(` ${th.fg("accent", th.bold("待办"))} ${this.todos.length ? `${th.fg("text", String(this.todos.length))} 项：${todoParts.join(" · ")}` : th.fg("success", "0 项")}`);
 		add("");
-		add(` ${th.fg("muted", `默认 Gate：QRD(${targetMonthlyUnits})≥20 · 新品占比≥15% · 毛利≥40% · CPC承受度≤0.60 · 风险非红`)}`);
+		add(` ${th.fg("muted", gateDefaultsLine(this.store))}`);
 	}
 
 	private renderTodos(add: (line?: string) => void): void {

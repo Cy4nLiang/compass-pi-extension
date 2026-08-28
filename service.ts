@@ -25,7 +25,8 @@ import {
 import { calculateMarketMetrics } from "./metrics.ts";
 import { renderMarketReport, type GeneratedReport, type MarketReportData } from "./report.ts";
 import { evaluateStrategy, parseStrategyYaml, slugify, strategyToYaml, type StrategyContext } from "./strategy.ts";
-import { deriveTodos } from "./todo.ts";
+import { deriveTodos, divergenceWatermarks, isResolvableTodoKind, missingDeepResearchFields, stageEntryTimes } from "./todo.ts";
+import { TODO_RESOLUTION_STATUS_LABELS } from "./types.ts";
 import type {
 	BudgetPool,
 	Candidate,
@@ -46,6 +47,7 @@ import type {
 	ProfitEstimate,
 	ProfitInput,
 	ProfitResult,
+	ResolvableTodoKind,
 	ReviewAnalysis,
 	ReviewTheme,
 	RiskEvidenceItem,
@@ -54,6 +56,12 @@ import type {
 	StrategyEvaluation,
 	StrategyRun,
 	StrategyVersion,
+	TodoEvidenceRef,
+	TodoResolution,
+	TodoResolutionAttempt,
+	TodoResolutionBasis,
+	TodoResolutionStatus,
+	TodoResolutionVerdict,
 	WorkbenchTodo,
 } from "./types.ts";
 
@@ -139,6 +147,11 @@ export function ensureDefaults(store: CompassStore, actor = "compass"): boolean 
 	}
 	if (!Array.isArray(legacy.lessons)) {
 		legacy.lessons = [];
+		changed = true;
+	}
+	// 待办处理记录：可选顶层集合，回填后下游（派生/工具/Web）可无条件按数组消费
+	if (!Array.isArray(store.todoResolutions)) {
+		store.todoResolutions = [];
 		changed = true;
 	}
 	if (!store.strategies.some((strategy) => strategy.id === DEFAULT_STRATEGY_ID)) {
@@ -1544,6 +1557,12 @@ export function listRetroDue(store: CompassStore, now = nowIso()): RetroDueItem[
 	return dueRetroItems(store, now, retroDueConfig(strategy?.definition.meta));
 }
 
+// 深研阶段的合并指标（快照 + 利润 + 风险 + 评论）：待办派生与 verify 硬门槛共用同一口径。
+// 仅「无快照」按全缺处理；其余异常（如 store 局部损坏）照常抛出，不伪装成缺数据
+function deepResearchMetricsFor(store: CompassStore, marketId: string): MetricMap {
+	return latestSnapshotIfPresent(store, marketId) ? buildStrategyContext(store, marketId).context.metrics : {};
+}
+
 // 工作台待办：组合预算态、复盘到期、深研指标与多源偏差后委托 todo.ts 纯函数推导
 export function listWorkbenchTodos(store: CompassStore, now = nowIso()): WorkbenchTodo[] {
 	// 非法 now 统一回退当前时钟，避免预算月界与时间类待办各用一套时钟
@@ -1552,15 +1571,201 @@ export function listWorkbenchTodos(store: CompassStore, now = nowIso()): Workben
 	const retroDue = listRetroDue(store, resolvedNow);
 	const deepResearchMetrics = store.candidates
 		.filter((candidate) => candidate.stage === "deep_research")
-		.map((candidate): { marketId: string; metrics: MetricMap } => {
-			// 仅「无快照」按全缺处理；其余异常（如 store 局部损坏）照常抛出，不伪装成缺数据
-			const snapshot = latestSnapshotIfPresent(store, candidate.marketId);
-			return { marketId: candidate.marketId, metrics: snapshot ? buildStrategyContext(store, candidate.marketId).context.metrics : {} };
-		});
+		.map((candidate): { marketId: string; metrics: MetricMap } => ({ marketId: candidate.marketId, metrics: deepResearchMetricsFor(store, candidate.marketId) }));
 	const divergentMarkets = [...new Set(store.candidates.filter((candidate) => candidate.stage !== "archived").map((candidate) => candidate.marketId))]
 		.map((marketId) => ({ marketId, metrics: metricDivergences(store, marketId).map((item) => item.metric) }))
 		.filter((item) => item.metrics.length > 0);
 	return deriveTodos({ store, budgets, retroDue, deepResearchMetrics, divergentMarkets, now: resolvedNow });
+}
+
+// —— 待办人工处理闭环：提交 → 验证 → 勾选 → 重开 ——
+// 状态机迁移的唯一入口。每个动作的 actor / 时间 / 说明或理由全部留痕于记录自身，
+// **不写 decisionLog**：旧版 assertStore 对 decisionLog.type 是严格白名单，新增取值会让回滚后的
+// store 打不开（spec §5 方案 F）；审计链由记录本身 + 读侧时间线合并承载。
+
+interface TodoResolutionRules {
+	// verify verdict=pass 前的硬门槛，返回全部未满足项（中文）；空数组 = 通过
+	gate(store: CompassStore, record: TodoResolution): string[];
+	// 硬门槛查不了的语义部分：verify 时列给 agent 照单核对（spec §4.3 A 右列）
+	reviewPoints: string;
+	// 勾选时刻的抑制水位；无法确定时返回 undefined，由调用方拒绝勾选
+	// （口径必须与 todo.ts 的抑制判定同源——直接复用其导出函数，不另写一套）
+	basis(store: CompassStore, record: TodoResolution, now: string): TodoResolutionBasis | undefined;
+}
+
+const monthBasis = (_store: CompassStore, _record: TodoResolution, now: string): TodoResolutionBasis => ({ month: monthPrefix(new Date(now)) });
+
+// per-kind 查表：扩闭环 kind 只需加一行，四个动作的主流程不动
+const TODO_RESOLUTION_RULES: Record<ResolvableTodoKind, TodoResolutionRules> = {
+	// 预算两类与偏差类无可代码化门槛：是否给出结论/决定属语义判断，由 agent 终审兜底
+	budget_warning: {
+		gate: () => [],
+		reviewPoints: "是否给出用量核对结论与后续动作（提额 / 收紧补数 / 接受现状）",
+		basis: monthBasis,
+	},
+	budget_fused: {
+		gate: () => [],
+		reviewPoints: "是否给出明确决定（提额 or 本月接受停摆）与理由",
+		basis: monthBasis,
+	},
+	metric_divergence: {
+		gate: () => [],
+		reviewPoints: "说明是否明确「以哪个来源为准」及理由",
+		basis: (store, record) => {
+			const watermark = record.marketId ? divergenceWatermarks(store).get(record.marketId) : undefined;
+			return watermark ? { snapshotWatermark: watermark } : undefined;
+		},
+	},
+	deep_missing_data: {
+		reviewPoints: "提交说明是否真含供应商 / 具体 SKU / 成本构成",
+		// ① 四项硬指标齐备（口径同深研派生）② 该市场存在具体的利润测算记录
+		gate: (store, record) => {
+			const unmet = record.marketId
+				? missingDeepResearchFields(deepResearchMetricsFor(store, record.marketId)).map((label) => `缺${label}`)
+				: ["缺市场归属，无法核对硬指标"];
+			const hasProfit = store.profitEstimates.some((estimate) =>
+				(record.marketId !== undefined && estimate.marketId === record.marketId)
+				|| (record.candidateId !== undefined && estimate.candidateId === record.candidateId));
+			if (!hasProfit) unmet.push("缺利润测算记录");
+			return unmet;
+		},
+		basis: (store, record) => {
+			const enteredAt = record.candidateId ? stageEntryTimes(store, "deep_research").get(record.candidateId) : undefined;
+			return enteredAt ? { stageEnteredAt: enteredAt } : undefined;
+		},
+	},
+};
+
+export function findTodoResolution(store: CompassStore, todoRef: string): TodoResolution | undefined {
+	return store.todoResolutions?.find((record) => record.todoId === todoRef);
+}
+
+// 只读验证工作台（compass_todo 的待验证队列消费）：把该 kind 的硬门槛预检结果与语义终审要点
+// 一并给 agent，避免任何消费面复刻门槛口径。纯读，不改任何状态。
+export function todoResolutionReviewGuide(store: CompassStore, record: TodoResolution): { reviewPoints: string; unmetGate: string[] } {
+	const rules = TODO_RESOLUTION_RULES[record.kind];
+	return { reviewPoints: rules.reviewPoints, unmetGate: rules.gate(store, record) };
+}
+
+function requireTodoResolution(store: CompassStore, todoRef: string): TodoResolution {
+	const record = findTodoResolution(store, todoRef);
+	if (!record) throw new Error(`待办 ${todoRef} 尚无处理记录，请先提交处理结果`);
+	return record;
+}
+
+function currentAttempt(record: TodoResolution): TodoResolutionAttempt {
+	const attempt = record.attempts[record.attempts.length - 1];
+	if (!attempt) throw new Error(`待办 ${record.todoId} 的处理记录损坏：无提交轮次`);
+	return attempt;
+}
+
+function statusLabel(status: TodoResolutionStatus): string {
+	return TODO_RESOLUTION_STATUS_LABELS[status];
+}
+
+export function submitTodoResolution(
+	store: CompassStore,
+	input: { todoRef: string; note: string; evidence?: Array<{ ref: string; note?: string }> },
+	actor: string,
+	now = nowIso(),
+): TodoResolution {
+	const note = input.note?.trim();
+	if (!note) throw new Error("处理说明不能为空：请写清做了什么、结论与关键数值");
+	const evidence: TodoEvidenceRef[] = (input.evidence ?? []).map((item) => {
+		const ref = item.ref?.trim();
+		if (!ref) throw new Error("证据引用不能为空：填写 URL 或项目内文件路径");
+		const itemNote = item.note?.trim();
+		return itemNote ? { ref, note: itemNote } : { ref };
+	});
+	// 状态前置校验先于活跃清单查询：已勾选的条目本就被抑制在清单外，
+	// 若先查清单会把「请先重开」误报成「待办不存在」，把运营指向错误的下一步
+	const existing = findTodoResolution(store, input.todoRef);
+	if (existing?.status === "submitted") throw new Error(`待办 ${input.todoRef} 已提交，正在等待 agent 验证（当前「待验证」）`);
+	if (existing?.status === "verified") throw new Error(`待办 ${input.todoRef} 已验证通过，请直接勾选已处理`);
+	if (existing?.status === "resolved") throw new Error(`待办 ${input.todoRef} 已勾选处理，如需重新处理请先重开`);
+	// 必须命中当前活跃派生清单：条件已自然解决的待办不接受提交
+	const todo = listWorkbenchTodos(store, now).find((item) => item.id === input.todoRef);
+	if (!todo) throw new Error(`待办 ${input.todoRef} 不存在或已消失（可能条件已解决）`);
+	if (!isResolvableTodoKind(todo.kind)) throw new Error(`待办 ${input.todoRef} 属 ${todo.kind}，该类待办由系统动作自动消失，无需提交处理结果`);
+	const attempt: TodoResolutionAttempt = { submittedAt: now, submittedBy: actor, note, evidence };
+	if (!existing) {
+		const record: TodoResolution = {
+			id: shortId("tdr"),
+			todoId: todo.id,
+			kind: todo.kind,
+			titleSnapshot: todo.title,
+			status: "submitted",
+			attempts: [attempt],
+			reopens: [],
+			createdAt: now,
+			updatedAt: now,
+		};
+		if (todo.marketId) record.marketId = todo.marketId;
+		if (todo.candidateId) record.candidateId = todo.candidateId;
+		if (todo.source) record.source = todo.source;
+		(store.todoResolutions ??= []).push(record);
+		return record;
+	}
+	// rejected / reopened：追加新一轮，历史轮次与重开留痕全部保留；标题快照刷新为当前派生标题
+	existing.attempts.push(attempt);
+	existing.status = "submitted";
+	existing.titleSnapshot = todo.title;
+	existing.updatedAt = now;
+	return existing;
+}
+
+export function verifyTodoResolution(
+	store: CompassStore,
+	input: { todoRef: string; verdict: TodoResolutionVerdict; reason: string },
+	actor: string,
+	now = nowIso(),
+): TodoResolution {
+	const reason = input.reason?.trim();
+	if (!reason) throw new Error("验证结论必须填写理由");
+	if (input.verdict !== "pass" && input.verdict !== "reject") throw new Error(`验证结论只能是 pass 或 reject：${String(input.verdict)}`);
+	const record = requireTodoResolution(store, input.todoRef);
+	if (record.status !== "submitted") throw new Error(`待办 ${input.todoRef} 当前为「${statusLabel(record.status)}」，只有待验证的记录可以验证`);
+	if (input.verdict === "pass") {
+		// 硬门槛不满足时拒绝落「通过」：agent 只能改判 reject 或先补齐数据（前置于任何写入）
+		const unmet = TODO_RESOLUTION_RULES[record.kind].gate(store, record);
+		if (unmet.length) throw new Error(`待办 ${input.todoRef} 未达硬门槛，不得判定通过：${unmet.join("、")}；请先补齐数据，或改判 reject`);
+	}
+	const attempt = currentAttempt(record);
+	attempt.verdict = input.verdict;
+	attempt.verdictReason = reason;
+	attempt.verifiedAt = now;
+	attempt.verifiedBy = actor;
+	record.status = input.verdict === "pass" ? "verified" : "rejected";
+	record.updatedAt = now;
+	return record;
+}
+
+export function completeTodoResolution(store: CompassStore, input: { todoRef: string }, actor: string, now = nowIso()): TodoResolution {
+	const record = requireTodoResolution(store, input.todoRef);
+	if (record.status === "resolved") throw new Error(`待办 ${input.todoRef} 已勾选处理，无需重复勾选`);
+	// 服务端强制校验：前端置灰只是辅助，绕过前端直连端点同样拦下
+	if (record.status !== "verified") throw new Error(`待办 ${input.todoRef} 须先经 agent 验证通过才能勾选已处理（当前「${statusLabel(record.status)}」）`);
+	const basis = TODO_RESOLUTION_RULES[record.kind].basis(store, record, now);
+	if (!basis) throw new Error(`待办 ${input.todoRef} 无法确定抑制水位（关联市场或候选已不可用），暂不能勾选已处理`);
+	record.status = "resolved";
+	record.resolvedAt = now;
+	record.resolvedBy = actor;
+	record.basis = basis;
+	record.updatedAt = now;
+	return record;
+}
+
+export function reopenTodoResolution(store: CompassStore, input: { todoRef: string; reason: string }, actor: string, now = nowIso()): TodoResolution {
+	const reason = input.reason?.trim();
+	if (!reason) throw new Error("重开必须填写理由");
+	const record = requireTodoResolution(store, input.todoRef);
+	if (record.status !== "resolved") throw new Error(`待办 ${input.todoRef} 当前为「${statusLabel(record.status)}」，只有已处理的记录可以重开`);
+	record.reopens.push({ reopenedAt: now, reopenedBy: actor, reason });
+	record.status = "reopened";
+	record.updatedAt = now;
+	// resolvedAt/resolvedBy/basis 保留为「曾于何时被谁勾选」的历史事实，下次勾选时整体覆盖；
+	// 消费方判断「已处理」一律以 status === "resolved" 为准，不得看 resolvedAt 是否存在
+	return record;
 }
 
 export function historyTimeline(store: CompassStore, marketRef: string, candidateRef?: string): HistoryTimelineItem[] {

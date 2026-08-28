@@ -24,10 +24,12 @@ import {
 	candidateDetail,
 	classifyMcpToolResult,
 	cloneStrategy,
+	completeTodoResolution,
 	configureBudget,
 	createLead,
 	decideCandidate,
 	ensureDefaults,
+	findTodoResolution,
 	evaluateMcpGate,
 	findCandidate,
 	findDuplicateImport,
@@ -56,9 +58,13 @@ import {
 	recordReviewAnalysis,
 	recordRetroActuals,
 	recordRisk,
+	reopenTodoResolution,
 	retireLesson,
 	runStrategy,
 	saveLesson,
+	submitTodoResolution,
+	todoResolutionReviewGuide,
+	verifyTodoResolution,
 	saveStrategyVersion,
 	scanMarkets,
 	decisionHistoryNote,
@@ -66,14 +72,16 @@ import {
 	strategyHistoryNote,
 } from "./service.ts";
 import { CompassRepository } from "./store.ts";
-import { DEEP_RESEARCH_REQUIRED_FIELDS } from "./todo.ts";
-import { CANDIDATE_STAGES, DECISION_STATUSES, SNAPSHOT_SOURCES, TODO_KINDS, type CandidateStage, type CompassStore, type DecisionLog, type DecisionStatus, type OutcomeActuals, type ReviewTheme } from "./types.ts";
+import { DEEP_RESEARCH_REQUIRED_FIELDS, todoResolutionBadge } from "./todo.ts";
+import { CANDIDATE_STAGES, DECISION_STATUSES, SNAPSHOT_SOURCES, TODO_KINDS, TODO_RESOLUTION_STATUS_LABELS, TODO_RESOLUTION_STATUSES, type CandidateStage, type CompassStore, type DecisionLog, type DecisionStatus, type OutcomeActuals, type ReviewTheme } from "./types.ts";
 import { compactDashboardSummary, CompassDashboard } from "./ui.ts";
 import { startCompassWebServer, type CompassWebServer } from "./web/server.ts";
 
 const baseDir = dirname(fileURLToPath(import.meta.url));
 const TOOL_DETAILS_KIND = "compass-result";
 const METER_ACTOR = "compass-meter";
+// compass_todo 验证工作台单次展开的待验证条目上限：每条含说明/证据/审查要点，超出部分显式提示
+const WORKBENCH_QUEUE_LIMIT = 20;
 
 interface CompassDetails {
 	kind: typeof TOOL_DETAILS_KIND;
@@ -171,7 +179,7 @@ const TOOL_CATALOG: Array<{ name: (typeof DOMAIN_TOOLS)[number]; keywords: strin
 	{ name: "compass_risk_check", keywords: "risk patent trademark cert policy 风险 专利 商标 认证 擦边 季节", description: "记录五类风险清单与官方证据链接" },
 	{ name: "compass_reviews_record", keywords: "review pain kano 差评 评论 痛点 聚类 产品力", description: "保存差评主题、可改良性和预估星级差" },
 	{ name: "compass_budget", keywords: "budget cost quota source 预算 成本 配额 数据源 熔断 计量 调用次数", description: "查看、配置预算池并按市场记账；MCP 计量源可配单价与次数上限" },
-	{ name: "compass_todo", keywords: "todo task priority 待办 优先级 清单 人工 干预 复核 补数 处理", description: "查看工作台待办清单：需人工干预的事项与 5 级优先级" },
+	{ name: "compass_todo", keywords: "todo task priority 待办 优先级 清单 人工 干预 复核 补数 处理 处理结果 提交 验证 核验 勾选 已处理 重开 闭环", description: "查看工作台待办清单（5 级优先级 + 处理状态）；闭环四类待办的提交处理结果、agent 验证、勾选已处理与重开" },
 	{ name: "compass_asin_history", keywords: "asin history bsr price 历史 价格 评论", description: "读取同一 ASIN 跨快照历史" },
 	{ name: "compass_keyword_metrics", keywords: "keyword search volume cpc 关键词 搜索量", description: "读取关键词跨快照指标" },
 	{ name: "compass_data_route", keywords: "route source freshness cost 数据 路由 新鲜度 补数", description: "按阶段、字段、新鲜度和预算规划数据源" },
@@ -857,14 +865,81 @@ export default function compassExtension(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "compass_todo",
 		label: "Compass Todo",
-		description: "工作台待办清单：从 store 状态自动推导需人工干预的事项（预算熔断/复盘 challenged/Gate复核/待决策/补数据/补证据/到期复盘/预算告警/快照过期/多源偏差），P1 最高–P5 最低，逾期超 30 天升 1 级；事项解决后自动消失。",
+		description: [
+			"工作台待办清单与人工处理闭环。",
+			"list（默认）：推导需人工干预的事项（预算熔断/复盘 challenged/Gate复核/待决策/补数据/补证据/到期复盘/预算告警/快照过期/多源偏差），P1 最高–P5 最低，逾期超 30 天升 1 级；多数事项解决后自动消失。",
+			"闭环四类（metric_divergence / budget_warning / budget_fused / deep_missing_data）没有系统内动作可消除，须走「提交处理结果 → agent 验证 → 勾选已处理」，list 输出附处理状态徽标。",
+			"submit：代运营录入处理说明与证据（URL 或项目内文件路径）。verify：**验证是你的活**——用 action=list resolution_status=submitted 拉待验证队列，逐条核对提交材料与 store 实况后给 verdict；判据不满足或证据不足一律 reject，不得为了清单好看而放行。complete：勾选已处理（仅验证通过后可用）。reopen：拉回重新处理，必填理由。",
+		].join("\n"),
 		parameters: Type.Object({
+			action: Type.Optional(StringEnum(["list", "submit", "verify", "complete", "reopen"] as const)),
 			priority: Type.Optional(Type.Integer({ minimum: 1, maximum: 5, description: "只看该优先级" })),
 			kind: Type.Optional(StringEnum(TODO_KINDS)),
 			market_ref: Type.Optional(Type.String({ description: "market_id 或唯一市场名" })),
 			limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+			resolution_status: Type.Optional(StringEnum(TODO_RESOLUTION_STATUSES)),
+			todo_id: Type.Optional(Type.String({ description: "待办 id（list 输出第三列）；submit/verify/complete/reopen 必填" })),
+			note: Type.Optional(Type.String({ description: "submit：处理说明，写清做了什么、结论与关键数值" })),
+			evidence: Type.Optional(Type.Array(Type.Object({
+				ref: Type.String({ description: "URL 或项目内文件路径" }),
+				note: Type.Optional(Type.String()),
+			}), { maxItems: 20 })),
+			verdict: Type.Optional(StringEnum(["pass", "reject"] as const)),
+			reason: Type.Optional(Type.String({ description: "verify 的结论理由 / reopen 的重开理由，必填非空" })),
+			actor: Type.Optional(Type.String()),
 		}),
 		async execute(_id, params, _signal, _update, ctx) {
+			const action = params.action ?? "list";
+			if (action !== "list") {
+				const todoId = params.todo_id?.trim();
+				if (!todoId) throw new Error(`compass_todo action=${action} 需要 todo_id（见 list 输出第三列）`);
+				const actor = actorName(params.actor);
+				if (action === "submit") {
+					const { result: record } = await mutateStore(ctx, (store) => submitTodoResolution(store, { todoRef: todoId, note: params.note ?? "", evidence: params.evidence }, actor));
+					const summary = `${record.titleSnapshot} · 待验证 · 第 ${record.attempts.length} 轮`;
+					return textResult([
+						`todo_id=${record.todoId}`,
+						`状态：${TODO_RESOLUTION_STATUS_LABELS[record.status]}（第 ${record.attempts.length} 轮，提交人 ${actor}）`,
+						`下一步：核对材料与 store 实况后执行 compass_todo action=verify todo_id=${record.todoId} verdict=pass|reject reason=…`,
+					].join("\n"), details({ title: "处理结果已提交", status: "success", summary }));
+				}
+				if (action === "verify") {
+					if (params.verdict !== "pass" && params.verdict !== "reject") throw new Error("compass_todo action=verify 需要 verdict=pass 或 reject");
+					const verdict = params.verdict;
+					const { result: record } = await mutateStore(ctx, (store) => verifyTodoResolution(store, { todoRef: todoId, verdict, reason: params.reason ?? "" }, actor));
+					const passed = record.status === "verified";
+					const summary = `${record.titleSnapshot} · ${TODO_RESOLUTION_STATUS_LABELS[record.status]}`;
+					return textResult([
+						`todo_id=${record.todoId}`,
+						`验证结论：${verdict === "pass" ? "通过" : "驳回"} · ${record.attempts.at(-1)?.verdictReason ?? ""}`,
+						`状态：${TODO_RESOLUTION_STATUS_LABELS[record.status]}`,
+						passed
+							? `下一步：由运营在 Web 待办页勾选「已处理」，或 compass_todo action=complete todo_id=${record.todoId}`
+							: "下一步：请运营按驳回理由补充材料后重新提交（compass_todo action=submit）",
+					].join("\n"), details({ title: passed ? "验证通过" : "验证驳回", status: passed ? "success" : "warning", summary }));
+				}
+				if (action === "complete") {
+					const { result: record } = await mutateStore(ctx, (store) => completeTodoResolution(store, { todoRef: todoId }, actor));
+					const basis = record.basis ?? {};
+					const watermark = basis.month ?? basis.snapshotWatermark ?? basis.stageEnteredAt ?? "—";
+					const summary = `${record.titleSnapshot} · 已处理`;
+					return textResult([
+						`todo_id=${record.todoId}`,
+						`状态：已处理（勾选人 ${actor}）`,
+						`抑制水位：${watermark}`,
+						"该条目已离开活跃清单；出现新事实（新快照/新预算月/深研重入）会自动失效浮出，也可用 action=reopen 主动拉回",
+					].join("\n"), details({ title: "已勾选处理", status: "success", summary }));
+				}
+				const { result: record } = await mutateStore(ctx, (store) => reopenTodoResolution(store, { todoRef: todoId, reason: params.reason ?? "" }, actor));
+				const summary = `${record.titleSnapshot} · ${TODO_RESOLUTION_STATUS_LABELS[record.status]}`;
+				return textResult([
+					`todo_id=${record.todoId}`,
+					`状态：${TODO_RESOLUTION_STATUS_LABELS[record.status]}（重开人 ${actor}）`,
+					`重开理由：${record.reopens.at(-1)?.reason ?? ""}`,
+					"下一步：条目已回到活跃清单，请重新提交处理结果（compass_todo action=submit）",
+				].join("\n"), details({ title: "待办已重开", status: "warning", summary }));
+			}
+
 			const store = await readStoreFlushingUsage(ctx);
 			let todos = listWorkbenchTodos(store);
 			if (params.market_ref) {
@@ -873,11 +948,55 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			}
 			if (params.priority !== undefined) todos = todos.filter((todo) => todo.priority === params.priority);
 			if (params.kind) todos = todos.filter((todo) => todo.kind === params.kind);
+			if (params.resolution_status) todos = todos.filter((todo) => todo.resolution?.status === params.resolution_status);
 			const limited = todos.slice(0, params.limit ?? 50);
-			const lines = limited.map((todo) => `P${todo.priority} | ${todo.kind} | ${todo.marketName ?? todo.source ?? "—"} | ${todo.title} | ${todo.reason}${todo.overdueDays ? ` | 逾期${todo.overdueDays}天` : ""} | 建议：${todo.suggestedAction}`);
+			const lines = limited.map((todo) => {
+				const badge = todoResolutionBadge(todo);
+				// 驳回理由必须在工具面可见（R2）：只给「已驳回」三个字，agent 无从指导运营改什么
+				const status = badge === undefined
+					? "—"
+					: todo.resolution?.status === "rejected" && todo.resolution.verdictReason
+						? `${badge}（理由：${todo.resolution.verdictReason}）`
+						: badge;
+				return `P${todo.priority} | ${todo.kind} | ${todo.id} | ${todo.marketName ?? todo.source ?? "—"} | ${todo.title} | ${todo.reason}${todo.overdueDays ? ` | 逾期${todo.overdueDays}天` : ""} | ${status} | 建议：${todo.suggestedAction}`;
+			});
+			// 验证工作台：待验证条目附提交材料、该 kind 的审查要点与硬门槛预检，供 agent 照单核对。
+			// 计数按未截断的全量统计——页内截断不得让页外待验证的提交材料在 agent 面前静默消失
+			const pendingAll = todos.filter((todo) => todo.resolution?.status === "submitted");
+			const pending = limited.filter((todo) => todo.resolution?.status === "submitted");
+			const workbench: string[] = [];
+			for (const todo of pending.slice(0, WORKBENCH_QUEUE_LIMIT)) {
+				const record = findTodoResolution(store, todo.id);
+				const attempt = record?.attempts.at(-1);
+				if (!record || !attempt) continue;
+				const guide = todoResolutionReviewGuide(store, record);
+				const previous = record.attempts.at(-2);
+				workbench.push(
+					`- ${todo.id} | ${record.titleSnapshot} | ${todo.marketName ?? record.source ?? "—"}`,
+					`  提交：${attempt.submittedBy} @${attempt.submittedAt}（第 ${record.attempts.length} 轮）`,
+					// 处理说明是自由文本：续行缩进对齐，避免多行说明把工作台的条目块冲散
+					`  说明：${attempt.note.replace(/\r?\n/gu, "\n    ")}`,
+					`  证据：${attempt.evidence.map((item) => `${item.ref.replace(/\s+/gu, " ")}${item.note ? `（${item.note.replace(/\s+/gu, " ")}）` : ""}`).join("；") || "无"}`,
+					`  审查要点：${guide.reviewPoints}`,
+					`  硬门槛预检：${guide.unmetGate.length ? `未满足 —— ${guide.unmetGate.join("、")}（不得判 pass）` : "全部满足"}`,
+				);
+				if (previous?.verdict === "reject") workbench.push(`  上轮驳回：${previous.verdictReason ?? ""}`);
+			}
+			// 队列有溢出必须明说（同 compass_history 决策链的「仅显示最近 N 条」惯例）：
+			// 静默截断会让 agent 以为已核对完全部待验证项
+			const hiddenPending = pendingAll.length - Math.min(pending.length, WORKBENCH_QUEUE_LIMIT);
+			if (hiddenPending > 0) {
+				workbench.push(`（另有 ${hiddenPending} 项待验证未展开：用 action=list resolution_status=submitted，或加 kind= / market_ref= 缩小范围后重看）`);
+			}
 			const urgent = todos.filter((todo) => todo.priority <= 2).length;
-			const summary = todos.length ? `${todos.length} 项待办 · P1/P2 ${urgent} 项` : "当前没有需要人工处理的事项";
-			return textResult(lines.join("\n") || summary, details({
+			const summary = todos.length
+				? `${todos.length} 项待办 · P1/P2 ${urgent} 项${pendingAll.length ? ` · 待验证 ${pendingAll.length} 项` : ""}`
+				: "当前没有需要人工处理的事项";
+			const body = [
+				lines.join("\n") || summary,
+				workbench.length ? ["", "—— 待验证队列（核对后执行 compass_todo action=verify）——", ...workbench].join("\n") : "",
+			].filter(Boolean).join("\n");
+			return textResult(body, details({
 				title: "工作台待办",
 				status: urgent ? "warning" : "success",
 				summary,

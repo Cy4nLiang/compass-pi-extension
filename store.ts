@@ -3,7 +3,14 @@ import { lstatSync, readFileSync, readlinkSync, realpathSync } from "node:fs";
 import { chmod, mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
-import type { CompassStore, MarketSnapshot } from "./types.ts";
+import {
+	RESOLVABLE_TODO_KINDS,
+	TODO_RESOLUTION_BASIS_ANCHORS,
+	TODO_RESOLUTION_STATUSES,
+	type CompassStore,
+	type MarketSnapshot,
+	type ResolvableTodoKind,
+} from "./types.ts";
 
 const STORE_NEEDS_MIGRATION_WRITE = Symbol("compass-store-needs-migration-write");
 type MigratingStore = CompassStore & { [STORE_NEEDS_MIGRATION_WRITE]?: boolean };
@@ -36,6 +43,7 @@ export function createEmptyStore(now = new Date().toISOString()): CompassStore {
 		lessons: [],
 		budgetPools: [],
 		costEvents: [],
+		todoResolutions: [],
 	};
 }
 
@@ -86,6 +94,7 @@ function assertStore(value: unknown): asserts value is CompassStore {
 	] as const) arrays[key] = assertRecordArray(record, key);
 	arrays.outcomeChecks = assertRecordArray(record, "outcomeChecks", true);
 	arrays.lessons = assertRecordArray(record, "lessons", true);
+	arrays.todoResolutions = assertRecordArray(record, "todoResolutions", true);
 
 	for (const [index, market] of arrays.markets.entries()) {
 		assertString(market, "id", `markets[${index}]`);
@@ -194,6 +203,67 @@ function assertStore(value: unknown): asserts value is CompassStore {
 	for (const [index, review] of arrays.reviewAnalyses.entries()) {
 		for (const field of ["id", "marketId", "createdAt", "actor"]) assertString(review, field, `reviewAnalyses[${index}]`);
 		if (!Array.isArray(review.sourceAsins) || !Array.isArray(review.themes)) throw new Error(`罗盘数据字段 reviewAnalyses[${index}] 损坏`);
+	}
+	// 待办处理记录：记录本身即审计链，因此校验必须守住「状态 ⇔ 末轮验证结论」的一致性——
+	// 仿 outcomeChecks「无证据不得非 inconclusive」，杜绝未经验证就落已处理（绕过服务端校验写入的脏数据）
+	const seenTodoIds = new Set<string>();
+	for (const [index, resolution] of arrays.todoResolutions.entries()) {
+		const path = `todoResolutions[${index}]`;
+		for (const field of ["id", "todoId", "kind", "titleSnapshot", "status", "createdAt", "updatedAt"]) assertString(resolution, field, path);
+		for (const field of ["marketId", "candidateId", "source", "resolvedAt", "resolvedBy"]) {
+			if (resolution[field] !== undefined && (typeof resolution[field] !== "string" || !resolution[field])) throw new Error(`罗盘数据字段 ${path}.${field} 损坏`);
+		}
+		if (!(RESOLVABLE_TODO_KINDS as readonly unknown[]).includes(resolution.kind)) throw new Error(`罗盘数据字段 ${path}.kind 损坏`);
+		if (!(TODO_RESOLUTION_STATUSES as readonly unknown[]).includes(resolution.status)) throw new Error(`罗盘数据字段 ${path}.status 损坏`);
+		if (seenTodoIds.has(resolution.todoId as string)) throw new Error(`罗盘数据字段 ${path}.todoId 重复`);
+		seenTodoIds.add(resolution.todoId as string);
+		if (!Array.isArray(resolution.attempts) || resolution.attempts.length === 0) throw new Error(`罗盘数据字段 ${path}.attempts 必须非空`);
+		for (const [attemptIndex, attempt] of resolution.attempts.entries()) {
+			const attemptPath = `${path}.attempts[${attemptIndex}]`;
+			if (!isRecord(attempt)) throw new Error(`罗盘数据字段 ${attemptPath} 损坏`);
+			for (const field of ["submittedAt", "submittedBy"]) assertString(attempt, field, attemptPath);
+			if (typeof attempt.note !== "string" || !attempt.note.trim()) throw new Error(`罗盘数据字段 ${attemptPath}.note 必须非空`);
+			if (!Array.isArray(attempt.evidence)) throw new Error(`罗盘数据字段 ${attemptPath}.evidence 损坏`);
+			for (const [evidenceIndex, item] of attempt.evidence.entries()) {
+				const evidencePath = `${attemptPath}.evidence[${evidenceIndex}]`;
+				if (!isRecord(item)) throw new Error(`罗盘数据字段 ${evidencePath} 损坏`);
+				if (typeof item.ref !== "string" || !item.ref.trim()) throw new Error(`罗盘数据字段 ${evidencePath}.ref 必须非空`);
+				if (item.note !== undefined && typeof item.note !== "string") throw new Error(`罗盘数据字段 ${evidencePath}.note 损坏`);
+			}
+			if (attempt.verdict !== undefined) {
+				if (!(["pass", "reject"] as unknown[]).includes(attempt.verdict)) throw new Error(`罗盘数据字段 ${attemptPath}.verdict 损坏`);
+				if (typeof attempt.verdictReason !== "string" || !attempt.verdictReason.trim()) throw new Error(`罗盘数据字段 ${attemptPath}.verdictReason 必须非空`);
+				for (const field of ["verifiedAt", "verifiedBy"]) assertString(attempt, field, attemptPath);
+			} else if (attempt.verdictReason !== undefined || attempt.verifiedAt !== undefined || attempt.verifiedBy !== undefined) {
+				// 半截验证留痕 = 审计链断裂：宁可判损坏，也不让「有理由无结论」的记录混进已处理分区
+				throw new Error(`罗盘数据字段 ${attemptPath} 有验证留痕但缺 verdict`);
+			}
+		}
+		if (!Array.isArray(resolution.reopens)) throw new Error(`罗盘数据字段 ${path}.reopens 损坏`);
+		for (const [reopenIndex, reopen] of resolution.reopens.entries()) {
+			const reopenPath = `${path}.reopens[${reopenIndex}]`;
+			if (!isRecord(reopen)) throw new Error(`罗盘数据字段 ${reopenPath} 损坏`);
+			for (const field of ["reopenedAt", "reopenedBy"]) assertString(reopen, field, reopenPath);
+			if (typeof reopen.reason !== "string" || !reopen.reason.trim()) throw new Error(`罗盘数据字段 ${reopenPath}.reason 必须非空`);
+		}
+		if (resolution.basis !== undefined) {
+			if (!isRecord(resolution.basis)) throw new Error(`罗盘数据字段 ${path}.basis 损坏`);
+			for (const field of ["month", "snapshotWatermark", "stageEnteredAt"]) {
+				if (resolution.basis[field] !== undefined && (typeof resolution.basis[field] !== "string" || !resolution.basis[field])) throw new Error(`罗盘数据字段 ${path}.basis.${field} 损坏`);
+			}
+		}
+		const lastVerdict = resolution.attempts[resolution.attempts.length - 1].verdict;
+		const expectedVerdict: Record<string, unknown> = { submitted: undefined, rejected: "reject", verified: "pass", resolved: "pass" };
+		if (resolution.status !== "reopened" && lastVerdict !== expectedVerdict[resolution.status as string]) {
+			throw new Error(`罗盘数据字段 ${path} 的状态 ${String(resolution.status)} 与末轮验证结论不一致`);
+		}
+		if (resolution.status === "resolved") {
+			if (!resolution.resolvedAt || !resolution.resolvedBy) throw new Error(`罗盘数据字段 ${path} 的 resolved 状态缺少勾选留痕`);
+			const anchor = TODO_RESOLUTION_BASIS_ANCHORS[resolution.kind as ResolvableTodoKind];
+			const basis = isRecord(resolution.basis) ? resolution.basis : undefined;
+			if (typeof basis?.[anchor] !== "string" || !basis[anchor]) throw new Error(`罗盘数据字段 ${path} 的 resolved 状态缺少水位锚点 ${anchor}`);
+		}
+		if (resolution.status === "reopened" && resolution.reopens.length === 0) throw new Error(`罗盘数据字段 ${path} 的 reopened 状态缺少重开留痕`);
 	}
 }
 
@@ -337,7 +407,7 @@ export class CompassRepository {
 		try {
 			const text = await readFile(this.storePath, "utf8");
 			const parsed = JSON.parse(text) as unknown;
-			const needsMigrationWrite = isRecord(parsed) && (parsed.outcomeChecks === undefined || parsed.lessons === undefined);
+			const needsMigrationWrite = isRecord(parsed) && (parsed.outcomeChecks === undefined || parsed.lessons === undefined || parsed.todoResolutions === undefined);
 			assertStore(parsed);
 			if (needsMigrationWrite) Object.defineProperty(parsed, STORE_NEEDS_MIGRATION_WRITE, { value: true, configurable: true, enumerable: false, writable: true });
 			this.installLazySnapshotData(parsed);

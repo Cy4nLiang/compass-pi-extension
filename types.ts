@@ -423,7 +423,108 @@ export const TODO_GROUP_LABELS: Record<TodoPriority, string> = {
 	5: "P5 保鲜/优化",
 };
 
-// 工作台待办：从 store 派生的只读视图，不持久化（条件解决即消失）
+// 纳入人工处理闭环的四类待办：这四类没有系统内动作可消除（或消除条件不足以证明「实质处理」），
+// 需走「提交 → agent 验证 → 勾选已处理」；其余六类保持「条件解决即消失」的纯派生语义
+export const RESOLVABLE_TODO_KINDS = [
+	"metric_divergence",
+	"budget_warning",
+	"budget_fused",
+	"deep_missing_data",
+] as const satisfies readonly TodoKind[];
+
+export type ResolvableTodoKind = (typeof RESOLVABLE_TODO_KINDS)[number];
+
+// 处理记录状态机（迁移入口唯一在 service）：
+//   无记录 / rejected / reopened --submit--> submitted
+//   submitted --verify--> verified(pass) | rejected(reject)
+//   verified --complete--> resolved（活跃清单抑制中）
+//   resolved --reopen--> reopened（回活跃清单，历史轮次全保留）
+export const TODO_RESOLUTION_STATUSES = ["submitted", "rejected", "verified", "resolved", "reopened"] as const;
+export type TodoResolutionStatus = (typeof TODO_RESOLUTION_STATUSES)[number];
+export type TodoResolutionVerdict = "pass" | "reject";
+
+// 证据引用：URL 或项目内相对路径，仅作文本记录——服务端不读取其内容
+export interface TodoEvidenceRef {
+	ref: string;
+	note?: string;
+}
+
+// 一轮「提交 → 验证」；驳回后重新提交会追加新一轮，末条 = 当前轮
+export interface TodoResolutionAttempt {
+	submittedAt: string;
+	submittedBy: string;
+	note: string;
+	evidence: TodoEvidenceRef[];
+	verdict?: TodoResolutionVerdict;
+	verdictReason?: string;
+	verifiedAt?: string;
+	verifiedBy?: string;
+}
+
+export interface TodoResolutionReopen {
+	reopenedAt: string;
+	reopenedBy: string;
+	reason: string;
+}
+
+// 勾选时快照的抑制水位：抑制到期后待办重新浮出（宁可多提醒，绝不漏提醒）
+export interface TodoResolutionBasis {
+	month?: string;
+	snapshotWatermark?: string;
+	stageEnteredAt?: string;
+}
+
+// 每类闭环待办勾选时必须落的水位锚点：assertStore 硬校验、派生层抑制判定共用同一张表
+export const TODO_RESOLUTION_BASIS_ANCHORS: Record<ResolvableTodoKind, keyof TodoResolutionBasis> = {
+	metric_divergence: "snapshotWatermark",
+	budget_warning: "month",
+	budget_fused: "month",
+	deep_missing_data: "stageEnteredAt",
+};
+
+// 待办处理记录：以确定性待办 id 关联的持久化真相源，记录本身即完整审计链
+// （提交/验证/勾选/重开四类动作各含 actor + 时间 + 说明或理由，不写 decisionLog）
+export interface TodoResolution {
+	id: string;
+	todoId: string;
+	kind: ResolvableTodoKind;
+	marketId?: string;
+	candidateId?: string;
+	source?: string;
+	// 提交时的待办标题快照：待办自然消失后「已处理」分区仍可展示
+	titleSnapshot: string;
+	status: TodoResolutionStatus;
+	attempts: TodoResolutionAttempt[];
+	reopens: TodoResolutionReopen[];
+	resolvedAt?: string;
+	resolvedBy?: string;
+	basis?: TodoResolutionBasis;
+	createdAt: string;
+	updatedAt: string;
+}
+
+// 处理状态徽标：Web / TUI / compass_todo / service 错误文案四端共用同一措辞
+export const TODO_RESOLUTION_STATUS_LABELS: Record<TodoResolutionStatus, string> = {
+	submitted: "待验证",
+	rejected: "已驳回",
+	verified: "验证通过·待勾选",
+	resolved: "已处理",
+	reopened: "已重开·待重新提交",
+};
+
+// 活跃待办上合成的处理状态摘要（只读派生，不落盘）
+export interface WorkbenchTodoResolution {
+	status: TodoResolutionStatus;
+	verdict?: TodoResolutionVerdict;
+	verdictReason?: string;
+	attemptCount: number;
+	updatedAt: string;
+	// 已勾选但水位失效、重新浮出
+	lapsed?: boolean;
+}
+
+// 工作台待办：从 store 派生的只读视图，不持久化（条件解决即消失）；
+// 闭环四类另附由 store.todoResolutions 合成的处理状态（resolvable / resolution）
 export interface WorkbenchTodo {
 	id: string;
 	kind: TodoKind;
@@ -438,6 +539,8 @@ export interface WorkbenchTodo {
 	suggestedAction: string;
 	dueAt?: string;
 	overdueDays?: number;
+	resolvable?: boolean;
+	resolution?: WorkbenchTodoResolution;
 }
 
 export interface CompassStore {
@@ -457,4 +560,6 @@ export interface CompassStore {
 	lessons: Lesson[];
 	budgetPools: BudgetPool[];
 	costEvents: CostEvent[];
+	// 可选顶层集合（走 ensureDefaults 回填 + load 迁移回写）：旧版扩展回滚后忽略本字段
+	todoResolutions?: TodoResolution[];
 }

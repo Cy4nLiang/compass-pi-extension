@@ -59,7 +59,7 @@ Agent 会先调用 `compass_tools`，按需动态激活相关工具。
 | `compass_risk_check` | 认证/IP/季节/政策/物流风险及官方证据 |
 | `compass_reviews_record` | 差评主题、Kano 可改良性、星级差 |
 | `compass_budget` | 数据源预算与 MCP 调用计量（`cost_per_call_cny` 单价、`monthly_call_limit` 次数上限）、80% 告警、100% 熔断、市场归因 |
-| `compass_todo` | 工作台待办清单：自动推导需人工干预的事项（复核/补数/复盘/预算等 10 类），P1–P5 优先级，事项解决后自动消失 |
+| `compass_todo` | 工作台待办清单：自动推导需人工干预的事项（复核/补数/复盘/预算等 10 类），P1–P5 优先级；事项条件解决即消失，另有四类（多源偏差、预算 80% 告警、预算熔断、深研数据）的人工处理系统感知不到，走「提交处理结果 → agent 验证 → 勾选已处理」闭环，`action=submit/verify/complete/reopen` |
 | `compass_asin_history` | 本地 ASIN 跨快照历史 |
 | `compass_keyword_metrics` | 本地关键词搜索量/CPC 历史 |
 | `compass_data_route` | 按字段 × 新鲜度 × 阶段 × 预算生成补数计划 |
@@ -82,6 +82,8 @@ Agent 会先调用 `compass_tools`，按需动态激活相关工具。
 不想用 TUI 也可以用浏览器：在 pi 会话里输入 `/compass-web`，会打印本机访问地址（默认 `http://127.0.0.1:4780`，浏览器打开即可）；`/compass-web 5000` 指定端口；`/compass-web stop` 关闭。会话结束（含正常退出、`/reload` 等触发的会话重建）会自动兜底关闭。
 
 候选池页点开候选卡即进入**全屏单品决策页**：Amazon 搜索链接（≤3）与 Top5 竞品链接可直接点开实况核对，关键指标、五维分、利润测算、风险状态、Gate 规则与决策日志齐屏，move/decide 表单同页完成、成功后自动返回看板。
+
+待办页对闭环四类事项提供行内闭环：填处理说明与证据后**提交**、状态徽标显示进展、验证通过后**勾选已处理**、勾错了可**重开**；「已处理」筛选项里能回看每条的说明、证据、验证结论与三个动作的时间和操作者。**验证不在浏览器做**——Web 端没有 LLM 通道，提交后回 pi 会话让 agent 执行 `compass_todo action=verify`。
 
 也可以完全脱离 pi 独立启动：
 

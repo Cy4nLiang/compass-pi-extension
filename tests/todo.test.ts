@@ -2,10 +2,15 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { configureBudget, ensureDefaults, listWorkbenchTodos, recordMcpUsage } from "../service.ts";
 import { createEmptyStore } from "../store.ts";
-import { deriveTodos, type DeriveTodosInput, type TodoBudgetPool } from "../todo.ts";
-import type { Candidate, CandidateStage, CompassStore, MetricMap } from "../types.ts";
+import { deriveTodos, divergenceWatermarks, type DeriveTodosInput, type TodoBudgetPool } from "../todo.ts";
+import type { Candidate, CandidateStage, CompassStore, MetricMap, ResolvableTodoKind, TodoResolution } from "../types.ts";
 
 const NOW = "2026-08-26T00:00:00.000Z";
+
+// 深研四项硬指标齐备的指标表
+const DEEP_METRICS: MetricMap = Object.fromEntries(
+	["main_cpc", "gross_margin", "cpc_ratio", "waist_rating_median"].map((name) => [name, { value: 1, source: "t", capturedAt: NOW, confidence: 0.8 }]),
+);
 
 function baseStore(): CompassStore {
 	return createEmptyStore("2026-08-01T00:00:00.000Z");
@@ -27,6 +32,44 @@ function addSnapshot(store: CompassStore, id: string, marketId: string, captured
 
 function derive(store: CompassStore, overrides: Partial<DeriveTodosInput> = {}) {
 	return deriveTodos({ store, budgets: [], retroDue: [], deepResearchMetrics: [], divergentMarkets: [], now: NOW, ...overrides });
+}
+
+function addResolution(store: CompassStore, todoId: string, kind: ResolvableTodoKind, overrides: Partial<TodoResolution> = {}): TodoResolution {
+	const existing = store.todoResolutions ?? [];
+	const record: TodoResolution = {
+		id: `tdr_${existing.length + 1}`,
+		todoId,
+		kind,
+		titleSnapshot: "提交时的标题快照",
+		status: "submitted",
+		attempts: [{ submittedAt: "2026-08-20T00:00:00.000Z", submittedBy: "ops", note: "处理说明", evidence: [] }],
+		reopens: [],
+		createdAt: "2026-08-20T00:00:00.000Z",
+		updatedAt: "2026-08-20T00:00:00.000Z",
+		...overrides,
+	};
+	store.todoResolutions = [...existing, record];
+	return record;
+}
+
+// 已勾选记录：末轮 pass + 勾选留痕 + 指定水位（与 assertStore 硬不变式一致）
+function resolvedFields(basis: TodoResolution["basis"], verdictReason = "材料齐备"): Partial<TodoResolution> {
+	return {
+		status: "resolved",
+		attempts: [{
+			submittedAt: "2026-08-20T00:00:00.000Z",
+			submittedBy: "ops",
+			note: "处理说明",
+			evidence: [],
+			verdict: "pass",
+			verdictReason,
+			verifiedAt: "2026-08-21T00:00:00.000Z",
+			verifiedBy: "compass-agent",
+		}],
+		resolvedAt: "2026-08-21T00:00:00.000Z",
+		resolvedBy: "compass-web",
+		basis,
+	};
 }
 
 test("empty store yields no todos", () => {
@@ -119,16 +162,10 @@ test("deep research candidates missing hard metrics surface as P3", () => {
 	const store = baseStore();
 	addMarket(store, "m1", "alpha");
 	addCandidate(store, "c1", "m1", "deep_research");
-	let todos = derive(store, { deepResearchMetrics: [{ marketId: "m1", metrics: {} }] });
-	const item = todos.find((todo) => todo.kind === "deep_missing_data");
+	const item = derive(store, { deepResearchMetrics: [{ marketId: "m1", metrics: {} }] }).find((todo) => todo.kind === "deep_missing_data");
 	assert.ok(item);
 	assert.equal(item.priority, 3);
 	assert.match(item.reason, /主词CPC/);
-	const full: MetricMap = Object.fromEntries(
-		["main_cpc", "gross_margin", "cpc_ratio", "waist_rating_median"].map((name) => [name, { value: 1, source: "t", capturedAt: NOW, confidence: 0.8 }]),
-	);
-	todos = derive(store, { deepResearchMetrics: [{ marketId: "m1", metrics: full }] });
-	assert.equal(todos.filter((todo) => todo.kind === "deep_missing_data").length, 0);
 });
 
 test("risk checklist gaps surface for risk/decision stages only", () => {
@@ -335,4 +372,179 @@ test("free-text reasons are flattened to a single line before display surfaces",
 	addCandidate(store, "c1", "m1", "screen", { gateOutcome: "review", gateReason: "第一行\n\t第二行" });
 	const todo = derive(store).find((item) => item.kind === "gate_review");
 	assert.equal(todo?.reason, "第一行 第二行");
+	// 驳回理由来自人工输入，同样在收口处压平
+	addResolution(store, "todo_metric_divergence_m1", "metric_divergence", {
+		status: "rejected",
+		attempts: [{
+			submittedAt: "2026-08-20T00:00:00.000Z", submittedBy: "ops", note: "说明", evidence: [],
+			verdict: "reject", verdictReason: "缺口径结论\n请补充来源", verifiedAt: "2026-08-21T00:00:00.000Z", verifiedBy: "compass-agent",
+		}],
+	});
+	const divergence = derive(store, { divergentMarkets: [{ marketId: "m1", metrics: ["cr3"] }] }).find((item) => item.kind === "metric_divergence");
+	assert.equal(divergence?.resolution?.verdictReason, "缺口径结论 请补充来源");
+});
+
+test("closable kinds carry resolvable and synthesize the record state onto active todos", () => {
+	const store = baseStore();
+	addMarket(store, "m1", "alpha");
+	addCandidate(store, "c1", "m1", "screen", { gateOutcome: "review", gateReason: "复核" });
+	const divergentMarkets = [{ marketId: "m1", metrics: ["cr3"] }];
+	const divergence = () => derive(store, { divergentMarkets }).find((todo) => todo.kind === "metric_divergence");
+
+	// 非闭环六类：不带处理状态，也不提供闭环入口
+	const gate = derive(store).find((todo) => todo.kind === "gate_review");
+	assert.equal(gate?.resolvable, false);
+	assert.equal(gate?.resolution, undefined);
+
+	// 未处理：闭环但尚无记录
+	assert.equal(divergence()?.resolvable, true);
+	assert.equal(divergence()?.resolution, undefined);
+
+	// 待验证
+	const record = addResolution(store, "todo_metric_divergence_m1", "metric_divergence");
+	assert.equal(divergence()?.resolution?.status, "submitted");
+	assert.equal(divergence()?.resolution?.attemptCount, 1);
+	assert.equal(divergence()?.resolution?.updatedAt, "2026-08-20T00:00:00.000Z");
+	assert.equal(divergence()?.resolution?.verdict, undefined);
+
+	// 已驳回：附末轮结论与理由，可重新提交
+	record.status = "rejected";
+	record.attempts = [{ ...record.attempts[0], verdict: "reject", verdictReason: "未说明以哪个来源为准", verifiedAt: "2026-08-21T00:00:00.000Z", verifiedBy: "compass-agent" }];
+	assert.equal(divergence()?.resolution?.status, "rejected");
+	assert.equal(divergence()?.resolution?.verdict, "reject");
+	assert.equal(divergence()?.resolution?.verdictReason, "未说明以哪个来源为准");
+
+	// 验证通过待勾选：仍在活跃清单
+	record.status = "verified";
+	record.attempts = [{ ...record.attempts[0], verdict: "pass", verdictReason: "口径与理由明确" }];
+	assert.equal(divergence()?.resolution?.status, "verified");
+	assert.equal(divergence()?.resolution?.verdict, "pass");
+
+	// 已重开待重新提交：轮次历史保留
+	record.status = "reopened";
+	record.reopens = [{ reopenedAt: "2026-08-22T00:00:00.000Z", reopenedBy: "ops", reason: "勾错了" }];
+	record.attempts = [record.attempts[0], { submittedAt: "2026-08-22T00:00:00.000Z", submittedBy: "ops", note: "第二轮", evidence: [] }];
+	assert.equal(divergence()?.resolution?.status, "reopened");
+	assert.equal(divergence()?.resolution?.attemptCount, 2);
+	assert.equal(divergence()?.resolution?.lapsed, undefined);
+});
+
+test("budget resolutions stay suppressed inside the same month and resurface as lapsed next month", () => {
+	const store = baseStore();
+	const budgets: TodoBudgetPool[] = [
+		{ source: "keepa", state: "warning", spentCny: 350, monthlyLimitCny: 400, callCount: 0 },
+		{ source: "sorftime", state: "fused", spentCny: 0, monthlyLimitCny: 0, callCount: 5, monthlyCallLimit: 5 },
+	];
+	addResolution(store, "todo_budget_warning_keepa", "budget_warning", resolvedFields({ month: "2026-08" }));
+	addResolution(store, "todo_budget_fused_sorftime", "budget_fused", resolvedFields({ month: "2026-07" }));
+	const todos = derive(store, { budgets });
+	assert.equal(todos.filter((todo) => todo.kind === "budget_warning").length, 0);
+	const fused = todos.find((todo) => todo.kind === "budget_fused");
+	assert.equal(fused?.resolution?.status, "resolved");
+	assert.equal(fused?.resolution?.lapsed, true);
+	assert.equal(fused?.resolution?.verdict, "pass");
+});
+
+test("divergence suppression tracks the compared-snapshot set, not just its newest timestamp", () => {
+	const store = baseStore();
+	addMarket(store, "m1", "alpha");
+	addCandidate(store, "c1", "m1", "screen");
+	addSnapshot(store, "sp1", "m1", "2026-08-20T00:00:00.000Z");
+	addSnapshot(store, "st1", "m1", "2026-08-18T00:00:00.000Z", {}, "sorftime");
+	// 水位口径与 metricDivergences 同源：各来源最新快照的指纹（Task 3 勾选时落同一个值）
+	const watermark = divergenceWatermarks(store).get("m1");
+	assert.equal(watermark, "sellersprite@2026-08-20T00:00:00.000Z|sorftime@2026-08-18T00:00:00.000Z");
+	addResolution(store, "todo_metric_divergence_m1", "metric_divergence", resolvedFields({ snapshotWatermark: watermark }));
+	const divergentMarkets = [{ marketId: "m1", metrics: ["cr3"] }];
+	const divergences = () => derive(store, { divergentMarkets }).filter((todo) => todo.kind === "metric_divergence");
+	// 等值边界：参与比较的快照集合未变，仍抑制
+	assert.equal(divergences().length, 0);
+	// 同来源同 capturedAt 重复导出：metricDivergences 仍取先入库那条，参与比较的值不变 → 仍抑制
+	addSnapshot(store, "st1_dup", "m1", "2026-08-18T00:00:00.000Z", {}, "sorftime");
+	assert.equal(divergences().length, 0);
+	// 回填补录：capturedAt 早于全市场最新，但替换了 sorftime 参与比较的快照，偏差事实已被改写 → 必须浮出
+	addSnapshot(store, "st2", "m1", "2026-08-19T00:00:00.000Z", {}, "sorftime");
+	assert.equal(divergences()[0]?.resolution?.lapsed, true, "回填补录改写偏差事实后不得继续抑制（漏提醒防线）");
+	// 新来源加入比较组同样使水位失效
+	const refreshed = divergenceWatermarks(store).get("m1");
+	store.todoResolutions = [];
+	addResolution(store, "todo_metric_divergence_m1", "metric_divergence", resolvedFields({ snapshotWatermark: refreshed }));
+	assert.equal(divergences().length, 0);
+	addSnapshot(store, "kp1", "m1", "2026-08-17T00:00:00.000Z", {}, "keepa");
+	assert.equal(divergences()[0]?.resolution?.lapsed, true);
+});
+
+test("deep research todos switch copy when hard metrics are complete but unconfirmed", () => {
+	const store = baseStore();
+	addMarket(store, "m1", "alpha");
+	addCandidate(store, "c1", "m1", "deep_research");
+	const missing = derive(store, { deepResearchMetrics: [{ marketId: "m1", metrics: {} }] }).find((todo) => todo.kind === "deep_missing_data");
+	assert.equal(missing?.title, "深研缺硬指标");
+	assert.match(missing?.suggestedAction ?? "", /compass_data_route/);
+	// 指标齐备不再自动消失：转「待人工确认」并指向提交入口
+	const complete = derive(store, { deepResearchMetrics: [{ marketId: "m1", metrics: DEEP_METRICS }] }).find((todo) => todo.kind === "deep_missing_data");
+	assert.equal(complete?.title, "深研数据待人工确认");
+	assert.equal(complete?.priority, 3);
+	assert.match(complete?.reason ?? "", /四项硬指标齐备/);
+	assert.match(complete?.suggestedAction ?? "", /compass_todo action=submit/);
+	assert.equal(complete?.resolvable, true);
+});
+
+test("deep resolutions suppress inside one stage cycle and resurface on metric rollback or re-entry", () => {
+	const store = baseStore();
+	addMarket(store, "m1", "alpha");
+	const candidate = addCandidate(store, "c1", "m1", "deep_research");
+	store.decisionLog.push({ id: "d1", candidateId: "c1", marketId: "m1", type: "stage_move", conclusion: "screen → deep_research", reason: "r", actor: "t", createdAt: "2026-08-10T00:00:00.000Z" });
+	addResolution(store, "todo_deep_missing_data_c1", "deep_missing_data", resolvedFields({ stageEnteredAt: "2026-08-10T00:00:00.000Z" }));
+	const complete = { deepResearchMetrics: [{ marketId: "m1", metrics: DEEP_METRICS }] };
+	const deepTodos = (overrides = complete) => derive(store, overrides).filter((todo) => todo.kind === "deep_missing_data");
+	// 同周期 + 指标仍齐备 → 抑制
+	assert.equal(deepTodos().length, 0);
+	// 例行 CSV 导入刷新 candidate.updatedAt 不得造成假失效
+	candidate.updatedAt = "2026-08-24T00:00:00.000Z";
+	assert.equal(deepTodos().length, 0);
+	// 指标回退缺失 → 浮出并回到缺指标文案
+	const rolledBack = deepTodos({ deepResearchMetrics: [{ marketId: "m1", metrics: {} }] })[0];
+	assert.equal(rolledBack?.title, "深研缺硬指标");
+	assert.equal(rolledBack?.resolution?.lapsed, true);
+	// 移出后重新进入深研 = 新周期 → 记录失效
+	store.decisionLog.push({ id: "d2", candidateId: "c1", marketId: "m1", type: "stage_move", conclusion: "risk → deep_research", reason: "r", actor: "t", createdAt: "2026-08-25T00:00:00.000Z" });
+	const reentered = deepTodos()[0];
+	assert.equal(reentered?.title, "深研数据待人工确认");
+	assert.equal(reentered?.resolution?.lapsed, true);
+});
+
+test("deep stage anchor falls back to candidate.createdAt when no stage_move trail exists", () => {
+	const store = baseStore();
+	addMarket(store, "m1", "alpha");
+	const candidate = addCandidate(store, "c1", "m1", "deep_research");
+	addResolution(store, "todo_deep_missing_data_c1", "deep_missing_data", resolvedFields({ stageEnteredAt: candidate.createdAt }));
+	const complete = { deepResearchMetrics: [{ marketId: "m1", metrics: DEEP_METRICS }] };
+	assert.equal(derive(store, complete).filter((todo) => todo.kind === "deep_missing_data").length, 0);
+	candidate.updatedAt = "2026-08-25T00:00:00.000Z";
+	assert.equal(derive(store, complete).filter((todo) => todo.kind === "deep_missing_data").length, 0);
+});
+
+test("resolution records that cannot match an active todo are defensively ignored", () => {
+	const store = baseStore();
+	addMarket(store, "m1", "alpha");
+	addCandidate(store, "c1", "m1", "screen", { gateOutcome: "review", gateReason: "复核" });
+	const divergentMarkets = [{ marketId: "m1", metrics: ["cr3"] }];
+	// 空集合
+	store.todoResolutions = [];
+	assert.equal(derive(store, { divergentMarkets }).filter((todo) => todo.kind === "metric_divergence").length, 1);
+	// 悬空 todoId（待办已自然消失）+ 非闭环 kind 记录 + todoId 命中但 kind 不符
+	addResolution(store, "todo_metric_divergence_已消失的市场", "metric_divergence", resolvedFields({ snapshotWatermark: "2026-08-20T00:00:00.000Z" }));
+	addResolution(store, "todo_gate_review_c1", "gate_review" as unknown as ResolvableTodoKind, resolvedFields({ month: "2026-08" }));
+	addResolution(store, "todo_metric_divergence_m1", "budget_warning", resolvedFields({ month: "2026-08" }));
+	const todos = derive(store, { divergentMarkets });
+	const divergence = todos.find((todo) => todo.kind === "metric_divergence");
+	assert.ok(divergence, "kind 不匹配的记录不得抑制待办");
+	assert.equal(divergence.resolution, undefined);
+	const gate = todos.find((todo) => todo.kind === "gate_review");
+	assert.equal(gate?.resolvable, false);
+	assert.equal(gate?.resolution, undefined);
+	// 集合缺失（旧 store 尚未迁移）同样不影响派生
+	delete store.todoResolutions;
+	assert.equal(derive(store, { divergentMarkets }).filter((todo) => todo.kind === "metric_divergence").length, 1);
 });

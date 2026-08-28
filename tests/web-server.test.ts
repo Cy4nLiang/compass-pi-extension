@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { parseMarketCsv } from "../csv.ts";
-import { ensureDefaults, importMarketAndScreen } from "../service.ts";
+import { ensureDefaults, importMarketAndScreen, verifyTodoResolution } from "../service.ts";
 import { CompassRepository } from "../store.ts";
 import { startCompassWebServer, type CompassWebServer } from "../web/server.ts";
 
@@ -575,6 +575,120 @@ test("read endpoints never touch lazily loaded snapshot detail files", async () 
 			assert.equal((await getJson(`${server.url}${path}`)).status, 200);
 		}
 		assert.equal(hits, 0, "读端点不应触发快照明细的磁盘加载");
+	} finally {
+		await teardown(root, server);
+	}
+});
+
+// 预算 80% 告警是闭环四类里唯一没有代码硬门槛的 kind：端点测试用它，避免依赖深研指标与利润测算
+async function seedBudgetWarning(root: string): Promise<string> {
+	const month = new Date().toISOString().slice(0, 7);
+	await new CompassRepository(root).update((store) => {
+		ensureDefaults(store, "test");
+		store.costEvents.push({ id: "ce_todo_web", source: "keepa", amountCny: 350, createdAt: `${month}-01T00:00:00.000Z`, actor: "ops" });
+	});
+	return "todo_budget_warning_keepa";
+}
+
+function activeTodoIds(payload: Envelope): string[] {
+	const groups = payload.data.groups as Array<{ todos: Array<{ id: string }> }>;
+	return groups.flatMap((group) => group.todos).map((todo) => todo.id);
+}
+
+test("todo resolution endpoints walk submit → complete → reopen with compass-web attribution", async () => {
+	const { root, server } = await setupProject({ seed: true });
+	try {
+		const todoId = await seedBudgetWarning(root);
+		const initial = (await getJson(`${server.url}/api/todos`)).body;
+		assert.ok(activeTodoIds(initial).includes(todoId), "预算告警待办应在活跃清单");
+
+		// 说明为空 / 证据形状非法：400 且不落盘
+		const before = await new CompassRepository(root).load();
+		const blank = await post(`${server.url}/api/todos/submit`, { todoId, note: "   " });
+		assert.equal(blank.status, 400);
+		assert.match(blank.body.error ?? "", /处理说明/);
+		const badEvidence = await post(`${server.url}/api/todos/submit`, { todoId, note: "已核对用量", evidence: "https://example.com/x" });
+		assert.equal(badEvidence.status, 400);
+		assert.match(badEvidence.body.error ?? "", /证据/);
+		const afterRejects = await new CompassRepository(root).load();
+		assert.deepEqual(afterRejects.todoResolutions, before.todoResolutions ?? [], "被拒的提交不得留下记录");
+
+		const submitted = await post(`${server.url}/api/todos/submit`, {
+			todoId,
+			note: "核对当月用量后决定收紧补数，不提额",
+			evidence: [{ ref: "compass-imports/usage.md", note: "用量明细" }],
+		});
+		assert.equal(submitted.status, 200);
+		assert.equal(submitted.body.data.status, "submitted");
+		const stored = await new CompassRepository(root).load();
+		const record = stored.todoResolutions?.[0];
+		assert.equal(record?.todoId, todoId);
+		assert.equal(record?.attempts[0].submittedBy, "compass-web", "Web 写操作必须署名 compass-web");
+		assert.equal(record?.attempts[0].evidence[0].ref, "compass-imports/usage.md");
+
+		// 未经验证直接勾选：400，且 store 完全没被写过
+		const beforeComplete = await new CompassRepository(root).load();
+		const early = await post(`${server.url}/api/todos/complete`, { todoId });
+		assert.equal(early.status, 400);
+		assert.match(early.body.error ?? "", /验证通过/);
+		const afterEarly = await new CompassRepository(root).load();
+		assert.equal(afterEarly.updatedAt, beforeComplete.updatedAt, "被拒的勾选不得触发写盘");
+		assert.equal(afterEarly.todoResolutions?.[0].status, "submitted");
+
+		// Web 侧没有 verify 端点：验证只在 pi 会话由 agent 执行
+		assert.equal((await post(`${server.url}/api/todos/verify`, { todoId, verdict: "pass", reason: "x" })).status, 404);
+		await new CompassRepository(root).update((store) => {
+			verifyTodoResolution(store, { todoRef: todoId, verdict: "pass", reason: "已给出用量结论与后续动作" }, "compass-agent");
+		});
+
+		const completed = await post(`${server.url}/api/todos/complete`, { todoId });
+		assert.equal(completed.status, 200);
+		assert.equal(completed.body.data.status, "resolved");
+		const afterComplete = (await getJson(`${server.url}/api/todos`)).body;
+		assert.equal(activeTodoIds(afterComplete).includes(todoId), false, "勾选后应离开活跃清单");
+		const resolvedRow = afterComplete.data.resolved.find((row: { todoId: string }) => row.todoId === todoId);
+		assert.ok(resolvedRow, "勾选后应出现在已处理分区");
+		assert.equal(resolvedRow.resolvedBy, "compass-web");
+		assert.equal(resolvedRow.verdict, "pass");
+
+		// 重开：理由必填；带理由后回到活跃清单
+		assert.equal((await post(`${server.url}/api/todos/reopen`, { todoId })).status, 400);
+		const reopened = await post(`${server.url}/api/todos/reopen`, { todoId, reason: "勾错了，实际未处理" });
+		assert.equal(reopened.status, 200);
+		assert.equal(reopened.body.data.status, "reopened");
+		const afterReopen = (await getJson(`${server.url}/api/todos`)).body;
+		assert.ok(activeTodoIds(afterReopen).includes(todoId), "重开后应回到活跃清单");
+		// 已处理分区只认 status === "resolved"：重开后 resolvedAt 仍在，拿它判定会让条目同时出现在两处
+		assert.equal(afterReopen.data.resolved.some((row: { todoId: string }) => row.todoId === todoId), false, "重开后不得留在已处理分区");
+		const stillResolved = await new CompassRepository(root).load();
+		assert.equal(stillResolved.todoResolutions?.[0].reopens[0].reopenedBy, "compass-web");
+	} finally {
+		await teardown(root, server);
+	}
+});
+
+test("todo write endpoints refuse wrong methods and cross-site posts", async () => {
+	const { root, server } = await setupProject({ seed: true });
+	try {
+		const todoId = await seedBudgetWarning(root);
+		const payload = JSON.stringify({ todoId, note: "跨站写入", reason: "跨站写入" });
+		for (const path of ["/api/todos/submit", "/api/todos/complete", "/api/todos/reopen"]) {
+			assert.equal((await getJson(`${server.url}${path}`)).status, 405, `${path} 只允许 POST`);
+			const crossSite = await getJson(`${server.url}${path}`, {
+				method: "POST",
+				headers: { "content-type": "text/plain;charset=UTF-8", origin: "https://evil.example" },
+				body: payload,
+			});
+			assert.ok([403, 415].includes(crossSite.status), `${path} 跨站写入必须被拒绝，实际 ${crossSite.status}`);
+			const forgedType = await getJson(`${server.url}${path}`, {
+				method: "POST",
+				headers: { "content-type": "application/json", origin: "https://evil.example" },
+				body: payload,
+			});
+			assert.equal(forgedType.status, 403, `${path} 跨站 Origin 必须被拒绝`);
+		}
+		const store = await new CompassRepository(root).load();
+		assert.deepEqual(store.todoResolutions, [], "被拒绝的跨站请求不得落盘");
 	} finally {
 		await teardown(root, server);
 	}

@@ -14,6 +14,7 @@ import {
 	metricDivergences,
 	targetMonthlyUnits,
 } from "../service.ts";
+import { todoResolutionBadge } from "../todo.ts";
 import {
 	CANDIDATE_STAGES,
 	STAGE_LABELS,
@@ -298,8 +299,57 @@ export function overviewData(store: CompassStore, now = new Date().toISOString()
 
 export function todosData(store: CompassStore, now = new Date().toISOString()) {
 	now = resolveNow(now);
-	// WorkbenchTodo 本身就是派生只读 DTO（todo.ts），无懒加载字段，整体透传
-	const todos = listWorkbenchTodos(store, now);
+	// WorkbenchTodo 本身就是派生只读 DTO（todo.ts），无懒加载字段，整体透传；
+	// 闭环四类另附处理状态（可选字段一律 null 归一）与后端算好的徽标文案，
+	// 徽标由 todo.ts 统一出词，前端不再自己拼，保证 Web/TUI/工具面措辞一致（R5）
+	const todos = listWorkbenchTodos(store, now).map((todo) => ({
+		...todo,
+		resolvable: todo.resolvable === true,
+		statusBadge: todoResolutionBadge(todo) ?? null,
+		resolution: todo.resolution
+			? {
+				status: todo.resolution.status,
+				verdict: todo.resolution.verdict ?? null,
+				verdictReason: todo.resolution.verdictReason ?? null,
+				attemptCount: todo.resolution.attemptCount,
+				updatedAt: todo.resolution.updatedAt,
+				lapsed: todo.resolution.lapsed === true,
+			}
+			: null,
+	}));
+	// 失效浮出的记录同时出现在活跃清单与已处理分区：分区里标注出来，避免运营以为重复
+	const lapsedTodoIds = new Set(todos.filter((todo) => todo.resolution?.lapsed).map((todo) => todo.id));
+	const marketName = (marketId: string | undefined): string | null =>
+		(marketId ? store.markets.find((market) => market.id === marketId)?.name : undefined) ?? null;
+	// 已处理分区：只认 status === "resolved"（重开后 resolvedAt 仍保留为历史事实，不能拿它判定）
+	const resolved = (store.todoResolutions ?? [])
+		.filter((record) => record.status === "resolved")
+		.sort((a, b) => (b.resolvedAt ?? b.updatedAt).localeCompare(a.resolvedAt ?? a.updatedAt))
+		.map((record) => {
+			const attempt = record.attempts[record.attempts.length - 1];
+			return {
+				todoId: record.todoId,
+				kind: record.kind,
+				titleSnapshot: record.titleSnapshot,
+				marketId: record.marketId ?? null,
+				marketName: marketName(record.marketId),
+				candidateId: record.candidateId ?? null,
+				source: record.source ?? null,
+				note: attempt?.note ?? null,
+				evidence: attempt?.evidence.map((item) => ({ ref: item.ref, note: item.note ?? null })) ?? [],
+				verdict: attempt?.verdict ?? null,
+				verdictReason: attempt?.verdictReason ?? null,
+				submittedAt: attempt?.submittedAt ?? null,
+				submittedBy: attempt?.submittedBy ?? null,
+				verifiedAt: attempt?.verifiedAt ?? null,
+				verifiedBy: attempt?.verifiedBy ?? null,
+				resolvedAt: record.resolvedAt ?? null,
+				resolvedBy: record.resolvedBy ?? null,
+				attemptCount: record.attempts.length,
+				reopenCount: record.reopens.length,
+				lapsed: lapsedTodoIds.has(record.todoId),
+			};
+		});
 	return {
 		total: todos.length,
 		groups: TODO_PRIORITIES.map((priority) => ({
@@ -307,6 +357,7 @@ export function todosData(store: CompassStore, now = new Date().toISOString()) {
 			label: TODO_GROUP_LABELS[priority],
 			todos: todos.filter((todo) => todo.priority === priority),
 		})),
+		resolved,
 	};
 }
 

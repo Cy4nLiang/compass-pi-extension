@@ -1,6 +1,7 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { budgetStatus, gateDefaultsLine, listRetroDue, listWorkbenchTodos } from "./service.ts";
+import { todoResolutionBadge } from "./todo.ts";
 import { CANDIDATE_STAGES, STAGE_LABELS, TODO_GROUP_LABELS, TODO_PRIORITIES, type CompassStore, type TodoPriority, type WorkbenchTodo } from "./types.ts";
 
 const TAB_NAMES = ["总览", "待办", "市场", "候选池", "预算", "复盘"] as const;
@@ -26,7 +27,9 @@ export function compactDashboardSummary(store: CompassStore): string {
 	const urgent = todos.filter((todo) => todo.priority === 1).length;
 	const conclusive = store.outcomeChecks.filter((check) => check.verdict !== "inconclusive");
 	const validationRate = conclusive.length ? `${(conclusive.filter((check) => check.verdict === "validated").length / conclusive.length * 100).toFixed(0)}%` : "—";
-	return `${store.markets.length} 市场 · ${active} 活跃候选 · ${review} 待复核 · ${rejected} 否决 · ${due} 待复盘 · ${todos.length} 待办${urgent ? `（P1 ${urgent}）` : ""} · 验证率 ${validationRate} · 本月 ¥${spent.toFixed(0)}`;
+	// 已提交待 agent 验证的条目：运营看得见「球在会话侧」，避免提交后无声等待
+	const pendingVerify = todos.filter((todo) => todo.resolution?.status === "submitted").length;
+	return `${store.markets.length} 市场 · ${active} 活跃候选 · ${review} 待复核 · ${rejected} 否决 · ${due} 待复盘 · ${todos.length} 待办${urgent ? `（P1 ${urgent}）` : ""}${pendingVerify ? ` · 待验证 ${pendingVerify}` : ""} · 验证率 ${validationRate} · 本月 ¥${spent.toFixed(0)}`;
 }
 
 export class CompassDashboard {
@@ -140,10 +143,34 @@ export class CompassDashboard {
 		add(` ${th.fg("muted", gateDefaultsLine(this.store))}`);
 	}
 
+	// 处理状态徽标（只读）：颜色按「谁的球」分——待办方 warning、被驳回 error、可勾选 success、未处理 dim
+	private todoBadge(todo: WorkbenchTodo): string {
+		const badge = todoResolutionBadge(todo);
+		if (!badge) return "";
+		const status = todo.resolution?.lapsed ? "lapsed" : todo.resolution?.status;
+		const color = status === undefined ? "dim" : status === "rejected" ? "error" : status === "verified" ? "success" : "warning";
+		return ` ${this.theme.fg(color, `[${badge}]`)}`;
+	}
+
+	// 行内第二行：闭环类按处理状态给出下一步（驳回理由须在 TUI 可见 —— spec §3.1 R2），
+	// 其余保持派生的 suggestedAction；每条仍占 2 行，分组布局不变
+	private todoNextStep(todo: WorkbenchTodo): string {
+		const resolution = todo.resolution;
+		if (!resolution) return todo.suggestedAction;
+		if (resolution.lapsed) return `已处理后出现新事实并重新浮出：compass_todo action=reopen todo_id=${todo.id} 后重新提交`;
+		// 理由在前、重提路径在后：窄终端只会截掉行尾的命令，驳回理由不会被吃掉
+		if (resolution.status === "rejected") return `驳回：${resolution.verdictReason ?? "未留理由"} · 改好后重新提交：compass_todo action=submit todo_id=${todo.id}`;
+		if (resolution.status === "submitted") return `待 agent 验证：在 pi 会话执行 compass_todo action=verify todo_id=${todo.id}`;
+		if (resolution.status === "verified") return `验证通过：在 Web 待办页勾选「已处理」，或 compass_todo action=complete todo_id=${todo.id}`;
+		if (resolution.status === "reopened") return "已重开：请重新提交处理结果（compass_todo action=submit）";
+		return todo.suggestedAction;
+	}
+
 	private renderTodos(add: (line?: string) => void): void {
 		const th = this.theme;
+		const pendingVerify = this.todos.filter((todo) => todo.resolution?.status === "submitted").length;
 		add("");
-		add(` ${th.fg("accent", th.bold(`待办清单 · ${this.todos.length}`))}  ${th.fg("muted", "自动推导，事项解决后自动消失；逾期超 30 天升 1 级")}`);
+		add(` ${th.fg("accent", th.bold(`待办清单 · ${this.todos.length}`))}${pendingVerify ? `  ${th.fg("warning", `待验证 ${pendingVerify}`)}` : ""}  ${th.fg("muted", "多数事项解决即消失；闭环四类需提交→验证→勾选")}`);
 		if (!this.todos.length) {
 			add(` ${th.fg("success", "当前没有需要人工处理的事项")}`);
 			return;
@@ -157,8 +184,8 @@ export class CompassDashboard {
 			// spec §4.3：每组最多 6 物理行 = 3 条 × 每条 2 行（主行 + 建议动作行）
 			for (const todo of group.slice(0, 3)) {
 				const name = todo.marketName ?? todo.source ?? "—";
-				add(`   ${th.fg(color, "●")} ${name} · ${todo.title} · ${th.fg("muted", todo.reason)}${todo.overdueDays ? th.fg("dim", ` · 逾期${todo.overdueDays}天`) : ""}`);
-				add(`     ${th.fg("dim", `→ ${todo.suggestedAction}`)}`);
+				add(`   ${th.fg(color, "●")} ${name} · ${todo.title}${this.todoBadge(todo)} · ${th.fg("muted", todo.reason)}${todo.overdueDays ? th.fg("dim", ` · 逾期${todo.overdueDays}天`) : ""}`);
+				add(`     ${th.fg("dim", `→ ${this.todoNextStep(todo)}`)}`);
 			}
 			if (group.length > 3) add(`   ${th.fg("dim", `… +${group.length - 3}；compass_todo priority=${priority} 查看全部`)}`);
 		}

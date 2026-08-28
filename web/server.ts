@@ -3,9 +3,17 @@ import { readdir, readFile, realpath, stat } from "node:fs/promises";
 import { dirname, extname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { performCsvImport } from "../importer.ts";
-import { decideCandidate, ensureDefaults, generateMarketReport, moveCandidate } from "../service.ts";
+import {
+	completeTodoResolution,
+	decideCandidate,
+	ensureDefaults,
+	generateMarketReport,
+	moveCandidate,
+	reopenTodoResolution,
+	submitTodoResolution,
+} from "../service.ts";
 import { CompassRepository, StoreIoError } from "../store.ts";
-import { CANDIDATE_STAGES, DECISION_STATUSES, SNAPSHOT_SOURCES, type CandidateStage, type CompassStore, type DecisionStatus } from "../types.ts";
+import { CANDIDATE_STAGES, DECISION_STATUSES, SNAPSHOT_SOURCES, TODO_RESOLUTION_STATUS_LABELS, type CandidateStage, type CompassStore, type DecisionStatus, type TodoResolution } from "../types.ts";
 import {
 	budgetData,
 	marketDossierData,
@@ -27,6 +35,8 @@ const DEFAULT_HOST = "127.0.0.1";
 const WEB_ACTOR = "compass-web";
 const IMPORTS_DIR_NAME = "compass-imports";
 const MAX_BODY_BYTES = 1_000_000;
+// 证据条目上限：与 compass_todo 工具面的 maxItems 一致，防单次提交塞入超长列表
+const MAX_EVIDENCE_ITEMS = 20;
 // 关闭时排空写队列的上限：单个写最长等锁 10 秒，但 session_shutdown 不能被拖太久
 const CLOSE_DRAIN_MS = 3_000;
 
@@ -261,7 +271,7 @@ export async function startCompassWebServer(options: CompassWebServerOptions): P
 		{ match: (p) => /^\/api\/pool\/([^/]+)$/.exec(p)?.[1], label: "候选引用", build: (store, ref) => poolCandidateData(store, ref) },
 	];
 
-	const WRITE_PATHS = ["/api/pool/move", "/api/pool/decide", "/api/import", "/api/report"];
+	const WRITE_PATHS = ["/api/pool/move", "/api/pool/decide", "/api/import", "/api/report", "/api/todos/submit", "/api/todos/complete", "/api/todos/reopen"];
 
 	// 候选池写端点：阶段流转与终局决策都强制填写理由（服务端兜底，前端也拦一次）
 	async function handlePoolWrite(response: ServerResponse, pathname: string, body: Record<string, unknown>): Promise<void> {
@@ -278,6 +288,59 @@ export async function startCompassWebServer(options: CompassWebServerOptions): P
 		if (!(DECISION_STATUSES as readonly string[]).includes(status)) throw new HttpError(400, `未知决策状态：${status}`);
 		const { store, result } = await webMutate((data) => decideCandidate(data, { candidateRef, status: status as DecisionStatus, reason, actor: WEB_ACTOR }));
 		sendData(response, store, { candidate: { id: result.id, decisionStatus: result.decisionStatus, decisionReason: result.decisionReason, decisionAt: result.decisionAt } });
+	}
+
+	// 证据列表来自浏览器 JSON，形状不可信：service 层按类型契约消费，形状校验必须在这一层做完
+	function parseEvidence(value: unknown): Array<{ ref: string; note?: string }> | undefined {
+		if (value === undefined || value === null) return undefined;
+		if (!Array.isArray(value)) throw new HttpError(400, "证据列表必须是数组");
+		if (value.length > MAX_EVIDENCE_ITEMS) throw new HttpError(400, `证据最多 ${MAX_EVIDENCE_ITEMS} 条`);
+		return value.map((item, index) => {
+			if (!item || typeof item !== "object" || Array.isArray(item)) throw new HttpError(400, `第 ${index + 1} 条证据必须是对象`);
+			const entry = item as Record<string, unknown>;
+			const ref = requireString(entry, "ref", `第 ${index + 1} 条证据的链接或路径`);
+			// 证据备注会进永久审计记录：非字符串大声报错，不学 optionalString 静默丢弃
+			// （同 handleImport 对 capturedAt/runScreen 的处理）
+			if (entry.note !== undefined && typeof entry.note !== "string") throw new HttpError(400, `第 ${index + 1} 条证据的备注必须是字符串`);
+			const note = optionalString(entry, "note");
+			return note ? { ref, note } : { ref };
+		});
+	}
+
+	function todoResolutionPayload(record: TodoResolution) {
+		const attempt = record.attempts[record.attempts.length - 1];
+		return {
+			todoId: record.todoId,
+			status: record.status,
+			statusLabel: TODO_RESOLUTION_STATUS_LABELS[record.status],
+			attemptCount: record.attempts.length,
+			verdict: attempt?.verdict ?? null,
+			verdictReason: attempt?.verdictReason ?? null,
+			resolvedAt: record.resolvedAt ?? null,
+			updatedAt: record.updatedAt,
+		};
+	}
+
+	// 待办人工处理闭环：提交 / 勾选 / 重开。**没有 verify 端点**——浏览器端无 agent 通道，
+	// 验证只在 pi 会话经 compass_todo action=verify 执行（spec §4.2.2 决策①）
+	async function handleTodoWrite(response: ServerResponse, pathname: string, body: Record<string, unknown>): Promise<void> {
+		const todoRef = requireString(body, "todoId", "待办 id");
+		if (pathname.endsWith("/submit")) {
+			const note = requireString(body, "note", "处理说明");
+			const evidence = parseEvidence(body.evidence);
+			const { store, result } = await webMutate((data) => submitTodoResolution(data, { todoRef, note, evidence }, WEB_ACTOR));
+			sendData(response, store, todoResolutionPayload(result));
+			return;
+		}
+		if (pathname.endsWith("/complete")) {
+			// 服务端强制「必须已验证通过」：前端置灰只是辅助，绕过前端直连这里同样拦下
+			const { store, result } = await webMutate((data) => completeTodoResolution(data, { todoRef }, WEB_ACTOR));
+			sendData(response, store, todoResolutionPayload(result));
+			return;
+		}
+		const reason = requireString(body, "reason", "重开理由");
+		const { store, result } = await webMutate((data) => reopenTodoResolution(data, { todoRef, reason }, WEB_ACTOR));
+		sendData(response, store, todoResolutionPayload(result));
 	}
 
 	async function handleImport(response: ServerResponse, body: Record<string, unknown>): Promise<void> {
@@ -371,6 +434,7 @@ export async function startCompassWebServer(options: CompassWebServerOptions): P
 			try {
 				if (pathname === "/api/import") return await handleImport(response, body);
 				if (pathname === "/api/report") return await handleReport(response, body);
+				if (pathname.startsWith("/api/todos/")) return await handleTodoWrite(response, pathname, body);
 				return await handlePoolWrite(response, pathname, body);
 			} catch (error) {
 				asDomainError(error);

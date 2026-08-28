@@ -34,6 +34,13 @@
 	box-sizing: border-box;
 }
 
+/* hidden 属性只由 UA 样式表的 [hidden]{display:none} 实现，作者层任何 display 声明都会压过它
+   （.todo-group-panel / .todo-confirm / .btn 都写了 display）。没有这条兜底，所有靠 el.hidden
+   切换显隐的地方都只改属性不改画面——待办页的优先级筛选与「已处理」分区、勾选的二次确认都会失效 */
+[hidden] {
+	display: none !important;
+}
+
 html, body {
 	margin: 0;
 	padding: 0;
@@ -523,7 +530,7 @@ button {
 	gap: 8px;
 }
 
-.todo-item {
+.todo-closable {
 	border-left: 2px solid var(--c-border);
 	padding-left: 10px;
 }
@@ -1831,4 +1838,114 @@ a.chip {
 /* 操作面板用主色描边突出「这一屏的目的」 */
 .decide-actions {
 	border-color: var(--c-accent);
+}
+
+/* ── 待办闭环：链接区 + 操作区、状态徽标、行内表单、已处理分区 ────────────── */
+
+/* 闭环行外壳：把「行」与「行内展开面板」包在一起，行本身仍复用 .todo-row 的排版 */
+.todo-closable {
+	border-bottom: 1px solid var(--c-divider);
+}
+
+.todo-row-list > .todo-closable:last-child,
+.todo-row-list > .todo-row:last-child {
+	border-bottom: none;
+}
+
+.todo-closable > .todo-row {
+	border-bottom: none;
+}
+
+/* 链接区：占满剩余宽度，保持原来整行点击的信息密度 */
+.todo-row-link {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	flex: 1 1 auto;
+	min-width: 0;
+	color: inherit;
+	text-decoration: none;
+}
+
+.todo-badge {
+	flex: 0 0 auto;
+	white-space: nowrap;
+}
+
+.todo-badge.tone-warning { border-color: var(--c-warning); color: var(--c-warning); }
+.todo-badge.tone-error { border-color: var(--c-error); color: var(--c-error); }
+.todo-badge.tone-success { border-color: var(--c-success); color: var(--c-success); }
+/* 「未处理」用 secondary 而非 muted：暗色下 muted 对面板底色仅 4.4:1，小字徽标读着吃力 */
+.todo-badge.tone-muted { border-color: var(--c-border); color: var(--c-text-secondary); }
+
+.todo-confirm {
+	display: inline-flex;
+	gap: 6px;
+	flex: 0 0 auto;
+}
+
+.todo-row-panel {
+	padding: 0 10px 8px 13px;
+}
+
+.todo-row-hint {
+	font-size: 12px;
+	color: var(--c-text-secondary);
+	padding: 2px 0 6px;
+	overflow-wrap: anywhere;
+}
+
+.todo-evidence-row {
+	margin-top: 8px;
+}
+
+.todo-evidence-note {
+	flex: 1 1 auto;
+	min-width: 0;
+}
+
+.todo-evidence-drop {
+	flex: 0 0 auto;
+	padding: 4px 10px;
+}
+
+/* 已处理分区 */
+.todo-done-head {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	padding: 8px 0 4px 10px;
+}
+
+.todo-done-body {
+	padding: 0 10px 10px 10px;
+	font-size: 12px;
+	color: var(--c-text-secondary);
+}
+
+.todo-done-note {
+	color: var(--c-text);
+	overflow-wrap: anywhere;
+}
+
+.todo-done-evidence {
+	margin: 6px 0;
+	padding-left: 18px;
+	overflow-wrap: anywhere;
+}
+
+.todo-done-verdict {
+	margin-top: 4px;
+	overflow-wrap: anywhere;
+}
+
+.todo-done-stamps {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 4px 14px;
+	margin-top: 6px;
+}
+
+.todo-done-stamp {
+	white-space: nowrap;
 }

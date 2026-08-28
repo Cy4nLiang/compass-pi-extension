@@ -478,6 +478,92 @@ async function refreshGlobalChrome(isCurrent) {
 
 // ── 待办页 ──────────────────────────────────────────────────────
 
+// 处理状态 → 徽标配色；徽标文案由后端 statusBadge 给出（与 TUI / compass_todo 同一口径）
+const TODO_RESOLUTION_TONES = {
+	submitted: "tone-warning",
+	rejected: "tone-error",
+	verified: "tone-success",
+	reopened: "tone-warning",
+	resolved: "tone-muted",
+};
+
+function todoBadgeTone(todo) {
+	if (!todo.resolution) return "tone-muted";
+	if (todo.resolution.lapsed) return "tone-warning";
+	return TODO_RESOLUTION_TONES[todo.resolution.status] || "tone-muted";
+}
+
+// 行内提示：谁该动、下一步做什么。验证只能在 pi 会话完成（浏览器端没有 agent）
+function todoResolutionHint(todo) {
+	const resolution = todo.resolution;
+	if (!resolution) return "在系统外处理完后，提交处理说明与证据；agent 验证通过后才能勾选已处理";
+	if (resolution.lapsed) return "勾选后出现了新事实（新快照 / 新预算月 / 深研重入），条目重新浮出：重开后重新提交";
+	if (resolution.status === "submitted") return `已提交，等待 pi 会话中的 agent 验证：compass_todo action=verify todo_id=${todo.id}`;
+	if (resolution.status === "rejected") return `验证驳回：${resolution.verdictReason || "未留理由"}；按理由补充材料后重新提交`;
+	if (resolution.status === "verified") return "agent 已验证通过，可勾选已处理";
+	if (resolution.status === "reopened") return "已重开，请重新提交处理结果";
+	return "";
+}
+
+function buildTodoEvidenceRowHtml() {
+	return `
+		<div class="drawer-form-row todo-evidence-row">
+			<input type="text" class="field-input" data-evidence-ref placeholder="URL 或项目内文件路径">
+			<input type="text" class="field-input todo-evidence-note" data-evidence-note placeholder="备注（可选）">
+			<button type="button" class="btn btn-outline todo-evidence-drop" data-todo-action="remove-evidence" title="删除该条证据">×</button>
+		</div>
+	`;
+}
+
+function buildTodoSubmitFormHtml() {
+	return `
+		<form class="drawer-form todo-form" data-todo-form="submit" hidden>
+			<div class="drawer-form-label">提交处理结果</div>
+			<textarea class="field-textarea" data-todo-note placeholder="必填：做了什么、结论是什么、关键数值"></textarea>
+			<div class="drawer-form-label" style="margin-top:10px;">证据（可选，0..n 条）</div>
+			<div data-evidence-list>${buildTodoEvidenceRowHtml()}</div>
+			<div class="drawer-form-row" style="margin-top:10px;">
+				<button type="button" class="btn btn-outline" data-todo-action="add-evidence">+ 再加一条证据</button>
+				<button type="submit" class="btn btn-accent-fill" style="flex:1 1 auto; justify-content:center;">提交，等待 agent 验证</button>
+			</div>
+			<div class="drawer-form-hint">证据填 URL 或项目内文件路径（服务端只做文本留痕，不读取内容）；提交后回 pi 会话让 agent 验证</div>
+			<div class="drawer-form-error" data-todo-error hidden></div>
+		</form>
+	`;
+}
+
+function buildTodoReopenFormHtml() {
+	return `
+		<form class="drawer-form todo-form" data-todo-form="reopen" hidden>
+			<div class="drawer-form-label">重开待办</div>
+			<input type="text" class="field-input" data-todo-reason placeholder="必填：为什么要拉回重新处理">
+			<div class="drawer-form-row" style="margin-top:10px;">
+				<button type="submit" class="btn btn-accent-fill" style="flex:1 1 auto; justify-content:center;">确认重开</button>
+			</div>
+			<div class="drawer-form-hint">重开后条目回到活跃清单，历史提交与验证记录全部保留</div>
+			<div class="drawer-form-error" data-todo-error hidden></div>
+		</form>
+	`;
+}
+
+function buildTodoActionsHtml(todo) {
+	const status = todo.resolution ? todo.resolution.status : null;
+	const lapsed = Boolean(todo.resolution && todo.resolution.lapsed);
+	if (lapsed) return `<button type="button" class="btn btn-outline todo-row-btn" data-todo-action="toggle-reopen">重开</button>`;
+	// 待验证：只给徽标，不给任何操作入口——球在 agent 那边
+	if (status === "submitted") return "";
+	if (status === "verified") {
+		return `
+			<button type="button" class="btn btn-outline todo-row-btn" data-todo-action="ask-complete">勾选已处理</button>
+			<span class="todo-confirm" data-todo-confirm hidden>
+				<button type="button" class="btn btn-accent-fill todo-row-btn" data-todo-action="complete">确认勾选</button>
+				<button type="button" class="btn btn-outline todo-row-btn" data-todo-action="cancel-complete">取消</button>
+			</span>
+		`;
+	}
+	return `<button type="button" class="btn btn-outline todo-row-btn" data-todo-action="toggle-submit">提交处理结果</button>`;
+}
+
 function renderTodoRow(todo) {
 	const kindLabel = TODO_KIND_LABELS[todo.kind] || todo.kind;
 	const buttonLabel = TODO_KIND_BUTTON_LABELS[todo.kind] || "查看详情";
@@ -485,14 +571,37 @@ function renderTodoRow(todo) {
 	const overdue = todo.overdueDays
 		? `<span class="mono todo-row-overdue ${todo.overdueDays > 30 ? "tone-error" : "tone-warning"}">逾期${todo.overdueDays}天</span>`
 		: "";
-	return `
-		<a class="todo-row p${todo.priority}" href="${todoKindRoute(todo)}">
+	const inner = `
 			<span class="tag-pill">${escapeHtml(kindLabel)}</span>
 			<span class="todo-row-subject">${escapeHtml(subject)}</span>
 			<span class="todo-row-reason">${escapeHtml(todo.title)} · ${escapeHtml(todo.reason)}</span>
-			${overdue}
+			${overdue}`;
+	// 非闭环六类：整行仍是一个跳转链接，行为与改造前完全一致
+	if (!todo.resolvable) {
+		return `
+		<a class="todo-row p${todo.priority}" href="${todoKindRoute(todo)}">${inner}
 			<span class="btn btn-outline todo-row-btn">${escapeHtml(buttonLabel)}</span>
 		</a>
+	`;
+	}
+	// 闭环四类：链接区 + 操作区分离（按钮不能嵌在 <a> 内），行下挂状态提示与行内表单
+	const status = todo.resolution ? todo.resolution.status : null;
+	const lapsed = Boolean(todo.resolution && todo.resolution.lapsed);
+	const canSubmit = !status || status === "rejected" || status === "reopened";
+	return `
+		<div class="todo-closable" data-todo-id="${escapeHtml(todo.id)}">
+			<div class="todo-row todo-row-closable p${todo.priority}">
+				<a class="todo-row-link" href="${todoKindRoute(todo)}">${inner}</a>
+				<span class="tag-pill todo-badge ${todoBadgeTone(todo)}">${escapeHtml(todo.statusBadge || "未处理")}</span>
+				${buildTodoActionsHtml(todo)}
+			</div>
+			<div class="todo-row-panel">
+				<div class="todo-row-hint ${status === "rejected" ? "tone-error" : ""}">${escapeHtml(todoResolutionHint(todo))}</div>
+				<div class="drawer-form-error" data-todo-row-error hidden></div>
+				${canSubmit && !lapsed ? buildTodoSubmitFormHtml() : ""}
+				${lapsed ? buildTodoReopenFormHtml() : ""}
+			</div>
+		</div>
 	`;
 }
 
@@ -508,14 +617,68 @@ function renderTodoGroupPanel(group) {
 	`;
 }
 
+function todoActorLine(label, at, actor) {
+	if (!at) return "";
+	// 复用既有 formatDateTime：记录里的时间戳是 UTC（service 的 nowIso），直接切片会让 UTC+8 少 8 小时
+	return `<span class="todo-done-stamp"><span class="cell-muted">${escapeHtml(label)}</span> <span class="mono">${escapeHtml(formatDateTime(at))}</span> · ${escapeHtml(actor || "—")}</span>`;
+}
+
+function renderResolvedRow(row) {
+	const evidence = row.evidence.length
+		? row.evidence.map((item) => `<li>${escapeHtml(item.ref)}${item.note ? ` <span class="cell-muted">（${escapeHtml(item.note)}）</span>` : ""}</li>`).join("")
+		: `<li class="cell-muted">无证据条目</li>`;
+	const verdict = row.verdict === "pass" ? "验证通过" : row.verdict === "reject" ? "验证驳回" : "无验证结论";
+	return `
+		<div class="todo-closable todo-done-item" data-todo-id="${escapeHtml(row.todoId)}">
+			<div class="todo-done-head">
+				<span class="tag-pill">${escapeHtml(TODO_KIND_LABELS[row.kind] || row.kind)}</span>
+				<span class="todo-row-subject">${escapeHtml(row.marketName || row.source || "—")}</span>
+				<span class="todo-row-reason">${escapeHtml(row.titleSnapshot)}</span>
+				${row.lapsed ? `<span class="tag-pill todo-badge tone-warning">已失效浮出</span>` : ""}
+				<button type="button" class="btn btn-outline todo-row-btn" data-todo-action="toggle-reopen">重开</button>
+			</div>
+			<div class="todo-done-body">
+				<div class="todo-done-note">${escapeHtml(row.note || "（无处理说明）")}</div>
+				<ul class="todo-done-evidence">${evidence}</ul>
+				<div class="todo-done-verdict ${row.verdict === "pass" ? "tone-success" : "tone-error"}">${escapeHtml(verdict)}${row.verdictReason ? `：${escapeHtml(row.verdictReason)}` : ""}</div>
+				<div class="todo-done-stamps">
+					${todoActorLine("提交", row.submittedAt, row.submittedBy)}
+					${todoActorLine("验证", row.verifiedAt, row.verifiedBy)}
+					${todoActorLine("勾选", row.resolvedAt, row.resolvedBy)}
+					${row.attemptCount > 1 ? `<span class="todo-done-stamp cell-muted">共 ${row.attemptCount} 轮提交</span>` : ""}
+					${row.reopenCount ? `<span class="todo-done-stamp cell-muted">曾重开 ${row.reopenCount} 次</span>` : ""}
+				</div>
+			</div>
+			<div class="todo-row-panel">${buildTodoReopenFormHtml()}</div>
+		</div>
+	`;
+}
+
+function buildResolvedPanelHtml(rows) {
+	const body = rows.length
+		? `<div class="todo-row-list">${rows.map(renderResolvedRow).join("")}</div>`
+		: `<div class="empty-state">${ICON_CHECK}还没有已处理的待办</div>`;
+	return `
+		<div class="panel todo-group-panel" data-priority="resolved" hidden>
+			<div class="todo-group-label">已处理 <span class="mono">(${rows.length})</span></div>
+			${body}
+		</div>
+	`;
+}
+
 function buildTodosHtml(data) {
-	const chips = [{ key: "all", label: "全部", count: data.total }, ...data.groups.map((g) => ({ key: String(g.priority), label: `P${g.priority}`, count: g.todos.length }))];
+	const chips = [
+		{ key: "all", label: "全部", count: data.total },
+		...data.groups.map((g) => ({ key: String(g.priority), label: `P${g.priority}`, count: g.todos.length })),
+		{ key: "resolved", label: "已处理", count: data.resolved.length },
+	];
 	const chipsHtml = chips.map((c) => `<button type="button" class="chip todo-filter-chip ${c.key === "all" ? "is-active" : ""}" data-priority="${c.key}">${escapeHtml(c.label)} <span class="mono">×${c.count}</span></button>`).join("");
+	const pendingVerify = data.groups.flatMap((g) => g.todos).filter((todo) => todo.resolution && todo.resolution.status === "submitted").length;
 	return `
 		<div class="filter-toolbar">
 			<div class="filter-toolbar-title">
-				<span style="font-size:14px; font-weight:600;">待办清单 <span class="mono tone-accent">${data.total}</span></span>
-				<span class="panel-hint">自动推导，事项解决后自动消失；逾期超 30 天升 1 级</span>
+				<span style="font-size:14px; font-weight:600;">待办清单 <span class="mono tone-accent">${data.total}</span>${pendingVerify ? ` <span class="mono tone-warning">待验证 ${pendingVerify}</span>` : ""}</span>
+				<span class="panel-hint">多数事项解决即消失；闭环四类需提交 → agent 验证 → 勾选已处理</span>
 			</div>
 			<div class="chip-row" id="todo-filter-chips">
 				${chipsHtml}
@@ -523,7 +686,7 @@ function buildTodosHtml(data) {
 				<div class="dropdown-placeholder" title="即将上线">市场：全部${ICON_CHEVRON_DOWN}</div>
 			</div>
 		</div>
-		<div class="todo-group-list" id="todo-group-list">${data.groups.map(renderTodoGroupPanel).join("")}</div>
+		<div class="todo-group-list" id="todo-group-list">${data.groups.map(renderTodoGroupPanel).join("")}${buildResolvedPanelHtml(data.resolved)}</div>
 	`;
 }
 
@@ -536,7 +699,105 @@ function bindTodoFilterChips(content) {
 		if (!chip) return;
 		for (const el of chipsEl.querySelectorAll(".todo-filter-chip")) el.classList.toggle("is-active", el === chip);
 		const priority = chip.dataset.priority;
-		for (const panel of listEl.querySelectorAll(".todo-group-panel")) panel.hidden = priority !== "all" && panel.dataset.priority !== priority;
+		for (const panel of listEl.querySelectorAll(".todo-group-panel")) {
+			// 「已处理」是独立分区：选它时只显示它，选其他时它始终隐藏
+			panel.hidden = panel.dataset.priority === "resolved" ? priority !== "resolved" : priority === "resolved" || (priority !== "all" && panel.dataset.priority !== priority);
+		}
+	});
+}
+
+// 写操作统一收口（同 submitPoolWrite 模式）：错误原样展示后端中文文案，成功交给调用方决定刷新
+async function submitTodoWrite(path, payload, errorEl, busyEl) {
+	errorEl.hidden = true;
+	busyEl.disabled = true;
+	try {
+		await fetchApi(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
+		return true;
+	} catch (error) {
+		errorEl.textContent = error.message;
+		errorEl.hidden = false;
+		return false;
+	} finally {
+		busyEl.disabled = false;
+	}
+}
+
+function bindTodoResolutionActions(content, refresh) {
+	const listEl = content.querySelector("#todo-group-list");
+	if (!listEl) return;
+	const formOf = (item, kind) => item.querySelector(`[data-todo-form="${kind}"]`);
+
+	listEl.addEventListener("click", async (event) => {
+		const trigger = event.target.closest("[data-todo-action]");
+		if (!trigger) return;
+		const item = trigger.closest(".todo-closable");
+		if (!item) return;
+		const action = trigger.dataset.todoAction;
+		const todoId = item.dataset.todoId;
+		if (action === "toggle-submit" || action === "toggle-reopen") {
+			const form = formOf(item, action === "toggle-submit" ? "submit" : "reopen");
+			if (form) form.hidden = !form.hidden;
+			return;
+		}
+		if (action === "add-evidence") {
+			const list = item.querySelector("[data-evidence-list]");
+			if (list) list.insertAdjacentHTML("beforeend", buildTodoEvidenceRowHtml());
+			return;
+		}
+		if (action === "remove-evidence") {
+			const row = trigger.closest(".todo-evidence-row");
+			const list = item.querySelector("[data-evidence-list]");
+			// 至少留一行空表单，避免删光后没有可填入口
+			if (row && list && list.querySelectorAll(".todo-evidence-row").length > 1) row.remove();
+			else if (row) for (const input of row.querySelectorAll("input")) input.value = "";
+			return;
+		}
+		if (action === "ask-complete" || action === "cancel-complete") {
+			const confirmEl = item.querySelector("[data-todo-confirm]");
+			const askBtn = item.querySelector('[data-todo-action="ask-complete"]');
+			if (confirmEl) confirmEl.hidden = action !== "ask-complete";
+			if (askBtn) askBtn.hidden = action === "ask-complete";
+			return;
+		}
+		if (action === "complete") {
+			// 后端中文错误落进行内 error 区（同表单惯例），不弹原生对话框
+			const ok = await submitTodoWrite("/api/todos/complete", { todoId }, item.querySelector("[data-todo-row-error]"), trigger);
+			if (ok) refresh();
+		}
+	});
+
+	listEl.addEventListener("submit", async (event) => {
+		const form = event.target.closest(".todo-form");
+		if (!form) return;
+		event.preventDefault();
+		const item = form.closest(".todo-closable");
+		const todoId = item.dataset.todoId;
+		const errorEl = form.querySelector("[data-todo-error]");
+		const submitBtn = form.querySelector('button[type="submit"]');
+		if (form.dataset.todoForm === "reopen") {
+			const reason = form.querySelector("[data-todo-reason]").value.trim();
+			if (!reason) {
+				errorEl.textContent = "必填：请填写重开理由";
+				errorEl.hidden = false;
+				return;
+			}
+			if (await submitTodoWrite("/api/todos/reopen", { todoId, reason }, errorEl, submitBtn)) refresh();
+			return;
+		}
+		const note = form.querySelector("[data-todo-note]").value.trim();
+		if (!note) {
+			errorEl.textContent = "必填：请填写处理说明（做了什么、结论、关键数值）";
+			errorEl.hidden = false;
+			return;
+		}
+		const evidence = [];
+		for (const row of form.querySelectorAll(".todo-evidence-row")) {
+			const ref = row.querySelector("[data-evidence-ref]").value.trim();
+			if (!ref) continue;
+			const note = row.querySelector("[data-evidence-note]").value.trim();
+			evidence.push(note ? { ref, note } : { ref });
+		}
+		if (await submitTodoWrite("/api/todos/submit", { todoId, note, evidence }, errorEl, submitBtn)) refresh();
 	});
 }
 
@@ -553,6 +814,7 @@ async function renderTodos(content, isCurrent) {
 	if (!isCurrent()) return;
 	content.innerHTML = buildTodosHtml(data);
 	bindTodoFilterChips(content);
+	bindTodoResolutionActions(content, () => renderTodos(content, isCurrent));
 }
 
 // ── 市场页 ──────────────────────────────────────────────────────

@@ -33,7 +33,7 @@ Web UI（`web/` 目录，TUI 之外的第二套前端，读同一个 store）：
 
 数据流：CSV 导入（`csv.ts`：UTF-8/16 解码、分隔符嗅探、中英文字段别名映射）→ 生成不可变市场快照并把原始文件归档到 `raw/` → `metrics.ts` 计算五维指标，每个数字都是 MetricEvidence（value + source + capturedAt + confidence）→ `strategy.ts` 执行 GSE（Gate → Score，veto 命中即整体否决）→ 候选卡按阶段流转并写 decisionLog → `report.ts` 输出五维 Markdown 报告。
 
-持久化（`store.ts` 的 CompassRepository）：单一 JSON store（schemaVersion 1，load 时 assertStore 校验）写入**宿主项目**（运行 pi 的 cwd）的 `.pi/compass/`，而不是扩展自身目录。写入走临时文件 + rename 原子替换，目录 0700、文件 0600。`resolveInputPath` / `resolveOutputPath` 把一切输入输出路径限制在宿主项目内——不要绕过它们直接拼路径。
+持久化（`store.ts` 的 CompassRepository）：单一 JSON store（schemaVersion 1，load 时 assertStore 校验）写入**宿主项目**（运行 pi 的 cwd）的 `.pi/compass/`，而不是扩展自身目录。新增顶层集合一律走「可选数组 + `ensureDefaults` 回填 + `load()` 迁移检测与回写」（`outcomeChecks` / `lessons` / `todoResolutions` 是先例），schemaVersion 保持 1，旧版扩展回滚后忽略新字段即可打开。写入走临时文件 + rename 原子替换，目录 0700、文件 0600。`resolveInputPath` / `resolveOutputPath` 把一切输入输出路径限制在宿主项目内——不要绕过它们直接拼路径。
 
 新增工具时：在 `index.ts` 同时更新 `DOMAIN_TOOLS` 与 `TOOL_CATALOG`（`compass_tools` 的动态激活检索依赖后者），并同步 README 工具表与 SKILL.md。
 
@@ -48,7 +48,12 @@ Web UI（`web/` 目录，TUI 之外的第二套前端，读同一个 store）：
 - 利润输入中大于 1 的百分比一律拒绝（`economics.ts`）。
 - Lesson 必须挂非空且可解析的 evidence；OutcomeCheck 缺少新快照或数字实绩时 verdict 只能是 `inconclusive`，不得伪装成 `validated`。
 - hook 只做本地只读计算、展示增强和上下文注入；不得在 hook 中开启 store 写事务。历史速览 ≤12 行，工具历史尾注 ≤8 行，压缩台账 ≤20 行。
-- MCP 调用计量遵守同一约束：tool_result hook 只做内存 pending 自增，落账仅在安全点事务内（mutateStore 顺带 / 查看面 flush / session_shutdown 尽力）；工作台待办为派生视图（`todo.ts`），不持久化、条件解决即消失。
+- MCP 调用计量遵守同一约束：tool_result hook 只做内存 pending 自增，落账仅在安全点事务内（mutateStore 顺带 / 查看面 flush / session_shutdown 尽力）。
+- 待办是**混合语义**：条目本体永远由 `todo.ts` 派生（唯一所有者，不实体化、不双真相源），但闭环四类（`metric_divergence` / `budget_warning` / `budget_fused` / `deep_missing_data`）另有持久化的处理记录 `store.todoResolutions`，派生层把记录合成到条目上（状态徽标 / 抑制 / 失效浮出）。其余六类仍是「条件解决即消失」。
+- 处理记录的状态机（提交 → 验证 → 勾选 → 重开）只能经 `service.ts` 的四个函数迁移；`assertStore` 硬校验「勾选必须存在验证通过的末轮 + 该类水位锚点」，杜绝未经验证的已处理——同 OutcomeCheck「无证据不得非 inconclusive」。
+- 处理动作**不写 decisionLog**：旧版 assertStore 对 `decisionLog.type` 是严格白名单，新增取值会让回滚后的 store 打不开。审计链由记录自身承载（每个动作含 actor / 时间 / 说明或理由），`history.ts` 在**读侧**合并成时间线事件。
+- 抑制必须带失效水位（预算=月份、偏差=参与比较的快照集合指纹、深研=本次进入 deep_research 的周期）：水位失效即重新浮出。派生层只读判定、绝不改写记录；错位的最坏情况必须是「多提醒一次」，绝不能是漏提醒。
+- 验证只在 pi 会话由 agent 执行（Web 端无 LLM 通道，故 Web 只有 submit/complete/reopen 三个写端点，没有 verify）。深研类的代码硬门槛（四指标齐备 + 该市场有利润测算）在 service 层前置，不满足时 `verdict=pass` 直接拒绝落库。
 
 ## 文档与数据卫生
 

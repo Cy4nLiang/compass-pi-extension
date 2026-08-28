@@ -147,6 +147,7 @@ test("serialized DTOs never leak lazy snapshot detail arrays", async () => {
 		JSON.stringify(marketDossierData(store, "fresh market", NOW)),
 		JSON.stringify(poolData(store, NOW)),
 		JSON.stringify(poolCandidateData(store, "fresh market")),
+		JSON.stringify(todosData(store, NOW)),
 	];
 	for (const payload of payloads) {
 		assert.ok(!payload.includes('"listings"'), "DTO 序列化结果不得包含快照明细 listings");
@@ -267,4 +268,88 @@ test("pool candidate detail normalizes optional listing fields to null at the DT
 	assert.ok("url" in first, "可选字段必须以 null 出现而非丢键（前端严格 !== null 判空惯例）");
 	assert.equal(first.url, null);
 	assert.equal(first.asin, "bad asin!!");
+});
+
+test("todos DTO carries resolution summaries, status badges, and the resolved partition", () => {
+	const store = createEmptyStore("2026-08-01T00:00:00.000Z");
+	ensureDefaults(store, "test");
+	store.markets.push({ id: "m1", name: "偏差市场", keywords: [], createdAt: "2026-08-01T00:00:00.000Z", updatedAt: "2026-08-01T00:00:00.000Z" });
+	store.candidates.push({ id: "c1", marketId: "m1", stage: "screen", tags: [], gateOutcome: "review", gateReason: "缺 cr3", createdAt: "2026-08-01T00:00:00.000Z", updatedAt: "2026-08-01T00:00:00.000Z" });
+	for (const [id, source, capturedAt, cr3] of [["s1", "sellersprite", "2026-08-20T00:00:00.000Z", 0.9], ["s2", "sorftime", "2026-08-19T00:00:00.000Z", 0.5]] as const) {
+		store.snapshots.push({ id, marketId: "m1", source, capturedAt, importedAt: capturedAt, rowCount: 0, listings: [], keywords: [], metrics: { cr3: { value: cr3, source, capturedAt, confidence: 0.8 } }, warnings: [] });
+	}
+	// 预算：一条当月已勾选（抑制）、一条上月水位失效（浮出）
+	store.costEvents.push({ id: "ce1", source: "keepa", amountCny: 350, createdAt: "2026-08-20T00:00:00.000Z", actor: "ops" });
+	store.budgetPools.push({ source: "web_demo", tier: "B", monthlyLimitCny: 100, enabled: true });
+	store.costEvents.push({ id: "ce2", source: "web_demo", amountCny: 90, createdAt: "2026-08-20T00:00:00.000Z", actor: "ops" });
+	const passed = {
+		submittedAt: "2026-08-21T00:00:00.000Z", submittedBy: "compass-web", note: "已核对用量并决定收紧补数",
+		evidence: [{ ref: "compass-imports/usage.md", note: "用量明细" }],
+		verdict: "pass" as const, verdictReason: "结论与后续动作明确", verifiedAt: "2026-08-22T00:00:00.000Z", verifiedBy: "compass-agent",
+	};
+	store.todoResolutions = [
+		{
+			id: "tdr_sub", todoId: "todo_metric_divergence_m1", kind: "metric_divergence", marketId: "m1",
+			titleSnapshot: "多源指标偏差 >30%", status: "rejected",
+			attempts: [{ ...passed, verdict: "reject", verdictReason: "未说明以哪个来源为准" }],
+			reopens: [], createdAt: "2026-08-21T00:00:00.000Z", updatedAt: "2026-08-22T00:00:00.000Z",
+		},
+		{
+			id: "tdr_done", todoId: "todo_budget_warning_keepa", kind: "budget_warning", source: "keepa",
+			titleSnapshot: "预算 80% 告警：keepa", status: "resolved", attempts: [passed], reopens: [],
+			resolvedAt: "2026-08-23T00:00:00.000Z", resolvedBy: "compass-web", basis: { month: "2026-08" },
+			createdAt: "2026-08-21T00:00:00.000Z", updatedAt: "2026-08-23T00:00:00.000Z",
+		},
+		{
+			id: "tdr_lapsed", todoId: "todo_budget_warning_web_demo", kind: "budget_warning", source: "web_demo",
+			titleSnapshot: "预算 80% 告警：web_demo", status: "resolved", attempts: [passed],
+			reopens: [{ reopenedAt: "2026-07-20T00:00:00.000Z", reopenedBy: "ops", reason: "上月曾拉回" }],
+			resolvedAt: "2026-07-23T00:00:00.000Z", resolvedBy: "compass-web", basis: { month: "2026-07" },
+			createdAt: "2026-07-21T00:00:00.000Z", updatedAt: "2026-07-23T00:00:00.000Z",
+		},
+	];
+
+	const data = todosData(store, NOW);
+	const active = data.groups.flatMap((group) => group.todos);
+	// 非闭环类：resolvable=false、无状态徽标（null 归一，不留 undefined）
+	const gate = active.find((todo) => todo.kind === "gate_review");
+	assert.equal(gate?.resolvable, false);
+	assert.equal(gate?.resolution, null);
+	assert.equal(gate?.statusBadge, null);
+	// 闭环类已驳回：徽标与驳回理由都进 DTO
+	const divergence = active.find((todo) => todo.id === "todo_metric_divergence_m1");
+	assert.equal(divergence?.resolvable, true);
+	assert.equal(divergence?.statusBadge, "已驳回");
+	assert.equal(divergence?.resolution?.verdict, "reject");
+	assert.equal(divergence?.resolution?.verdictReason, "未说明以哪个来源为准");
+	assert.equal(divergence?.resolution?.lapsed, false);
+	// 已勾选且水位有效：不在活跃清单
+	assert.equal(active.some((todo) => todo.id === "todo_budget_warning_keepa"), false);
+	// 水位失效：浮出并标注
+	const lapsed = active.find((todo) => todo.id === "todo_budget_warning_web_demo");
+	assert.equal(lapsed?.statusBadge, "已处理·失效浮出");
+	assert.equal(lapsed?.resolution?.lapsed, true);
+
+	// 已处理分区：两条 resolved 记录，含末轮说明、结论、三动作时间与 actor
+	assert.equal(data.resolved.length, 2);
+	const done = data.resolved.find((row) => row.todoId === "todo_budget_warning_keepa");
+	assert.equal(done?.titleSnapshot, "预算 80% 告警：keepa");
+	assert.equal(done?.note, "已核对用量并决定收紧补数");
+	assert.equal(done?.verdict, "pass");
+	assert.equal(done?.verdictReason, "结论与后续动作明确");
+	assert.equal(done?.submittedBy, "compass-web");
+	assert.equal(done?.verifiedBy, "compass-agent");
+	assert.equal(done?.resolvedBy, "compass-web");
+	assert.equal(done?.resolvedAt, "2026-08-23T00:00:00.000Z");
+	assert.equal(done?.lapsed, false);
+	assert.equal(done?.marketId, null, "预算类无市场归属，null 归一");
+	assert.equal(done?.evidence.length, 1);
+	assert.equal(done?.reopenCount, 0);
+	const lapsedRow = data.resolved.find((row) => row.todoId === "todo_budget_warning_web_demo");
+	assert.equal(lapsedRow?.lapsed, true, "失效浮出的记录在已处理分区应标注");
+	assert.equal(lapsedRow?.reopenCount, 1);
+	// 按勾选时间倒序
+	assert.deepEqual(data.resolved.map((row) => row.todoId), ["todo_budget_warning_keepa", "todo_budget_warning_web_demo"]);
+	// 懒加载红线：DTO 不得序列化快照明细
+	assert.ok(!JSON.stringify(data).includes('"listings"'));
 });

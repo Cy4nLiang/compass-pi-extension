@@ -319,6 +319,62 @@ test("legacy schemaVersion 1 stores gain retro collections and write them back l
 	}
 });
 
+test("legacy schemaVersion 1 stores gain todoResolutions and write them back lazily", async () => {
+	const root = await mkdtemp(join(tmpdir(), "compass-todo-resolution-migration-"));
+	try {
+		const repo = new CompassRepository(root);
+		const legacy = createEmptyStore() as unknown as Record<string, unknown>;
+		delete legacy.todoResolutions;
+		await mkdir(dirname(repo.storePath), { recursive: true });
+		await writeFile(repo.storePath, JSON.stringify(legacy), "utf8");
+		const loaded = await repo.load();
+		assert.deepEqual(loaded.todoResolutions, []);
+		await repo.update(() => false, { shouldSave: () => false });
+		const persisted = JSON.parse(await readFile(repo.storePath, "utf8")) as Record<string, unknown>;
+		assert.deepEqual(persisted.todoResolutions, []);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("todo resolutions survive a full save/load round-trip", async () => {
+	const root = await mkdtemp(join(tmpdir(), "compass-todo-resolution-roundtrip-"));
+	try {
+		const repo = new CompassRepository(root);
+		const store = createEmptyStore("2026-08-01T00:00:00.000Z");
+		ensureDefaults(store, "tester");
+		store.todoResolutions = [{
+			id: "tdr_roundtrip",
+			todoId: "todo_budget_fused_sorftime",
+			kind: "budget_fused",
+			source: "sorftime",
+			titleSnapshot: "预算熔断：sorftime",
+			status: "resolved",
+			attempts: [{
+				submittedAt: "2026-08-01T00:00:00.000Z",
+				submittedBy: "compass-web",
+				note: "本月接受停摆，不提额",
+				evidence: [{ ref: "compass-imports/budget-2026-08.md", note: "月度用量说明" }],
+				verdict: "pass",
+				verdictReason: "决定明确且给出理由",
+				verifiedAt: "2026-08-02T00:00:00.000Z",
+				verifiedBy: "compass-agent",
+			}],
+			reopens: [],
+			resolvedAt: "2026-08-02T01:00:00.000Z",
+			resolvedBy: "compass-web",
+			basis: { month: "2026-08" },
+			createdAt: "2026-08-01T00:00:00.000Z",
+			updatedAt: "2026-08-02T01:00:00.000Z",
+		}];
+		await repo.save(store);
+		const loaded = await repo.load();
+		assert.deepEqual(loaded.todoResolutions, store.todoResolutions);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
 test("corrupted store elements fail with a path-aware diagnostic", async () => {
 	const root = await mkdtemp(join(tmpdir(), "compass-corrupt-"));
 	try {

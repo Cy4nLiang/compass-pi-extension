@@ -100,7 +100,7 @@ const LOWER_IS_BETTER = new Set([
 
 export interface HistoryTimelineItem {
 	at: string;
-	kind: "decision" | "strategy_run" | "snapshot" | "outcome_check";
+	kind: "decision" | "strategy_run" | "snapshot" | "outcome_check" | "todo_resolution";
 	id: string;
 	marketId: string;
 	candidateId?: string;
@@ -109,6 +109,9 @@ export interface HistoryTimelineItem {
 	snapshotId?: string;
 	strategy?: string;
 	verdict?: OutcomeVerdict;
+	// 待办处理事件专用（读侧合并，不落盘、不写 decisionLog）：动作与操作者
+	action?: "submit" | "verify" | "complete" | "reopen";
+	actor?: string;
 }
 
 export interface SimilarMarketResult {
@@ -174,6 +177,12 @@ export interface SessionLedgerItem {
 	action: string;
 	conclusion: string;
 	ids?: string[];
+}
+
+// 处理说明与理由是人工自由文本，可能含换行；时间线是单行展示面（compass_history 管道行），统一压平
+function timelineText(value: string | undefined): string | undefined {
+	const flattened = value?.replace(/\s+/gu, " ").trim();
+	return flattened || undefined;
 }
 
 function parseTime(value: string | undefined): number | undefined {
@@ -426,7 +435,65 @@ export function buildTimeline(store: CompassStore, marketId: string, candidateId
 			snapshotId: check.evidenceSnapshotId,
 			verdict: check.verdict,
 		}));
-	return [...decisions, ...runs, ...snapshots, ...checks].sort((a, b) => b.at.localeCompare(a.at) || a.kind.localeCompare(b.kind));
+	// 待办处理事件：读侧合并，回滚零影响（记录本身即审计链，不写 decisionLog）。
+	// 预算两类记录只有 source、没有市场归属，自然不会进入任何市场时间线
+	const resolutions: HistoryTimelineItem[] = [];
+	for (const record of store.todoResolutions ?? []) {
+		if (record.marketId !== marketId) continue;
+		if (candidateId && record.candidateId && record.candidateId !== candidateId) continue;
+		const base = { kind: "todo_resolution" as const, marketId, candidateId: record.candidateId };
+		// 操作者写进 summary 而不是只放 action/actor 字段：时间线唯一的渲染面（compass_history）
+		// 按 `at | kind | id | summary | reason` 逐行输出，不落进 summary 就答不出「谁处理、谁验证」
+		const event = (actor: string | undefined, label: string) => `待办处理·${label} · ${actor ?? "未知操作者"} · ${record.titleSnapshot}`;
+		for (const [index, attempt] of record.attempts.entries()) {
+			const round = record.attempts.length > 1 ? `（第 ${index + 1} 轮）` : "";
+			resolutions.push({
+				...base,
+				at: attempt.submittedAt,
+				id: `${record.id}:submit:${index}`,
+				summary: event(attempt.submittedBy, `提交${round}`),
+				reason: timelineText(attempt.note),
+				actor: attempt.submittedBy,
+				action: "submit",
+			});
+			if (!attempt.verdict) continue;
+			resolutions.push({
+				...base,
+				at: attempt.verifiedAt ?? attempt.submittedAt,
+				id: `${record.id}:verify:${index}`,
+				summary: event(attempt.verifiedBy, `${attempt.verdict === "pass" ? "验证通过" : "验证驳回"}${round}`),
+				reason: timelineText(attempt.verdictReason),
+				actor: attempt.verifiedBy,
+				action: "verify",
+			});
+		}
+		// 记录只留最近一次勾选（resolvedAt 被下一次勾选整体覆盖，见 spec §4.2.3 已知局限），
+		// 重开次数仍可从 reopens 全量读出
+		if (record.resolvedAt) {
+			resolutions.push({
+				...base,
+				at: record.resolvedAt,
+				id: `${record.id}:complete`,
+				summary: event(record.resolvedBy, "勾选已处理"),
+				action: "complete",
+				actor: record.resolvedBy,
+			});
+		}
+		for (const [index, reopen] of record.reopens.entries()) {
+			resolutions.push({
+				...base,
+				at: reopen.reopenedAt,
+				id: `${record.id}:reopen:${index}`,
+				summary: event(reopen.reopenedBy, "重开"),
+				reason: timelineText(reopen.reason),
+				actor: reopen.reopenedBy,
+				action: "reopen",
+			});
+		}
+	}
+	// id 兜底让同一时刻的事件顺序确定，不依赖集合在 store 中的物理顺序
+	return [...decisions, ...runs, ...snapshots, ...checks, ...resolutions]
+		.sort((a, b) => b.at.localeCompare(a.at) || a.kind.localeCompare(b.kind) || a.id.localeCompare(b.id));
 }
 
 export function searchDecisionHistory(

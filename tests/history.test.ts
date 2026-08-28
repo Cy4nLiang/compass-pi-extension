@@ -159,3 +159,100 @@ test("timeline merges snapshots, strategy runs, decisions, and outcome checks", 
 	assert.deepEqual(new Set(timeline.map((item) => item.kind)), new Set(["snapshot", "strategy_run", "decision", "outcome_check"]));
 	assert.equal(timeline[0].id, "chk");
 });
+
+test("timeline merges todo resolution events with actor, reason, and stable ordering", () => {
+	const store = createEmptyStore(at);
+	store.markets.push(market("m", "market", []));
+	store.markets.push(market("other", "other market", []));
+	store.snapshots.push({ id: "snap", marketId: "m", source: "test", capturedAt: at, importedAt: at, rowCount: 0, listings: [], keywords: [], metrics: {}, warnings: [] });
+	store.todoResolutions = [
+		{
+			id: "tdr_1",
+			todoId: "todo_metric_divergence_m",
+			kind: "metric_divergence",
+			marketId: "m",
+			candidateId: "c1",
+			titleSnapshot: "多源指标偏差 >30%",
+			status: "reopened",
+			attempts: [
+				{ submittedAt: "2026-03-01T00:00:00.000Z", submittedBy: "compass-web", note: "第一轮说明\n第二行", evidence: [], verdict: "reject", verdictReason: "未说明以哪个来源为准", verifiedAt: "2026-03-02T00:00:00.000Z", verifiedBy: "compass-agent" },
+				{ submittedAt: "2026-03-03T00:00:00.000Z", submittedBy: "compass-web", note: "第二轮说明", evidence: [], verdict: "pass", verdictReason: "口径与理由明确", verifiedAt: "2026-03-04T00:00:00.000Z", verifiedBy: "compass-agent" },
+			],
+			reopens: [{ reopenedAt: "2026-03-06T00:00:00.000Z", reopenedBy: "ops", reason: "勾错了，拉回重新处理" }],
+			resolvedAt: "2026-03-05T00:00:00.000Z",
+			resolvedBy: "compass-web",
+			basis: { snapshotWatermark: "sellersprite@2026-02-01T00:00:00.000Z" },
+			createdAt: "2026-03-01T00:00:00.000Z",
+			updatedAt: "2026-03-06T00:00:00.000Z",
+		},
+		// 其他市场的记录不得混入
+		{
+			id: "tdr_2",
+			todoId: "todo_metric_divergence_other",
+			kind: "metric_divergence",
+			marketId: "other",
+			titleSnapshot: "多源指标偏差 >30%",
+			status: "submitted",
+			attempts: [{ submittedAt: "2026-03-07T00:00:00.000Z", submittedBy: "ops", note: "别的市场", evidence: [] }],
+			reopens: [],
+			createdAt: "2026-03-07T00:00:00.000Z",
+			updatedAt: "2026-03-07T00:00:00.000Z",
+		},
+		// 预算类无市场归属：不进任何市场时间线，但记录本身保留
+		{
+			id: "tdr_3",
+			todoId: "todo_budget_warning_keepa",
+			kind: "budget_warning",
+			source: "keepa",
+			titleSnapshot: "预算 80% 告警：keepa",
+			status: "submitted",
+			attempts: [{ submittedAt: "2026-03-08T00:00:00.000Z", submittedBy: "ops", note: "已核对用量", evidence: [] }],
+			reopens: [],
+			createdAt: "2026-03-08T00:00:00.000Z",
+			updatedAt: "2026-03-08T00:00:00.000Z",
+		},
+	];
+	const timeline = buildTimeline(store, "m");
+	const events = timeline.filter((item) => item.kind === "todo_resolution");
+	assert.equal(events.length, 6, "两轮提交 + 两次验证 + 一次勾选 + 一次重开");
+	// 时间倒序稳定排序
+	assert.deepEqual(events.map((item) => item.at), [
+		"2026-03-06T00:00:00.000Z",
+		"2026-03-05T00:00:00.000Z",
+		"2026-03-04T00:00:00.000Z",
+		"2026-03-03T00:00:00.000Z",
+		"2026-03-02T00:00:00.000Z",
+		"2026-03-01T00:00:00.000Z",
+	]);
+	assert.deepEqual(events.map((item) => item.action), ["reopen", "complete", "verify", "submit", "verify", "submit"]);
+	// 每个动作带 actor 与说明/理由，且自由文本被压平到单行
+	assert.equal(events[0].actor, "ops");
+	assert.equal(events[0].reason, "勾错了，拉回重新处理");
+	assert.equal(events[1].actor, "compass-web");
+	assert.match(events[2].summary, /验证通过/);
+	assert.equal(events[2].actor, "compass-agent");
+	// 操作者必须落进 summary：时间线的渲染面只输出 at/kind/id/summary/reason，字段不进正文就答不出「谁验证」
+	assert.match(events[2].summary, /compass-agent/);
+	assert.match(events[1].summary, /compass-web/);
+	assert.match(events[0].summary, /ops/);
+	assert.equal(events[2].reason, "口径与理由明确");
+	assert.match(events[4].summary, /驳回/);
+	assert.equal(events[5].reason, "第一轮说明 第二行");
+	assert.equal(events[5].candidateId, "c1");
+	assert.ok(events.every((item) => item.marketId === "m"));
+	// 既有条目类型不受影响
+	assert.ok(timeline.some((item) => item.kind === "snapshot"));
+	// 其他市场与无市场归属的记录都不混入
+	assert.equal(timeline.filter((item) => item.summary.includes("别的市场") || item.summary.includes("keepa")).length, 0);
+	// 候选过滤：指定其他候选时该市场的处理事件不出现
+	assert.equal(buildTimeline(store, "m", "c9").filter((item) => item.kind === "todo_resolution").length, 0);
+	assert.equal(buildTimeline(store, "m", "c1").filter((item) => item.kind === "todo_resolution").length, 6);
+});
+
+test("timeline tolerates stores without any todo resolutions", () => {
+	const store = createEmptyStore(at);
+	store.markets.push(market("m", "market", []));
+	store.snapshots.push({ id: "snap", marketId: "m", source: "test", capturedAt: at, importedAt: at, rowCount: 0, listings: [], keywords: [], metrics: {}, warnings: [] });
+	delete store.todoResolutions;
+	assert.equal(buildTimeline(store, "m").length, 1);
+});

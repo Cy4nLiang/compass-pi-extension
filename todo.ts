@@ -1,9 +1,26 @@
 import type { RetroDueItem } from "./history.ts";
-import type { CompassStore, MarketSnapshot, MetricMap, RiskRecord, TodoKind, TodoPriority, WorkbenchTodo } from "./types.ts";
+import {
+	RESOLVABLE_TODO_KINDS,
+	TODO_RESOLUTION_STATUS_LABELS,
+	type Candidate,
+	type CandidateStage,
+	type CompassStore,
+	type MarketSnapshot,
+	type MetricMap,
+	type ResolvableTodoKind,
+	type RiskRecord,
+	type TodoKind,
+	type TodoPriority,
+	type TodoResolution,
+	type WorkbenchTodo,
+	type WorkbenchTodoResolution,
+} from "./types.ts";
 
 // 待办推导：从 store 派生的只读视图，条件解决即消失。优先级映射与升级规则的唯一所有者。
 // 不 import service.ts——需要编排层计算的输入（预算态、复盘到期、深研指标、多源偏差）
 // 由 DeriveTodosInput 结构化传入，保持单向分层。
+// 闭环四类（RESOLVABLE_TODO_KINDS）另读 store.todoResolutions 合成处理状态：
+// 状态徽标 / 已勾选抑制 / 水位失效浮出的唯一所有者。
 
 // budgetStatus 返回值的结构化子集（避免依赖 service 的返回类型）
 export interface TodoBudgetPool {
@@ -73,16 +90,159 @@ function escalate(base: TodoPriority, overdueDays: number | undefined): TodoPrio
 	return Math.max(1, base - 1) as TodoPriority;
 }
 
+const RESOLVABLE_KIND_SET = new Set<TodoKind>(RESOLVABLE_TODO_KINDS);
+
+export function isResolvableTodoKind(kind: TodoKind): kind is ResolvableTodoKind {
+	return RESOLVABLE_KIND_SET.has(kind);
+}
+
+// 深研硬指标缺口（中文标签）：派生文案与 service 的 verify 硬门槛共用同一口径，杜绝两处漂移
+export function missingDeepResearchFields(metrics: MetricMap): string[] {
+	return DEEP_RESEARCH_REQUIRED_FIELDS
+		.filter((field) => {
+			const value = metrics[field]?.value;
+			return value === undefined || value === null;
+		})
+		.map((field) => FIELD_LABELS[field] ?? field);
+}
+
+// 派生时刻的水位快照：与记录勾选时落的 basis 逐类对比，决定抑制是否仍成立
+interface CurrentBasis {
+	month?: string;
+	snapshotWatermark?: string;
+	stageEnteredAt?: string;
+	metricsComplete?: boolean;
+}
+
+// 阶段周期锚：候选本次进入某阶段的时间 = decisionLog 最近一次「→ stage」的 stage_move createdAt，
+// 无留痕时回落建卡时间。**禁用 candidate.updatedAt**——例行 CSV 导入会刷新它，造成水位假失效。
+// 导出供 service 勾选时落 basis.stageEnteredAt 复用，杜绝抑制判定与水位口径两处漂移。
+export function stageEntryTimes(store: CompassStore, stage: CandidateStage): Map<string, string> {
+	const entered = new Map<string, string>();
+	const suffix = `→ ${stage}`;
+	for (const log of store.decisionLog) {
+		if (log.type !== "stage_move" || !log.candidateId || !log.conclusion.endsWith(suffix)) continue;
+		const previous = entered.get(log.candidateId);
+		if (previous === undefined || log.createdAt > previous) entered.set(log.candidateId, log.createdAt);
+	}
+	for (const candidate of store.candidates) if (!entered.has(candidate.id)) entered.set(candidate.id, candidate.createdAt);
+	return entered;
+}
+
+// 偏差水位：标记「参与比较的快照集合」本身，而不是它的最大 capturedAt。
+// metricDivergences（service.ts:1243）取各来源最新快照逐指标比较，任一来源被更新的导出替换，
+// 参与比较的值就变了。若水位取全市场最大 capturedAt，回填补录（capturedAt 早于全市场最新、
+// 但晚于该来源上一份，如补导前天的 Sorftime 导出）会改写偏差事实却不推高水位，已勾选条目
+// 静默到下一份更新快照为止——正是 spec §5 方案 G 判为不可接受的告警黑洞。
+// 指纹按 source 排序拼接：集合不变则完全相等（同 capturedAt 重导时该来源参与比较的快照不变，
+// 指纹同样不变，继续抑制）。导出供 service 勾选时落 basis.snapshotWatermark 复用同一口径。
+// 两处约定：① 选「该来源最新」用与 metricDivergences 排序相同的 localeCompare，取值相同者保留先入库那条，
+// 与其稳定排序取首条等价；② 指纹分隔符依赖 SNAPSHOT_SOURCES（types.ts）的来源名不含 "@" 与 "|"。
+export function divergenceWatermarks(store: CompassStore): Map<string, string> {
+	const latestBySource = new Map<string, Map<string, string>>();
+	for (const snapshot of store.snapshots) {
+		let sources = latestBySource.get(snapshot.marketId);
+		if (!sources) {
+			sources = new Map<string, string>();
+			latestBySource.set(snapshot.marketId, sources);
+		}
+		const previous = sources.get(snapshot.source);
+		if (previous === undefined || snapshot.capturedAt.localeCompare(previous) > 0) sources.set(snapshot.source, snapshot.capturedAt);
+	}
+	const watermarks = new Map<string, string>();
+	for (const [marketId, sources] of latestBySource) {
+		watermarks.set(marketId, [...sources.entries()]
+			.sort((a, b) => a[0].localeCompare(b[0]))
+			.map(([source, capturedAt]) => `${source}@${capturedAt}`)
+			.join("|"));
+	}
+	return watermarks;
+}
+
+// 抑制判定：仅当勾选时的水位仍成立才隐藏条目，失效即浮出（lapsed）。
+// 记录状态只由人工动作迁移，派生层永不改写记录——错位的最坏情况是多提醒一次，绝不漏提醒。
+function isSuppressed(record: TodoResolution, current: CurrentBasis): boolean {
+	const basis = record.basis;
+	if (!basis) return false;
+	switch (record.kind) {
+		case "budget_warning":
+		case "budget_fused":
+			// 新预算月开始即自然失效（次月用量重新计算）
+			return Boolean(current.month) && basis.month === current.month;
+		case "metric_divergence":
+			// 参与比较的快照集合指纹一致才继续抑制；水位取不到时按浮出处理
+			return basis.snapshotWatermark !== undefined
+				&& current.snapshotWatermark !== undefined
+				&& current.snapshotWatermark === basis.snapshotWatermark;
+		case "deep_missing_data":
+			// 同一深研周期内且四项硬指标仍齐备；指标回退或候选重入深研都算新事实
+			return current.metricsComplete === true && basis.stageEnteredAt !== undefined && basis.stageEnteredAt === current.stageEnteredAt;
+	}
+}
+
+// 状态徽标（TUI 与工具面共用；Web 前端按同一措辞自行渲染）：非闭环类返回 undefined
+export function todoResolutionBadge(todo: WorkbenchTodo): string | undefined {
+	if (!todo.resolvable) return undefined;
+	if (!todo.resolution) return "未处理";
+	if (todo.resolution.lapsed) return "已处理·失效浮出";
+	return TODO_RESOLUTION_STATUS_LABELS[todo.resolution.status];
+}
+
+function summarizeResolution(record: TodoResolution, lapsed: boolean): WorkbenchTodoResolution {
+	const last = record.attempts[record.attempts.length - 1];
+	const summary: WorkbenchTodoResolution = {
+		status: record.status,
+		attemptCount: record.attempts.length,
+		updatedAt: record.updatedAt,
+	};
+	if (last?.verdict) summary.verdict = last.verdict;
+	if (last?.verdictReason) summary.verdictReason = singleLine(last.verdictReason);
+	if (lapsed) summary.lapsed = true;
+	return summary;
+}
+
 export function deriveTodos(input: DeriveTodosInput): WorkbenchTodo[] {
 	const { store, budgets, retroDue, deepResearchMetrics, divergentMarkets } = input;
 	const now = input.now ?? new Date().toISOString();
 	const todos: WorkbenchTodo[] = [];
 	const marketName = (marketId: string | undefined): string | undefined =>
 		marketId ? store.markets.find((market) => market.id === marketId)?.name : undefined;
-	const push = (todo: Omit<WorkbenchTodo, "priority" | "basePriority" | "marketName"> & { marketName?: string }): void => {
+	// 处理记录按待办 id 建表（单遍 O(n)）；非闭环 kind 的记录防御性忽略，不参与任何判定
+	const resolutionByTodoId = new Map<string, TodoResolution>();
+	for (const record of store.todoResolutions ?? []) {
+		if (RESOLVABLE_KIND_SET.has(record.kind)) resolutionByTodoId.set(record.todoId, record);
+	}
+	// 预算水位口径与 budgetStatus 一致（UTC 月前缀）；now 非法时留空 → 一律不抑制
+	const currentMonth = Number.isFinite(Date.parse(now)) ? new Date(now).toISOString().slice(0, 7) : "";
+	// 深研周期锚与偏差水位都只在真要判抑制时才预扫一次（短路 + Code Motion，不在循环内重复扫描）
+	let deepEntryTimes: Map<string, string> | undefined;
+	const deepEnteredAt = (candidate: Candidate): string => {
+		deepEntryTimes ??= stageEntryTimes(store, "deep_research");
+		return deepEntryTimes.get(candidate.id) ?? candidate.createdAt;
+	};
+	let divergenceWatermarkByMarket: Map<string, string> | undefined;
+	const divergenceWatermark = (marketId: string): string | undefined => {
+		divergenceWatermarkByMarket ??= divergenceWatermarks(store);
+		return divergenceWatermarkByMarket.get(marketId);
+	};
+
+	// currentBasis 用 thunk 传入：仅在确有已勾选记录需要比对时才计算水位，避免无谓扫描
+	const push = (
+		todo: Omit<WorkbenchTodo, "priority" | "basePriority" | "marketName" | "resolvable" | "resolution"> & { marketName?: string },
+		currentBasis?: () => CurrentBasis,
+	): void => {
+		const resolvable = RESOLVABLE_KIND_SET.has(todo.kind);
+		const record = resolvable ? resolutionByTodoId.get(todo.id) : undefined;
+		// todoId 命中但 kind 不符 = 记录与待办不同源（数据损坏），按无记录处理
+		const matched = record?.kind === todo.kind ? record : undefined;
+		let lapsed = false;
+		if (matched?.status === "resolved") {
+			if (isSuppressed(matched, currentBasis?.() ?? {})) return;
+			lapsed = true;
+		}
 		const base = BASE_PRIORITY[todo.kind];
 		const name = todo.marketName ?? marketName(todo.marketId);
-		todos.push({
+		const entry: WorkbenchTodo = {
 			...todo,
 			title: singleLine(todo.title),
 			reason: singleLine(todo.reason),
@@ -90,7 +250,10 @@ export function deriveTodos(input: DeriveTodosInput): WorkbenchTodo[] {
 			marketName: name === undefined ? undefined : singleLine(name),
 			basePriority: base,
 			priority: escalate(base, todo.overdueDays),
-		});
+			resolvable,
+		};
+		if (matched) entry.resolution = summarizeResolution(matched, lapsed);
+		todos.push(entry);
 	};
 
 	// P1 budget_fused / P4 budget_warning：每个告警或熔断的池一条
@@ -108,7 +271,7 @@ export function deriveTodos(input: DeriveTodosInput): WorkbenchTodo[] {
 				title: `预算熔断：${pool.source}`,
 				reason: `当月用量已达上限（${usage}），付费补数链路停摆`,
 				suggestedAction: `compass_budget configure source=${pool.source} 提高上限，或降级 C 档数据源；次月自动恢复`,
-			});
+			}, () => ({ month: currentMonth }));
 		} else {
 			push({
 				id: `todo_budget_warning_${pool.source}`,
@@ -117,7 +280,7 @@ export function deriveTodos(input: DeriveTodosInput): WorkbenchTodo[] {
 				title: `预算 80% 告警：${pool.source}`,
 				reason: `当月用量已达 80%（${usage}）`,
 				suggestedAction: "compass_budget status 核对用量，评估是否提高上限或收紧补数",
-			});
+			}, () => ({ month: currentMonth }));
 		}
 	}
 
@@ -187,24 +350,24 @@ export function deriveTodos(input: DeriveTodosInput): WorkbenchTodo[] {
 			});
 		}
 
-		// P3 deep_missing_data
+		// P3 deep_missing_data：闭环类——指标齐备只是验证判据之一，不再自动消失，
+		// 须经「提交 → 验证 → 勾选」关闭（派生条件 = 指标有缺 或 无有效抑制记录）
 		if (candidate.stage === "deep_research") {
-			const metrics = deepMetricsByMarket.get(candidate.marketId) ?? {};
-			const missing = DEEP_RESEARCH_REQUIRED_FIELDS.filter((field) => {
-				const value = metrics[field]?.value;
-				return value === undefined || value === null;
-			});
-			if (missing.length) {
-				push({
-					id: `todo_deep_missing_data_${candidate.id}`,
-					kind: "deep_missing_data",
-					marketId: candidate.marketId,
-					candidateId: candidate.id,
-					title: "深研缺硬指标",
-					reason: `缺 ${missing.map((field) => FIELD_LABELS[field] ?? field).join("、")}`,
-					suggestedAction: `compass_data_route market_ref=${candidate.marketId} stage=deep_research 生成补数计划`,
-				});
-			}
+			const missing = missingDeepResearchFields(deepMetricsByMarket.get(candidate.marketId) ?? {});
+			const complete = missing.length === 0;
+			push({
+				id: `todo_deep_missing_data_${candidate.id}`,
+				kind: "deep_missing_data",
+				marketId: candidate.marketId,
+				candidateId: candidate.id,
+				title: complete ? "深研数据待人工确认" : "深研缺硬指标",
+				reason: complete
+					? "四项硬指标齐备，待提交调研说明与利润测算确认"
+					: `缺 ${missing.join("、")}`,
+				suggestedAction: complete
+					? `compass_todo action=submit todo_id=todo_deep_missing_data_${candidate.id} 提交调研说明与利润测算`
+					: `compass_data_route market_ref=${candidate.marketId} stage=deep_research 生成补数计划`,
+			}, () => ({ stageEnteredAt: deepEnteredAt(candidate), metricsComplete: complete }));
 		}
 
 		// P3 risk_missing
@@ -286,7 +449,7 @@ export function deriveTodos(input: DeriveTodosInput): WorkbenchTodo[] {
 			title: "多源指标偏差 >30%",
 			reason: `偏差指标：${item.metrics.join("、")}`,
 			suggestedAction: "对照报告的多源偏差表，人工确定基准口径后再决策",
-		});
+		}, () => ({ snapshotWatermark: divergenceWatermark(item.marketId) }));
 	}
 
 	return todos.sort((a, b) =>

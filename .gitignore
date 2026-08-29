@@ -9,3 +9,6 @@ node_modules/
 
 # Playwright MCP 验证 Web UI 时留下的一次性产物
 .playwright-mcp/
+
+# 评审工具的暂存目录：空目录 git 不跟踪，但一旦有东西写进去就会变成未忽略的未跟踪文件
+.tmpcritic/

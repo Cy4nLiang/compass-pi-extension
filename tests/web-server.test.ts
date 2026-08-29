@@ -241,6 +241,9 @@ test("report endpoint writes markdown inside the reports directory", async () =>
 		assert.equal(status, 200);
 		assert.match(body.data.path, /^\.pi\/compass\/reports\/.+\.md$/, "报告必须落在 reports 目录内");
 		assert.match(body.data.markdown, /罗盘选品报告/);
+		// 报告弹窗的标题栏直接读这四个字段（buildReportOverlayHtml），少一个就是弹窗里一个「—」
+		assert.ok(body.data.marketName && body.data.snapshotId, "弹窗标题栏依赖 marketName 与 snapshotId");
+		assert.ok(Number.isFinite(body.data.score) && body.data.outcome, "弹窗标题栏依赖 score 与 outcome");
 		const written = await readFile(join(root, body.data.path), "utf8");
 		assert.equal(written, body.data.markdown);
 
@@ -527,12 +530,18 @@ test("a corrupt store answers 500 rather than masquerading as a client error", a
 test("assets are reachable under both /assets/* and root, and pool write paths are not treated as refs", async () => {
 	const { root, server } = await setupProject();
 	try {
-		// markdown.js 是 app.js 的静态 import：它 404 时页面整体不执行（模块图加载失败），
-		// 表现是白屏而不是「报告弹窗坏了」，所以两种路径形态都要守住
-		for (const path of ["/assets/app.js", "/app.js", "/assets/markdown.js", "/markdown.js"]) {
-			const response = await fetch(`${server.url}${path}`);
-			assert.equal(response.status, 200, `${path} 应可访问`);
-			assert.match(response.headers.get("content-type") ?? "", /javascript/);
+		// app.js 的静态 import 一旦 404，整个模块图加载失败、app.js 一行都不执行，页面会停在
+		// index.html 的「正在加载罗盘工作台…」骨架上——不是「报告弹窗坏了」，是整站不可用。
+		// 说明符从源码里抽而不是写死清单：将来任何新增 / 改名的前端模块都自动进入守护范围。
+		const appSource = await readFile(join(here, "../web/assets/app.js"), "utf8");
+		const specifiers = [...appSource.matchAll(/^import[^"']*["']\.\/([^"']+)["']/gm)].map((match) => match[1]);
+		assert.ok(specifiers.length > 0, "没能从 app.js 抽出任何相对 import——正则要跟着源码一起改");
+		for (const name of ["app.js", ...specifiers]) {
+			for (const path of [`/assets/${name}`, `/${name}`]) {
+				const response = await fetch(`${server.url}${path}`);
+				assert.equal(response.status, 200, `${path} 应可访问`);
+				assert.match(response.headers.get("content-type") ?? "", /javascript/);
+			}
 		}
 		// 任务 6 验收标准明确点名：/assets/style.css（不只是根路径 /style.css）必须 200 + 正确 content-type
 		for (const path of ["/assets/style.css", "/style.css"]) {

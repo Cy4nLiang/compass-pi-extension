@@ -20,8 +20,10 @@ esac
 command -v jq >/dev/null 2>&1 || exit 0
 
 cmd=$(printf '%s' "$payload" | jq -r '.tool_input.command // ""')
-# 同时覆盖 `git commit` 与 `git -C <path> commit`
-printf '%s' "$cmd" | grep -qE '\bgit\b[^;&|]*\bcommit\b' || exit 0
+# 只认「命令位置上的 git，后面跟着 commit」：git 与 commit 之间只允许 -C/-c 及其参数、
+# 或 --xxx 形式的全局选项。从前的 \bgit\b[^;&|]*\bcommit\b 太松，git log --grep=commit
+# 这类纯只读命令也会命中，白跑一次全量 check + test（约 4.4 秒）。
+printf '%s' "$cmd" | grep -qE '(^|[;&|][[:space:]]*)git([[:space:]]+(-[Cc][[:space:]]+[^[:space:]]+|--[^[:space:]]+))*[[:space:]]+commit([^-[:alnum:]_]|$)' || exit 0
 
 root="${CLAUDE_PROJECT_DIR:-}"
 if [ -z "$root" ]; then

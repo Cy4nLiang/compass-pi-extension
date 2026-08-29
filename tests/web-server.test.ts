@@ -527,7 +527,9 @@ test("a corrupt store answers 500 rather than masquerading as a client error", a
 test("assets are reachable under both /assets/* and root, and pool write paths are not treated as refs", async () => {
 	const { root, server } = await setupProject();
 	try {
-		for (const path of ["/assets/app.js", "/app.js"]) {
+		// markdown.js 是 app.js 的静态 import：它 404 时页面整体不执行（模块图加载失败），
+		// 表现是白屏而不是「报告弹窗坏了」，所以两种路径形态都要守住
+		for (const path of ["/assets/app.js", "/app.js", "/assets/markdown.js", "/markdown.js"]) {
 			const response = await fetch(`${server.url}${path}`);
 			assert.equal(response.status, 200, `${path} 应可访问`);
 			assert.match(response.headers.get("content-type") ?? "", /javascript/);

@@ -2,6 +2,11 @@
 // （总览/待办/市场/市场档案/候选池/预算/复盘/导入向导）。
 // 纯 JS、无框架、无构建步骤（仓库零新增运行时依赖的约定延伸到前端）。
 
+// 唯一的跨文件依赖：报告弹窗要在浏览器里把 Markdown 渲染成 HTML。
+// 拆出去是为了让它能被 tests/web-markdown.test.ts 直接 import（app.js 本身满是 DOM 操作、
+// 在 node 里 import 会直接抛错），渲染器又正好是这套前端里唯一有注入风险的纯函数。
+import { renderMarkdown } from "./markdown.js";
+
 const TABS = [
 	{ id: "overview", label: "总览", hash: "#/overview" },
 	{ id: "todos", label: "待办", hash: "#/todos" },
@@ -1415,11 +1420,19 @@ function buildDecisionTimelinePanelHtml(data) {
 	`;
 }
 
+// 报告固定九章（对齐 report.ts 的 ## 小节顺序）：这里是生成前的目录预告，
+// 生成后弹窗左侧的小目录才是从真实 Markdown 里抽出来的
+const REPORT_CHAPTERS = ["决策摘要 GSE", "五维证据", "单位经济情景", "痛点与改良", "风险核查", "多源校准", "决策回放", "下一步", "历史与复盘"];
+
 function buildReportPanelHtml() {
+	const chapters = REPORT_CHAPTERS.map((label, index) => `<span class="report-chapter"><span class="mono report-chapter-no">${index + 1}</span> ${escapeHtml(label)}</span>`).join("");
 	return `
 		<div class="panel">
-			<div class="panel-title">五维报告</div>
-			<div style="margin-top:10px;" id="dossier-report-body"><div class="empty-note">点击上方「生成五维报告」按钮生成最新报告</div></div>
+			<div class="panel-title">五维报告 · 九章</div>
+			<div class="report-chapters">${chapters}</div>
+			<div class="report-result" id="dossier-report-body">
+				<span class="report-result-path mono">尚未生成——点右上角「生成五维报告」</span>
+			</div>
 		</div>
 	`;
 }
@@ -1456,6 +1469,124 @@ function bindDossierDimensionFilter(content) {
 	});
 }
 
+// ── 五维报告弹窗：落盘仍是 .md，看的是浏览器里实时渲染出来的 HTML ────────
+//
+// 弹窗挂在 <body> 而不是 #content：市场档案页任何一次重渲染都会整体替换 #content，
+// 挂在里面的弹窗会连同正文一起消失。它也刻意不是一个 hash 路由——报告正文只存在于
+// 这次 POST 返回的内存里，做成路由后刷新地址栏会得到一个空壳弹窗。
+// 同一时刻只允许一个，模块级句柄同时承担「关掉旧的」与「解绑全局监听」两件事。
+let reportOverlay = null;
+
+function closeReportOverlay() {
+	if (!reportOverlay) return;
+	const { element, onKeydown, onHashChange } = reportOverlay;
+	document.removeEventListener("keydown", onKeydown);
+	window.removeEventListener("hashchange", onHashChange);
+	element.remove();
+	reportOverlay = null;
+}
+
+function reportTocHtml(toc) {
+	if (!toc.length) return "";
+	// 目录项用 button 而不是 <a href="#...">：改 location.hash 会触发 hashchange，
+	// 被路由当成一次导航——页面跳走、弹窗被自己的 onHashChange 关掉
+	const links = toc.map((item) => `<button type="button" class="report-toc-link is-level${item.level}" data-target="${escapeHtml(item.id)}">${escapeHtml(item.text)}</button>`).join("");
+	return `<nav class="report-toc">${links}</nav>`;
+}
+
+function buildReportOverlayHtml(result, rendered) {
+	const meta = [
+		`Gate ${GATE_LABELS[result.outcome] ?? result.outcome ?? "—"}`,
+		`综合分 ${Number.isFinite(result.score) ? result.score.toFixed(1) : "—"}`,
+		`快照 ${result.snapshotId ?? "—"}`,
+	].join(" · ");
+	return `
+		<div class="report-modal" role="dialog" aria-modal="true" aria-label="五维报告">
+			<div class="report-modal-header">
+				<div class="report-modal-heading">
+					<div class="report-modal-title cell-truncate">五维报告 · ${escapeHtml(result.marketName)}</div>
+					<div class="report-modal-meta mono cell-truncate">${escapeHtml(meta)} · 已存 ${escapeHtml(result.path)}</div>
+				</div>
+				<div class="report-modal-actions">
+					<button type="button" class="btn btn-outline" data-report-action="source">Markdown 源码</button>
+					<button type="button" class="btn btn-outline" data-report-action="copy">复制 Markdown</button>
+					<button type="button" class="drawer-close" data-report-action="close" title="关闭（Esc）">${ICON_CLOSE}</button>
+				</div>
+			</div>
+			<div class="report-modal-body">
+				${reportTocHtml(rendered.toc)}
+				<article class="report-doc" id="report-doc">${rendered.html}</article>
+				<pre class="report-source" id="report-source" hidden>${escapeHtml(result.markdown)}</pre>
+			</div>
+		</div>
+	`;
+}
+
+function openReportOverlay(result) {
+	closeReportOverlay();
+	const element = document.createElement("div");
+	element.className = "report-overlay";
+	element.innerHTML = buildReportOverlayHtml(result, renderMarkdown(result.markdown));
+	const onKeydown = (event) => {
+		if (event.key === "Escape") closeReportOverlay();
+	};
+	const onHashChange = () => closeReportOverlay();
+	reportOverlay = { element, onKeydown, onHashChange };
+	document.body.appendChild(element);
+	document.addEventListener("keydown", onKeydown);
+	window.addEventListener("hashchange", onHashChange);
+	// 只有「按下」和「松开」都落在遮罩本身（弹窗以外的暗区）才关闭。
+	// 只判 click 的 target 是不够的：在正文里按住拖选文字、把光标甩出弹窗边框再松手，
+	// click 的 target 就是遮罩——报告会在选到一半时突然关掉、选区一起没
+	let pressedOnBackdrop = false;
+	element.addEventListener("mousedown", (event) => {
+		pressedOnBackdrop = event.target === element;
+	});
+	element.addEventListener("click", (event) => {
+		if (pressedOnBackdrop && event.target === element) closeReportOverlay();
+		pressedOnBackdrop = false;
+	});
+
+	const doc = element.querySelector("#report-doc");
+	const source = element.querySelector("#report-source");
+	const toc = element.querySelector(".report-toc");
+	const sourceBtn = element.querySelector('[data-report-action="source"]');
+	const copyBtn = element.querySelector('[data-report-action="copy"]');
+	element.querySelector('[data-report-action="close"]').addEventListener("click", closeReportOverlay);
+
+	sourceBtn.addEventListener("click", () => {
+		const showSource = source.hidden;
+		source.hidden = !showSource;
+		doc.hidden = showSource;
+		if (toc) toc.hidden = showSource;
+		sourceBtn.textContent = showSource ? "渲染视图" : "Markdown 源码";
+	});
+
+	copyBtn.addEventListener("click", async () => {
+		try {
+			// 127.0.0.1 属于安全上下文，剪贴板 API 可用；仍然兜底提示，
+			// 否则浏览器一旦拒绝授权，按钮就成了点了没反应的哑巴
+			await navigator.clipboard.writeText(result.markdown);
+			copyBtn.textContent = "已复制";
+		} catch {
+			copyBtn.textContent = "复制失败，请用源码视图手动复制";
+		}
+		setTimeout(() => {
+			if (copyBtn.isConnected) copyBtn.textContent = "复制 Markdown";
+		}, 2000);
+	});
+
+	if (toc) {
+		toc.addEventListener("click", (event) => {
+			const link = event.target.closest(".report-toc-link");
+			if (!link) return;
+			const target = doc.querySelector(`[id="${link.dataset.target}"]`);
+			if (target) target.scrollIntoView({ behavior: "smooth", block: "start" });
+			for (const el of toc.querySelectorAll(".report-toc-link")) el.classList.toggle("is-active", el === link);
+		});
+	}
+}
+
 // isCurrent 必须校验：点击后用户可能在 POST /api/report 挂起期间导航离开，
 // 届时 btn/body 已随 content.innerHTML 被整体替换而与文档分离，写入分离节点
 // 虽不抛错但用户看不到任何反馈——静默生成成功却像是失败
@@ -1466,17 +1597,17 @@ function bindDossierReportButton(content, marketRef, isCurrent) {
 	btn.addEventListener("click", async () => {
 		btn.disabled = true;
 		btn.textContent = "生成中…";
-		body.innerHTML = `<div class="loading">生成中…</div>`;
+		body.innerHTML = `<span class="report-result-path mono">生成中…</span>`;
 		try {
 			const result = await fetchApi("/api/report", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ marketRef }) });
 			if (!isCurrent()) return;
 			body.innerHTML = `
-				<div class="cell-muted mono" style="font-size:11px; margin-bottom:6px;">已生成：${escapeHtml(result.path)}</div>
-				<details class="report-preview">
-					<summary>展开 markdown 预览</summary>
-					<pre class="report-markdown">${escapeHtml(result.markdown)}</pre>
-				</details>
+				<span class="report-result-path mono" title="${escapeHtml(result.path)}">${escapeHtml(result.path)}</span>
+				<button type="button" class="btn btn-outline" id="dossier-report-open">查看最近报告</button>
 			`;
+			// 报告正文留在闭包里：重看不必再生成一次（生成会重算 GSE 并覆盖当天的 .md）
+			body.querySelector("#dossier-report-open").addEventListener("click", () => openReportOverlay(result));
+			openReportOverlay(result);
 		} catch (error) {
 			if (!isCurrent()) return;
 			body.innerHTML = `<div class="error-panel">生成失败：${escapeHtml(error.message)}</div>`;

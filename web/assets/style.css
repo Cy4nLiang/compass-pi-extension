@@ -22,6 +22,12 @@
 	--c-warning: #e5b567;
 	--c-error: #e5534b;
 	--c-info: #7ea6d9;
+	/* 焦点环专用。刻意不复用 --c-accent：金色在本设计系统里已经是「选中 / 激活」
+	   （.tab.is-active / .chip.is-active / .import-tab.is-active / .report-toc-link.is-active
+	   / .btn-accent*），拿它画焦点会让「键盘停在这」和「这一项已选中」读成同一个信号。
+	   中性近白是这套 token 里唯一不带状态含义的颜色，对 --c-bg 14.5:1、对 --c-bg-panel 13.4:1。
+	   不写成 var(--c-text)：数值今天确实相同，但焦点环和正文字色是两个应该能独立调的旋钮。 */
+	--c-focus: #dce3ea;
 
 	--f-sans: "IBM Plex Sans", "PingFang SC", "Hiragino Sans GB", sans-serif;
 	--f-mono: "IBM Plex Mono", ui-monospace, monospace;
@@ -87,6 +93,58 @@ button {
 
 .mono {
 	font-family: var(--f-mono);
+}
+
+/* ── 焦点可见性 ───────────────────────────────────────── */
+
+/* 全局兜底：所有可聚焦元素都从这一条拿焦点环，组件层只在下面必须的地方改颜色或方向。
+ * 三个已定的取舍，动手前先看这里：
+ *
+ * 1) 为什么不是 --c-accent。金色已经是「选中 / 激活」，再拿它画焦点，「键盘现在停在这」
+ *    和「这一项已被选中」就成了同一个信号；.btn-accent-fill 是金底黑字，金环贴上去连边界
+ *    都没有。而且这不是审美问题：按 WCAG 相对亮度算，对 --c-bg（L=0.006）拿 3:1 需要
+ *    L≥0.1175，对 --c-accent（L=0.427）拿 3:1 需要 L≤0.1090——**不存在**任何一个不透明纯色
+ *    能同时满足，所以金底元素必须换第二套颜色，见下面那条规则。
+ * 2) 为什么是 outline。border-color 与 background 两条通道都被 :hover 占了（.btn-outline /
+ *    .pool-card 改边框，a.data-table-row / .report-toc-link / .md-table tbody tr 改底色），
+ *    outline 是全文件唯一没被任何交互态用掉的通道，不会和 hover 抢同一批像素。
+ * 3) 为什么默认是负 offset。这个界面到处是 overflow: auto/hidden 的滚动容器，而且
+ *    .report-toc 直接包着 .report-toc-link、.pool-lane-body 直接包着 a.pool-card、
+ *    .market-table-rows 直接包着 a.data-table-row——正 offset 的环画在边框盒之外，会被这些
+ *    祖先裁成 L 形甚至整条不见。内嵌环画在自己的边框盒里，任何祖先都裁不到，于是「漏适配
+ *    一个容器」的后果是环挤了点（一眼看得见），而不是环凭空消失（无障碍回归，看不出来）。
+ *    整行链接（a.data-table-row / .todo-row-link）也因此不会把环压到相邻行的分隔线上。
+ *
+ * 另有两处必须就地处理、不在这一段：.toggle-checkbox-input（0×0 的代理复选框，环要转交给
+ * .toggle-switch）与 .report-focus-guard（透明哨兵，环必须抹掉）。
+ */
+:focus-visible {
+	outline: 2px solid var(--c-focus);
+	outline-offset: -2px;
+}
+
+/* 金底上白环只有 1.7:1，等于没画；换成这些元素文字本来就在用的墨色，对金底 8.5:1。
+   这是上面第 1 点那个亮度不等式的直接后果，不是配色偏好——别顺手改回 --c-focus */
+.btn-accent-fill:focus-visible,
+.tab.is-active:focus-visible,
+.import-tab.is-active:focus-visible {
+	outline-color: var(--c-accent-ink);
+}
+
+/* 这几个是行内链接或纯图标按钮：没有自己的内边距，内嵌环会压在字身 / 图标上（中文字面占满
+   em 框，比拉丁字母更明显）；.pipeline-stage 则是最外那 2px 另有用途——border-top 是阶段
+   状态色，被环盖掉就丢了信息。这几个外面都有足够留白，可以安全外扩。
+   往这份名单里加东西前必须先量：祖先的裁切边缘要离元素至少 4px（offset 2 + width 2），否则
+   环会缺一边。实测数据（1440×900）：.pipeline-stage / .panel-footnote a / .breadcrumb-back
+   根本没有 overflow 祖先，.drawer-close 离 .modal 边最近 16px，都够。
+   `.overflow-hint a` 曾在这份名单里，实测被否掉——它贴在 .col-panel-body 的角上，左边距 0px、
+   下边距 1px，外扩环会缺左下两边；它走默认的内嵌环，压一点字也比缺两条边强 */
+.breadcrumb-back:focus-visible,
+.drawer-close:focus-visible,
+.pipeline-stage:focus-visible,
+.panel-footnote a:focus-visible,
+.report-doc a:focus-visible {
+	outline-offset: 2px;
 }
 
 /* ── 应用外壳 ─────────────────────────────────────────── */
@@ -1597,10 +1655,14 @@ a.data-table-row:hover {
 	width: 100%;
 }
 
+/* 只保留这条边框提示，不再写 outline: none——焦点环交给全局 :focus-visible。
+   保持 :focus 而不改成 :focus-visible 是有意的：Chrome 对 <select> 的键盘模态判定不把鼠标
+   点击算进 :focus-visible，改了会让鼠标点开下拉时连这点边框反馈都没有。
+   另记一笔踩过的坑：这条是 (0,2,0)、全局那条 :focus-visible 是 (0,1,0)——从前那句
+   outline: none 不管挪到文件哪一行都会把新焦点环整条抹掉，是特异性问题，不是先后顺序问题 */
 .field-select:focus,
 .field-input:focus,
 .field-textarea:focus {
-	outline: none;
 	border-color: var(--c-text-muted);
 }
 
@@ -1764,6 +1826,15 @@ a.data-table-row:hover {
 
 .toggle-checkbox-input:checked + .toggle-switch::after {
 	transform: translateX(16px);
+}
+
+/* 真正的 <input type="checkbox"> 是 0×0 + opacity:0 的无障碍代理，焦点环画在它身上等于没画
+   （尺寸为零，而且 opacity:0 会把环一起吞掉）。转交给视觉上代表它的那个开关。
+   这里用正 offset：.toggle-switch 高 18px、::after 的滑块顶在 top/left 各 2px，内嵌环会正好
+   压在滑块边上；它外面是 .modal-body 的内边距，外扩 4px 裁不到 */
+.toggle-checkbox-input:focus-visible + .toggle-switch {
+	outline: 2px solid var(--c-focus);
+	outline-offset: 2px;
 }
 
 .import-result-card {
@@ -1998,6 +2069,13 @@ a.chip {
 	pointer-events: none;
 }
 
+/* 哨兵是只为接住 Tab 而存在的空节点，全局焦点环落上去就是画面里凭空冒出的一个 1px 亮点。
+   上面那句 opacity: 0 眼下确实会把环一起吞掉，但那是它的副作用、不是契约——哪天为了别的
+   原因把 opacity 换成 clip-path，亮点就回来了。意图写死，别靠巧合 */
+.report-focus-guard:focus-visible {
+	outline: none;
+}
+
 .report-modal {
 	width: min(1120px, 100%);
 	height: 100%;
@@ -2055,6 +2133,10 @@ a.chip {
 .report-toc {
 	flex: 0 0 208px;
 	overflow-y: auto;
+	/* 滚到底后不要把手势顺着链给背后的文档：竖向上 .app-shell 是硬 100vh、页面本身不滚，
+	   表现为整页橡皮筋抖一下；横向上窗口窄于 min-width: 1180px 时 <body> 是真能横滚的，
+	   两指手势带一点横向分量就会把背景页面拽偏 */
+	overscroll-behavior: contain;
 	padding: 12px 8px;
 	border-right: 1px solid var(--c-divider);
 	background: var(--c-bg-strip);
@@ -2101,6 +2183,10 @@ a.chip {
 	flex: 1 1 auto;
 	min-width: 0;
 	overflow-y: auto;
+	/* 滚到底后不要把手势顺着链给背后的文档：竖向上 .app-shell 是硬 100vh、页面本身不滚，
+	   表现为整页橡皮筋抖一下；横向上窗口窄于 min-width: 1180px 时 <body> 是真能横滚的，
+	   两指手势带一点横向分量就会把背景页面拽偏 */
+	overscroll-behavior: contain;
 	padding: 20px 28px 56px;
 	font-size: 13px;
 	line-height: 1.75;
@@ -2111,6 +2197,10 @@ a.chip {
 	flex: 1 1 auto;
 	min-width: 0;
 	overflow: auto;
+	/* 滚到底后不要把手势顺着链给背后的文档：竖向上 .app-shell 是硬 100vh、页面本身不滚，
+	   表现为整页橡皮筋抖一下；横向上窗口窄于 min-width: 1180px 时 <body> 是真能横滚的，
+	   两指手势带一点横向分量就会把背景页面拽偏 */
+	overscroll-behavior: contain;
 	margin: 0;
 	padding: 18px 20px;
 	white-space: pre-wrap;
@@ -2119,15 +2209,6 @@ a.chip {
 	line-height: 1.7;
 	color: var(--c-text-secondary);
 	background: var(--c-bg);
-}
-
-/* 两个面板带 tabindex="0"（键盘要能滚长报告），所以会吃到焦点环。必须自己画：
-   .report-modal 是 overflow: hidden + 圆角，UA 默认焦点环画在边框盒之外会被裁成 L 形，
-   负 offset 才能画到内侧；配色也得回到本设计系统，不然是一圈突兀的浏览器默认亮蓝 */
-.report-doc:focus-visible,
-.report-source:focus-visible {
-	outline: 2px solid var(--c-accent);
-	outline-offset: -2px;
 }
 
 /* ── 报告正文的 Markdown 排版（markdown.js 生成的 .md-* 类） ────── */

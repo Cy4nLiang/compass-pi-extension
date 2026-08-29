@@ -121,6 +121,12 @@ function escapeHtml(value) {
 	return String(value ?? "").replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch]);
 }
 
+// 全站唯一一处 matchMedia：目录跳转的平滑滚动是这套 UI 里唯一的动效，用户关了动效就别硬滚。
+// 每次现查而不缓存——系统偏好可以在页面开着的时候改
+function prefersReducedMotion() {
+	return typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
+}
+
 function formatCny(amount) {
 	const n = Number(amount) || 0;
 	return Number.isInteger(n) ? `¥${n}` : `¥${n.toFixed(2)}`;
@@ -1494,7 +1500,9 @@ function reportTocHtml(toc) {
 	if (!toc.length) return "";
 	// 目录项用 button 而不是 <a href="#...">：改 location.hash 会触发 hashchange，
 	// 被路由当成一次导航——页面跳走、弹窗被自己的 onHashChange 关掉
-	const links = toc.map((item) => `<button type="button" class="report-toc-link is-level${item.level}" data-target="${escapeHtml(item.id)}">${escapeHtml(item.text)}</button>`).join("");
+	// title 补的是被 text-overflow: ellipsis 截掉的那部分，给鼠标用户看。<button> 有文本内容时
+	// 可访问名取的是文本内容、title 只在没有别的名字时才兜底，所以加了不会盖掉读屏读到的名字
+	const links = toc.map((item) => `<button type="button" class="report-toc-link is-level${item.level}" data-target="${escapeHtml(item.id)}" title="${escapeHtml(item.text)}">${escapeHtml(item.text)}</button>`).join("");
 	return `<nav class="report-toc">${links}</nav>`;
 }
 
@@ -1520,7 +1528,7 @@ function buildReportOverlayHtml(result, rendered) {
 			</div>
 			<div class="report-modal-body">
 				${reportTocHtml(rendered.toc)}
-				<article class="report-doc" id="report-doc" tabindex="0" role="region" aria-label="报告正文">${rendered.html}</article>
+				<article class="report-doc" id="report-doc" tabindex="0" role="region" aria-label="报告正文">${rendered.html || `<div class="empty-note">报告内容为空——请回 pi 会话用 compass_report 复核。</div>`}</article>
 				<pre class="report-source" id="report-source" tabindex="0" role="region" aria-label="Markdown 源码" hidden>${escapeHtml(result.markdown)}</pre>
 			</div>
 		</div>
@@ -1538,13 +1546,16 @@ function openReportOverlay(result, trigger) {
 	const element = document.createElement("div");
 	element.className = "report-overlay";
 	element.innerHTML = buildReportOverlayHtml(result, renderMarkdown(result.markdown));
-	// 只用来取「环的两端」和把跑出去的焦点拽回来，**不是**弹窗内可聚焦元素的穷举名单：
-	// Chrome 会把溢出的可滚动容器（报告里的宽表格 .md-table-wrap 就是，窄窗下必然出现）
-	// 自动纳入 Tab 序列，这类元素没有 tabindex 属性，任何选择器都枚举不到。弹窗内部的环绕
-	// 因此交给首尾哨兵，这里不做首尾判定。
+	// 用来取「环的两端」和把跑出去的焦点拽回来。弹窗里每一个 Tab 停留点现在要么是
+	// button / a[href]，要么带显式 tabindex（#report-doc、#report-source、.md-table-wrap），
+	// 所以这份名单和原生 Tab 序列一一对应——这是 markdown.js 给每张表补 tabindex 换来的。
+	// 在那之前宽表只在 Chrome 里隐式可聚焦、没有 tabindex 属性、任何选择器都枚举不到，名单必然漏项。
+	// 名单里点名 .md-table-wrap 而不是写 [tabindex]：两个 .report-focus-guard 也带 tabindex="0"，
+	// 被枚举进来 items[0] 就成了起始哨兵，弹过去又触发它自己的 focusin——两个哨兵无限互弹。
 	// 每次按 Tab 现算而不是开弹窗时算一次：切到「Markdown 源码」视图会把 nav.report-toc 与
-	// #report-doc 设 hidden，藏起来的目录按钮与正文链接此刻必须退出名单；条目数也随报告而变
-	const focusables = () => [...element.querySelectorAll("button, a[href], #report-doc, #report-source")].filter((el) => !el.closest("[hidden]"));
+	// #report-doc 设 hidden，藏起来的目录按钮、正文链接与正文里的表格此刻必须退出名单；
+	// 条目数也随报告而变
+	const focusables = () => [...element.querySelectorAll("button, a[href], #report-doc, #report-source, .md-table-wrap")].filter((el) => !el.closest("[hidden]"));
 	const onKeydown = (event) => {
 		if (event.key === "Escape") {
 			closeReportOverlay();
@@ -1552,8 +1563,9 @@ function openReportOverlay(result, trigger) {
 		}
 		if (event.key !== "Tab") return;
 		// 焦点还在弹窗里就一概放行原生 Tab，边界由首尾哨兵接管。别在这里按名单判首尾：
-		// 焦点完全可能停在名单外的元素上（见 focusables 的注释），那时若强行弹回名单端点，
-		// 环会被截成两个互不相通的圈——正文后半段正向再也走不到，反向则在末几项里打转
+		// 焦点仍可能停在名单外的元素上（将来往正文里塞进新的隐式可聚焦元素就会），
+		// 那时若强行弹回名单端点，环会被截成两个互不相通的圈——正文后半段正向再也走不到，
+		// 反向则在末几项里打转
 		if (element.contains(document.activeElement)) return;
 		const items = focusables();
 		if (!items.length) return;
@@ -1564,12 +1576,12 @@ function openReportOverlay(result, trigger) {
 	reportOverlay = { element, onKeydown, onHashChange, previouslyFocused };
 	document.body.appendChild(element);
 	// 原生 Tab 走到弹窗边界时会先落到哨兵上，这里再把它弹回另一端。这样环绕不依赖
-	// 「弹窗里有哪些可聚焦元素」这份注定会漏的名单，新往正文里塞什么都不用改这段。
-	// 已知的单向缺口：落点仍取自 focusables()，而窄窗下 DOM 末尾可能是名单枚举不到的溢出表格
-	// （.md-table-wrap），于是排在最后一个链接之后的宽表只能正向 Tab 走到、反向走不到。
-	// 不把 .md-table-wrap 补进名单是刻意的：它没有 tabindex，只有 Chrome 会自动让它可聚焦，
-	// Firefox / Safari 里对它 focus() 是空操作，焦点会卡死在哨兵上、下一次 Shift+Tab 直接逃出
-	// 弹窗——那比单向缺口严重得多。真要补，得连带给它加 tabindex 并重跑一轮跨浏览器验证
+	// 「弹窗里有哪些可聚焦元素」这份名单的完整性，往正文里塞新东西不用改这段。
+	// 从前记在这里的单向缺口（窄窗下 DOM 末尾的 .md-table-wrap 正向走得到、反向走不到）
+	// 已经关掉：markdown.js 给每张表都补了 tabindex="0" + role/aria-label，它现在既在原生
+	// 序列里、也在 focusables() 里，两端取值与原生序列一致。当初不补是因为它没有 tabindex 时
+	// 只有 Chrome 会自动让它可聚焦，Firefox / Safari 里对它 focus() 是空操作、焦点会卡死在
+	// 哨兵上——补 tabindex 正是为了消掉这个跨浏览器分歧，别把它删回去
 	element.addEventListener("focusin", (event) => {
 		const guard = event.target.dataset?.reportGuard;
 		if (!guard) return;
@@ -1583,16 +1595,24 @@ function openReportOverlay(result, trigger) {
 	element.querySelector("#report-doc").focus();
 	document.addEventListener("keydown", onKeydown);
 	window.addEventListener("hashchange", onHashChange);
-	// 只有「按下」和「松开」都落在遮罩本身（弹窗以外的暗区）才关闭。
-	// 只判 click 的 target 是不够的：在正文里按住拖选文字、把光标甩出弹窗边框再松手，
-	// click 的 target 就是遮罩——报告会在选到一半时突然关掉、选区一起没
+	// 只有「按下」和「松开」都落在遮罩本身（弹窗以外的暗区）才关闭，两端各记一次。
+	// click 的 target 是 mousedown 与 mouseup 的最近公共祖先，所以它一个人分辨不出方向：
+	// 正文里按住拖选、把光标甩出弹窗再松手，target 是遮罩；反过来从暗区起手拖进正文里松手，
+	// target 同样是遮罩。只判 click、或只判 click 加 mousedown，都会在其中一个方向上误关——
+	// 报告在选到一半时突然消失、选区一起没
 	let pressedOnBackdrop = false;
+	let releasedOnBackdrop = false;
 	element.addEventListener("mousedown", (event) => {
 		pressedOnBackdrop = event.target === element;
 	});
-	element.addEventListener("click", (event) => {
-		if (pressedOnBackdrop && event.target === element) closeReportOverlay();
+	element.addEventListener("mouseup", (event) => {
+		releasedOnBackdrop = event.target === element;
+	});
+	element.addEventListener("click", () => {
+		// 键盘触发的 click（Enter / 空格）没有 mousedown / mouseup，两个标志都是 false，天然不误触
+		if (pressedOnBackdrop && releasedOnBackdrop) closeReportOverlay();
 		pressedOnBackdrop = false;
+		releasedOnBackdrop = false;
 	});
 
 	const doc = element.querySelector("#report-doc");
@@ -1609,7 +1629,12 @@ function openReportOverlay(result, trigger) {
 		if (toc) toc.hidden = showSource;
 		sourceBtn.textContent = showSource ? "渲染视图" : "Markdown 源码";
 		// 焦点可能正停在刚被 hidden 的目录按钮或正文上，浏览器会把它静默丢回 <body>；
-		// 主动送进新露出的那块，键盘与读屏都能接着往下读
+		// 主动送进新露出的那块，键盘与读屏都能接着往下读。
+		// 这次 focus() 同时兼任状态播报——两块面板各有 role="region" + aria-label，读屏会念出
+		// 「Markdown 源码 区域」。所以这个按钮**刻意不做成 aria-pressed 的切换按钮**：切换按钮的
+		// 可访问名必须恒定（名字指代被切换的东西，按下状态才携带开 / 关），而这里文案是在翻的，
+		// 「渲染视图 + 已按下」字面意思是「渲染视图已开启」，正好和实际状态相反，比不加更误导；
+		// 想靠 aria-label 固定名字又会违反 WCAG 2.5.3 Label in Name，语音控制说「点击 渲染视图」会失败
 		(showSource ? source : doc).focus();
 	});
 
@@ -1628,13 +1653,48 @@ function openReportOverlay(result, trigger) {
 	});
 
 	if (toc) {
+		const tocLinks = [...toc.querySelectorAll(".report-toc-link")];
+		const setActive = (link) => {
+			for (const el of tocLinks) {
+				const active = el === link;
+				el.classList.toggle("is-active", active);
+				// 光靠 class 高亮，读屏用户不知道自己读到哪一章了——状态得进语义层
+				if (active) el.setAttribute("aria-current", "true");
+				else el.removeAttribute("aria-current");
+			}
+		};
 		toc.addEventListener("click", (event) => {
 			const link = event.target.closest(".report-toc-link");
 			if (!link) return;
 			const target = doc.querySelector(`[id="${link.dataset.target}"]`);
-			if (target) target.scrollIntoView({ behavior: "smooth", block: "start" });
-			for (const el of toc.querySelectorAll(".report-toc-link")) el.classList.toggle("is-active", el === link);
+			if (target) {
+				// 焦点跟着滚动一起过去，否则键盘用户点完目录还要再 Tab 十几下才摸到正文。
+				// tabindex="-1" 只让标题能被脚本聚焦，不把它塞进 Tab 序列
+				target.tabIndex = -1;
+				target.scrollIntoView({ behavior: prefersReducedMotion() ? "auto" : "smooth", block: "start" });
+				target.focus({ preventScroll: true });
+			}
+			setActive(link);
 		});
+		// 高亮跟随滚动：只在点击时更新的话，用户手动滚过几章之后高亮还钉在上次点的那条。
+		// root 取 #report-doc 而不是视口——报告是在它自己的滚动容器里滚的
+		if (typeof IntersectionObserver === "function") {
+			const headings = tocLinks.map((link) => doc.querySelector(`[id="${link.dataset.target}"]`));
+			const visible = new Set();
+			const observer = new IntersectionObserver((entries) => {
+				// 切到「Markdown 源码」视图会把 #report-doc 整个设 hidden，所有标题同时离开视口。
+				// 不挡住这一格，高亮会被清空，切回渲染视图时目录一片空白
+				if (doc.hidden) return;
+				for (const entry of entries) {
+					if (entry.isIntersecting) visible.add(entry.target);
+					else visible.delete(entry.target);
+				}
+				// 取当前可见的最靠前那条：视口里同时露出两三个小节时，高亮应该跟着最上面那个
+				const index = headings.findIndex((heading) => heading && visible.has(heading));
+				if (index >= 0) setActive(tocLinks[index]);
+			}, { root: doc, rootMargin: "0px 0px -70% 0px" });
+			for (const heading of headings) if (heading) observer.observe(heading);
+		}
 	}
 }
 

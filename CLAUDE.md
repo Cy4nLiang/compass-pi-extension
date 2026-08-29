@@ -37,6 +37,15 @@ Web UI（`web/` 目录，TUI 之外的第二套前端，读同一个 store）：
 
 新增工具时：在 `index.ts` 同时更新 `DOMAIN_TOOLS` 与 `TOOL_CATALOG`（`compass_tools` 的动态激活检索依赖后者），并同步 README 工具表与 SKILL.md。
 
+## 写路径与并发（踩过的坑，改写事务前必读）
+
+- **写事务禁止嵌套**：`mutateStore`（宿主 `withFileMutationQueue`）、Web 的 `writeChain`、`store.json.lock` 三层串行都没有重入检测。在 mutator 内再开一次写事务，队列侧自等待、永久挂死且无超时；文件锁侧因「自己的 pid 存活 ⇒ 永不判 stale」空转满 10 秒后抛出误导性的「被其他进程锁定」，把排障引向跨进程冲突。读文件、查重、CSV 解析、归档等准备工作一律放在事务外（`importer.ts` 即此形状）。
+- **抢锁自旋的 `await delay(50)` 必须保持默认 ref、绝不 unref**：调用方正在 await 这次写入，unref 会让 event loop 一空就退出、pending 的写静默丢失。node:test 报「Promise resolution is still pending but the event loop has already resolved」就是此病——别去加大超时或重跑 CI。代价是进程退出最多被在途写拖 10 秒（抢锁 deadline 兜底），属刻意接受的正确语义；要缩短宿主关停等待只能在**关停侧**做——`web/server.ts` 的 `close()` 用 unref 的 3 秒定时器 race 写队列，放弃等待但不打断写。
+- **Web 侧一切写入走 `enqueueWrite` 串行队列**（含逻辑上只读的市场报告落盘），新增写端点不得直接调 `repo.update`——文件锁只跨进程互斥，同进程并发写只会互相抢锁重试。关停顺序固定为先 `server.close()` 停 accept（drain 期间不再有新写排进队尾）、再排空写队列（3 秒兜底），不得掐断在途写事务。
+- **新增 Web 写端点必须登记进 `server.ts` 的 `WRITE_PATHS`**：本服务无鉴权，POST-only 判定与「Content-Type 必须 application/json + Origin 限回环」这道跨站防线只挂在该白名单命中的那个分支上。在只读分支旁另起 `if (pathname === …)` 自行读 body 写事务照样功能正常，却静默丢掉全部写侧防护（测试只硬编码了现有路径，抓不到漏登记）。
+- **快照明细（`listings` / `keywords`）不进 store.json**，导入时一次性写进 `.pi/compass/snapshots/<id>.json` sidecar，store 只留元数据。给 `MarketSnapshot` 加字段必须同步登记进 `store.ts` 的 `emptySnapshotPayload` 白名单（否则每次 save 静默抹掉）；改已导入快照的明细必须新建 snapshot id（`persistSnapshotPayload` 见文件已存在即跳过写入）。sidecar 内容 load 时只做整体 `as` 强转、`assertStore` 不逐条校验，消费侧在 sort / slice / `toFixed` 之前必须自行 `Number.isFinite` / `typeof` 过滤——坏 rank 会按原位挤占 top-N 席位，字符串数值会让前端抛错。
+- **给 `assertStore` 加新硬校验前必须先确认存量 store 能通过**（新增字段一律可选 + `ensureDefaults` 回填）：load 与 save 跑的是同一份 `assertStore`，一条不合规的老记录会让 store 既读不出也写不进、扩展直接砖化，且失败被包成 StoreIoError 后只显示「读取罗盘数据失败」，看着像文件损坏而不是自己刚加的校验太严。这与上面「架构」里的回滚兼容互为反方向，向前向后两个方向都要守。
+
 ## 领域不变式（有测试守护，改动不得破坏）
 
 - 缺失硬指标 → 结论为 `review`，绝不把缺数据伪装成 pass。
@@ -47,13 +56,14 @@ Web UI（`web/` 目录，TUI 之外的第二套前端，读同一个 store）：
 - 候选池措辞统一为「七个工作阶段 + archived 归档」（CANDIDATE_STAGES 共 8 个值），不要写成「八阶段」。
 - 利润输入中大于 1 的百分比一律拒绝（`economics.ts`）。
 - Lesson 必须挂非空且可解析的 evidence；OutcomeCheck 缺少新快照或数字实绩时 verdict 只能是 `inconclusive`，不得伪装成 `validated`。
-- hook 只做本地只读计算、展示增强和上下文注入；不得在 hook 中开启 store 写事务。历史速览 ≤12 行，工具历史尾注 ≤8 行，压缩台账 ≤20 行。
+- 热路径 hook（before_agent_start / tool_call / tool_result / session_before_compact）只做只读计算、展示增强、上下文注入与调用拦截，绝不开 store 写事务；只有 `session_start`（ensureDefaults 回填）与 `session_shutdown`（兜底落账）两个生命周期 hook 例外，且写入必须包在 `withFileMutationQueue` 内串行落盘。历史速览 ≤12 行，工具历史尾注 ≤8 行，压缩台账 ≤20 行。
 - MCP 调用计量遵守同一约束：tool_result hook 只做内存 pending 自增，落账仅在安全点事务内（mutateStore 顺带 / 查看面 flush / session_shutdown 尽力）。
 - 待办是**混合语义**：条目本体永远由 `todo.ts` 派生（唯一所有者，不实体化、不双真相源），但闭环四类（`metric_divergence` / `budget_warning` / `budget_fused` / `deep_missing_data`）另有持久化的处理记录 `store.todoResolutions`，派生层把记录合成到条目上（状态徽标 / 抑制 / 失效浮出）。其余六类仍是「条件解决即消失」。
+- 派生待办 id（`todo_<kind>_<市场/候选/来源>` 拼接）是条目与 `store.todoResolutions.todoId` 之间唯一的关联键，assertStore 只校验它全局唯一、悬空记录一律静默忽略，因此这个字符串本身已是持久化数据格式的一部分：改闭环四类的 id 拼法、kind 取值或实体 id 来源，必须连带迁移存量记录，否则已勾选条目重新浮出、已处理分区留下永久孤儿且全程无报错。
 - 处理记录的状态机（提交 → 验证 → 勾选 → 重开）只能经 `service.ts` 的四个函数迁移；`assertStore` 硬校验「勾选必须存在验证通过的末轮 + 该类水位锚点」，杜绝未经验证的已处理——同 OutcomeCheck「无证据不得非 inconclusive」。
 - 处理动作**不写 decisionLog**：旧版 assertStore 对 `decisionLog.type` 是严格白名单，新增取值会让回滚后的 store 打不开。审计链由记录自身承载（每个动作含 actor / 时间 / 说明或理由），`history.ts` 在**读侧**合并成时间线事件。
 - 抑制必须带失效水位（预算=月份、偏差=参与比较的快照集合指纹、深研=本次进入 deep_research 的周期）：水位失效即重新浮出。派生层只读判定、绝不改写记录；错位的最坏情况必须是「多提醒一次」，绝不能是漏提醒。
-- 验证只在 pi 会话由 agent 执行（Web 端无 LLM 通道，故 Web 只有 submit/complete/reopen 三个写端点，没有 verify）。深研类的代码硬门槛（四指标齐备 + 该市场有利润测算）在 service 层前置，不满足时 `verdict=pass` 直接拒绝落库。
+- 验证只在 pi 会话由 agent 执行（`compass_todo action=verify`）：Web 端无 LLM 通道，待办闭环在 Web 侧只有 submit/complete/reopen，不得新增 verify 端点（Web 写端点共 7 条，另四条是 pool/move、pool/decide、import、report）。深研类的代码硬门槛（四指标齐备 + 该市场有利润测算）在 service 层前置于任何写入，不满足时 `verdict=pass` 直接拒绝落库。
 
 ## 文档与数据卫生
 

@@ -2302,30 +2302,39 @@ function buildImportWizardHtml() {
 	`;
 }
 
-function fileRowHtml(file, isSelected) {
+// 这一排是「从 compass-imports/ 里挑一个文件」的单选。用真的 <input type="radio"> 而不是
+// 挂了 click 的 <div>：后者键盘完全够不着（全站扫描下来这里曾是唯一一处），而原生单选还
+// 白拿到方向键在组内移动、整组只占一个 Tab 停留点、读屏能念出「第 2 项，共 5 项」。
+// radio 铺满整行并 pointer-events: none，是为了让键盘聚焦时滚动落到这一行本身而不是列表顶部；
+// 点击照旧穿透给 <label>，由 for 转发回 radio。
+function fileRowHtml(file, isSelected, index) {
 	const sizeKb = (file.size / 1024).toFixed(1);
+	const id = `import-file-${index}`;
 	return `
-		<div class="import-file-row ${isSelected ? "is-selected" : ""}" data-path="${escapeHtml(file.path)}">
-			${ICON_FILE}
-			<div style="min-width:0; flex:1 1 auto;">
-				<div class="mono cell-truncate" style="font-size:12px; color:var(--c-text);">${escapeHtml(file.name)}</div>
-				<div class="cell-muted" style="font-size:11px;">${sizeKb} KB · 修改于 ${escapeHtml(formatDateTime(file.mtime))}</div>
-			</div>
-			${isSelected ? ICON_CHECK : ""}
+		<div class="import-file-item">
+			<input type="radio" class="import-file-radio" name="import-file" id="${id}" value="${escapeHtml(file.path)}"${isSelected ? " checked" : ""}>
+			<label class="import-file-row ${isSelected ? "is-selected" : ""}" for="${id}" data-path="${escapeHtml(file.path)}">
+				${ICON_FILE}
+				<div style="min-width:0; flex:1 1 auto;">
+					<div class="mono cell-truncate" style="font-size:12px; color:var(--c-text);">${escapeHtml(file.name)}</div>
+					<div class="cell-muted" style="font-size:11px;">${sizeKb} KB · 修改于 ${escapeHtml(formatDateTime(file.mtime))}</div>
+				</div>
+				<span class="import-file-check">${ICON_CHECK}</span>
+			</label>
 		</div>
 	`;
 }
 
 function bindFilePicker(pickerEl, files, state) {
-	const render = () => {
-		pickerEl.innerHTML = `<div class="import-file-list">${files.map((f) => fileRowHtml(f, f.path === state.path)).join("")}</div>`;
-	};
-	render();
-	pickerEl.addEventListener("click", (event) => {
-		const row = event.target.closest(".import-file-row");
-		if (!row) return;
-		state.path = row.dataset.path;
-		render();
+	pickerEl.innerHTML = `<div class="import-file-list" role="radiogroup" aria-label="compass-imports/ 下待导入的 CSV">${files.map((file, index) => fileRowHtml(file, file.path === state.path, index)).join("")}</div>`;
+	// 听 change 而不是 click，且**不重新渲染**：原生单选用方向键在组内移动时只发 change，
+	// 重渲染会把焦点连同整棵 DOM 一起抹掉——键盘用户按一下方向键，焦点就掉回 <body>。
+	// 勾选图标改由 CSS 按 .is-selected 显隐（visibility 而非 display，免得选中时行高跳一下）
+	pickerEl.addEventListener("change", (event) => {
+		const input = event.target.closest(".import-file-radio");
+		if (!input) return;
+		state.path = input.value;
+		for (const row of pickerEl.querySelectorAll(".import-file-row")) row.classList.toggle("is-selected", row.dataset.path === state.path);
 	});
 }
 
@@ -2341,7 +2350,11 @@ function bindImportSourceTabs(content, state) {
 		const isPick = tab.dataset.tab === "pick";
 		pickerWrap.hidden = !isPick;
 		manualWrap.hidden = isPick;
-		// 切走 tab 清空另一侧已选内容：避免同时存在「选中文件」与「手输路径」两个数据源
+		// 切走 tab 清空另一侧已选内容：避免同时存在「选中文件」与「手输路径」两个数据源。
+		// 选择器那侧是原生单选，光清 state 不够——DOM 里的 checked 与高亮会原样留着，
+		// 切回来时界面显示「已选中」而 state 其实是空的，一提交报「未选择文件」，看着像 bug
+		for (const input of pickerWrap.querySelectorAll(".import-file-radio")) input.checked = false;
+		for (const row of pickerWrap.querySelectorAll(".import-file-row")) row.classList.remove("is-selected");
 		state.path = "";
 		manualInput.value = "";
 	});

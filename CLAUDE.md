@@ -46,6 +46,13 @@ Web UI（`web/` 目录，TUI 之外的第二套前端，读同一个 store）：
 - **快照明细（`listings` / `keywords`）不进 store.json**，导入时一次性写进 `.pi/compass/snapshots/<id>.json` sidecar，store 只留元数据。给 `MarketSnapshot` 加字段必须同步登记进 `store.ts` 的 `emptySnapshotPayload` 白名单（否则每次 save 静默抹掉）；改已导入快照的明细必须新建 snapshot id（`persistSnapshotPayload` 见文件已存在即跳过写入）。sidecar 内容 load 时只做整体 `as` 强转、`assertStore` 不逐条校验，消费侧在 sort / slice / `toFixed` 之前必须自行 `Number.isFinite` / `typeof` 过滤——坏 rank 会按原位挤占 top-N 席位，字符串数值会让前端抛错。
 - **给 `assertStore` 加新硬校验前必须先确认存量 store 能通过**（新增字段一律可选 + `ensureDefaults` 回填）：load 与 save 跑的是同一份 `assertStore`，一条不合规的老记录会让 store 既读不出也写不进、扩展直接砖化，且失败被包成 StoreIoError 后只显示「读取罗盘数据失败」，看着像文件损坏而不是自己刚加的校验太严。这与上面「架构」里的回滚兼容互为反方向，向前向后两个方向都要守。
 
+## `.claude/`：Claude Code 侧的开发期护栏
+
+`.claude/` 是**给 Claude Code 会话用的项目级配置**，pi 宿主不读它，与 `skills/compass-selection/`（给 pi 用的运营技能）是两套东西；只对以**本仓库**为工作目录启动的 Claude Code 会话生效（从上层宿主项目根目录启动的会话不加载它）。完整说明与自测/跑分命令见 `.claude/README.md`。
+
+- `settings.json` + `hooks/`：两道 PreToolUse 闸门——`guard-compass-data.sh` 拦对 `.pi/compass/` 与 `compass-imports/` 真实数据的误写，`precommit-gate.sh` 在 `git commit` 前跑 `npm run check && npm run test`（仅当改动含 `.ts`）。两者解析失败一律 fail open。
+- `.claude/skills/secure-store-write/SKILL.md` 把本文件里**写路径 / 持久化 / hook 落盘 / 待办闭环这几个切面的主要硬约束**（注意：不等于这几个切面的全部断言）复述成生成时的检查清单，CLAUDE.md 仍是唯一真相源。已镜像的有：上面「写路径与并发」整节；「架构」段的原子写与权限位、`resolveInputPath` / `resolveOutputPath`、顶层集合的 `ensureDefaults` 迁移、报告只落 `.md`；「领域不变式」里 hook 落盘与展示预算、MCP 计量、decisionLog 白名单、派生待办 id 与状态机迁移函数、Web 写端点条数。**两边互相都不是封闭名单**——未被镜像的（如勾选侧 `assertStore` 硬校验、深研写入的前置硬门槛）照样是不变式。改到上述任一切面时一律回看 SKILL.md §0–§8 做同步，再跑 `.claude/skills/secure-store-write/evals/` 那 5 条回归用例。
+
 ## 领域不变式（有测试守护，改动不得破坏）
 
 - 缺失硬指标 → 结论为 `review`，绝不把缺数据伪装成 pass。

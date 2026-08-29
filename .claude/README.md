@@ -5,13 +5,18 @@
 
 | 目录 | 作用 | 何时生效 |
 | --- | --- | --- |
-| `settings.json` + `hooks/` | 两道 PreToolUse 闸门 | 每次工具调用，自动 |
+| `settings.json` + `hooks/` | 两道 PreToolUse 闸门 | guard 走 Edit / Write / NotebookEdit / Bash，precommit-gate 只走 Bash（仅限在本仓库内启动的会话） |
 | `skills/secure-store-write/` | 写路径硬约束，生成时就守 | 模型判断相关时自动加载 |
 | `skills/secure-store-write/evals/` | 5 个回归用例，防技能被改坏 | 手动 / CI |
 
 ## 1. Hooks
 
 `settings.json` 注册两个 PreToolUse hook，都是仓库内可见、可审、可改的普通脚本：
+
+**作用域：只对以本仓库为工作目录启动的 Claude Code 会话生效。** 这是 project-level settings，
+从上层宿主项目根目录启动的会话读不到这份配置，两道闸一道都不在——而 `guard-compass-data.sh`
+要保护的 `.pi/compass/` 与 `compass-imports/` 恰恰位于宿主项目根下。这不是缺陷（代码工作本来
+就该在本目录内起会话），但别把它当成「装了就全局生效」的护栏。
 
 ### `hooks/guard-compass-data.sh` — 挡经营数据被误改
 
@@ -32,7 +37,14 @@
 加起来约 5 秒——比让坏提交进 CI（Node 22/24 两个矩阵）便宜得多。
 
 - 只在暂存区或工作区有 `.ts` 改动时才跑；纯文档 / 纯资源提交直接放行。
-- 找不到 `npm` 时 fail open，跳过门禁。
+- 工具链缺失时 fail open：找不到 `npm`，或探不到 `node_modules/.bin/tsc`（新克隆还没 `npm install`、
+  `node_modules` 是空目录、装到一半连 tsc 都没解包；`typescript` 是 devDependency，`--omit=dev` 装出的
+  依赖树同样命中这条）。不跳过的话 `tsc` 不存在会被这道闸报成「测试没过」，把排障指向完全错误的方向。
+  **判据只探 tsc 这一个点**：tsc 恰好先落地而别的包还没解包完时仍会走下去按「测试没过」拦，此时把
+  `npm install` 跑完再提交。
+- 除此之外还有一批**不打印任何提示**的静默放行：没装 `jq`、项目根解析或 `cd` 失败、找不到 `package.json`，
+  以及 `git` 不可用或当前不在 git 仓库里——那时取不到改动清单，会被当成「没有 `.ts` 改动」一并放行。
+- 跳过原因只写在脚本 stderr 上；hook 以 0 退出时会话里看不到它，手动跑下面的自测才可见。
 
 自测（不需要真的提交）：
 
@@ -40,14 +52,15 @@
 printf '%s' '{"tool_name":"Edit","tool_input":{"file_path":"/x/.pi/compass/store.json"}}' \
   | bash .claude/hooks/guard-compass-data.sh; echo "rc=$?   # 期望 2"
 CLAUDE_PROJECT_DIR="$PWD" bash .claude/hooks/precommit-gate.sh \
-  <<< '{"tool_name":"Bash","tool_input":{"command":"git commit -m wip"}}'; echo "rc=$?   # 期望 0（当前代码是绿的）"
+  <<< '{"tool_name":"Bash","tool_input":{"command":"git commit -m wip"}}'; echo "rc=$?   # 期望 0（放行；工作区若无 .ts 改动会直接跳过，并不会真的跑 check/test）"
 ```
 
 想临时停用：把 `settings.json` 里对应的那段删掉，或整体改名为 `settings.json.off`。
 
 ## 2. Skill：`secure-store-write`
 
-把 `CLAUDE.md` 里「写路径与并发（踩过的坑）」那一节从**读后知道**变成**生成时守住**：模型在改写事务、
+把 `CLAUDE.md` 里写路径这一切面的硬约束（主体是「写路径与并发（踩过的坑）」一节，另含「架构」段的持久化
+约定与「领域不变式」里若干条，范围口径见 `CLAUDE.md` 的「`.claude/`」小节，逐条以下面 §0–§8 为准）从**读后知道**变成**生成时守住**：模型在改写事务、
 Web 写端点、hook 落盘、store 字段或 `assertStore` 时自动加载，按条对照后再动手。
 
 `CLAUDE.md` 仍是唯一真相源；技能是它在写路径这一个切面上的可执行版本。**两边改了要同步**——
@@ -65,7 +78,8 @@ Web 写端点、hook 落盘、store 字段或 `assertStore` 时自动加载，�
 | `assert-store-compat` | `assertStore` 加校验会让存量 store 砖化 |
 | `hot-path-hook-write` | 热路径 hook 绝不开写事务 |
 
-跑之前要先开早期访问开关（`claude plugin eval` 目前是 early access）：
+跑之前要先开早期访问开关（`claude plugin eval` 目前是 early access）。下面三条命令都带 `--no-publish`：
+用例提示词与 HTML 报告里含本仓库的架构与写路径细节，只留在本地，不要发布到 claude.ai。
 
 ```bash
 export CLAUDE_CODE_WALNUT_SPIRE=1
@@ -79,10 +93,11 @@ claude plugin eval .claude/skills/secure-store-write \
   --ablation none --threshold 0.75 --no-publish
 
 # 看技能相对「没有技能」的增量（成本翻倍）
-claude plugin eval .claude/skills/secure-store-write --ablation with-without --runs 1
+claude plugin eval .claude/skills/secure-store-write --ablation with-without --runs 1 --no-publish
 ```
 
-**什么时候必须跑**：改 `SKILL.md`、改 `CLAUDE.md` 的写路径章节、改 hook 脚本之后。
+**什么时候必须跑**：改 `SKILL.md`、改 hook 脚本，或改 `CLAUDE.md` 里被 `SKILL.md` 镜像的任一处之后
+（范围口径见 `CLAUDE.md` 的「`.claude/`」小节，不止「写路径与并发」一节；逐条以 `SKILL.md` §0–§8 为准）。
 低于 `--threshold` 会以退出码 1 结束，可直接接进 CI。`skill-fired` 这条 grader 标了 `arm: with-only`，
 在消融模式下只作为「技能确实触发了」的指示器，不计入分数。
 

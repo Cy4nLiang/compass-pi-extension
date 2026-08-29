@@ -143,7 +143,7 @@ description: Amazon US 中小卖家精铺选品工作流。用于市场 CSV 导�
 
 - `/compass`：六页 TUI（总览/待办/市场/候选池/预算/复盘）；待办页只读展示处理状态徽标与驳回理由，不提供操作入口；
 - `compass_todo action=list resolution_status=submitted`：待验证队列（验证入口，见上节）；
-- `/compass-web [端口|stop]`：浏览器版工作台（多市场档案、导入向导、候选卡全屏决策页），仅本机可访问，不要转发到局域网/公网；也可脱离 pi 用 `npm run web` 独立启动；
+- `/compass-web [端口|stop]`：浏览器版工作台（多市场档案、导入向导、候选卡全屏决策页、五维报告弹窗），仅本机可访问，不要转发到局域网/公网；也可脱离 pi 用 `npm run web` 独立启动；
 - `/compass-import <csv>`：交互导入；
 - `/compass-report [market]`：生成并在会话中展示报告；
 - `/compass-strategy`：版本化编辑 YAML；

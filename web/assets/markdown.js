@@ -4,11 +4,21 @@
 // 这不是通用 Markdown 实现，覆盖范围严格对齐 report.ts 实际会生成的语法——
 // ATX 标题、引用块、无序/有序列表、GFM 表格（含 `---:` 对齐与 `\|` 转义单元格）、
 // 分隔线、段落，行内支持 **粗体** / *斜体* / `代码` / [文本](链接)。
+//
+// 刻意不支持（report.ts 不生成，也别去生成——括号里是实测的退化行为）：
+// - 嵌套列表（2 空格缩进被拉平成同级 <li>，4 空格缩进直接掉出列表变段落，都与 GitHub 不一致）
+// - 围栏代码块 ```（整段当普通段落，反引号原样显示）
+// - setext 标题（`标题\n====` 变段落）
+// - 下划线强调 __粗__ / _斜_（原样输出）
+// - ***三星号***（渲染成 <strong>*…</strong>*，漏出裸的 *；单独一行的 *** 是分隔线）
+// 生成侧新增语法前先回这里对表：落盘的 .md 还要过 GitHub 与 pi TUI（marked）两个渲染器，
+// 三方行为不一致的语法一律不用。
 // 前端零构建、零运行时依赖的约定延伸到这里：不引第三方 Markdown 库，也不走 CDN
 // （工作台只绑回环地址，必须能离线打开）。
 //
 // 安全边界（改动前必读）：报告正文里混着市场名、差评痛点、决策理由等用户自由文本，
-// 因此**先整体 HTML 转义、再套我们自己生成的标签**，任何输入都不可能注入元素；
+// 因此**先整体 HTML 转义、再套我们自己生成的标签**，任何输入都不可能注入**渲染出的 html**；
+// 注意这条只覆盖返回值的 html 那一半，toc[].text 是未转义的纯文本，见 renderMarkdown 的 JSDoc；
 // 链接只放行 http/https/mailto，其余（javascript:、data: 等）原样退回成纯文本。
 // 顺序反过来（先套标签再转义）会把生成的标签一起转义掉，先转义再拼是唯一正确的方向。
 
@@ -154,7 +164,7 @@ function isBlockStart(line) {
 	return HR_RE.test(line) || HEADING_RE.test(line) || QUOTE_RE.test(line) || UL_RE.test(line) || OL_RE.test(line) || TABLE_ROW_RE.test(line);
 }
 
-function renderTable(lines, start) {
+function renderTable(lines, start, section) {
 	const header = splitRow(lines[start]);
 	const aligns = splitRow(lines[start + 1]);
 	let index = start + 2;
@@ -171,7 +181,17 @@ function renderTable(lines, start) {
 		for (let i = 0; i < width; i++) tds.push(`<td${alignClass(aligns[i])}>${renderInline(cells[i] ?? "")}</td>`);
 		return `<tr>${tds.join("")}</tr>`;
 	}).join("");
-	const html = `<div class="md-table-wrap"><table class="md-table"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
+	// 横向溢出的表格必须自己进 Tab 序列：只有 Chrome 会隐式把溢出的滚动容器变成焦点目标，
+	// Firefox / Safari 不会——不加 tabindex，那两个浏览器里宽表只能用鼠标滚。
+	// role + aria-label 是配套的：缺了名字，焦点落到这里在读屏里就是「焦点凭空消失了」。
+	// 名字取「所在小节 · 表头首列」而不是统一写死——报告固定九章有 ≥5 张表，同名 region 会把读屏的
+	// 地标列表塞满。只取表头首列还不够：五维证据下 D1–D5 各有一张表、首列都叫「指标」，实测撞名 5 次。
+	// 不按「是否真的溢出」区分：那要量 scrollWidth，而本模块的约定是纯函数、不碰 DOM
+	// （还得挂 resize 重算，弹窗宽度是 min(1120px, 100%)）。代价是最多多几个 Tab 停留点，
+	// 换来三个浏览器行为一致、以及 app.js 那份哨兵名单能和原生 Tab 序列一一对应
+	const head0 = (header[0] ?? "").replaceAll("\\|", "|").replace(/[*`_]/g, "").trim() || "报告";
+	const caption = `${section ? `${section} · ` : ""}${head0} 表格（可横向滚动）`;
+	const html = `<div class="md-table-wrap" tabindex="0" role="region" aria-label="${escapeHtml(caption)}"><table class="md-table"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
 	return [html, index];
 }
 
@@ -226,7 +246,8 @@ function renderBlocks(lines, toc) {
 			continue;
 		}
 		if (TABLE_ROW_RE.test(line) && index + 1 < lines.length && isTableDelimiter(lines[index + 1])) {
-			const [html, next] = renderTable(lines, index);
+			// toc 末项就是这张表所在的那一节（引用块里 toc 为 null，退化成只用表头首列命名）
+			const [html, next] = renderTable(lines, index, toc && toc.length ? toc[toc.length - 1].text : "");
 			out.push(html);
 			index = next;
 			continue;
@@ -260,6 +281,14 @@ function renderBlocks(lines, toc) {
 
 /**
  * 把报告 Markdown 渲染成 HTML，并抽出 h2/h3 小目录。
+ *
+ * 返回值的两半**安全等级不同**：
+ * - `html` 已整体 HTML 转义，可以直接 innerHTML；
+ * - `toc[].text` 是 stripInline 之后的**纯文本原文、未做 HTML 转义**，调用方插进 DOM 之前
+ *   必须自己转（app.js 的 reportTocHtml 用的是 `escapeHtml(item.text)`）。这里不预先转义，
+ *   是因为目录文字也可能被拿去做 title / aria-label 等纯文本用途，预转义会让那些场景
+ *   显示出 &amp;lt; 这类实体。
+ *
  * @param {string} markdown
  * @returns {{ html: string, toc: Array<{ id: string, level: number, text: string }> }}
  */

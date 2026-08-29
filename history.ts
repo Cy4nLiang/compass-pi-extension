@@ -15,6 +15,9 @@ import type {
 	StrategyEvaluation,
 	StrategyRun,
 } from "./types.ts";
+// 复盘报告与市场报告共用同一套「自由文本进 Markdown」的转义规则，别再内联复制一份。
+// report.ts 只 import type，反向无依赖，不成环。
+import { escapeCell } from "./report.ts";
 
 const DAY_MS = 86_400_000;
 
@@ -881,15 +884,19 @@ export function renderRetroReport(store: CompassStore, generatedAt = new Date().
 		const market = store.markets.find((item) => item.id === check.marketId);
 		const evidence = check.evidenceSnapshotId ?? (check.actuals ? `实绩：日销${check.actuals.dailyUnits ?? "—"}/净利${typeof check.actuals.netMargin === "number" ? `${(check.actuals.netMargin * 100).toFixed(1)}%` : "—"}` : "缺证据");
 		const delta = check.deltas.filter((item) => item.direction !== "flat").slice(0, 3).map(formatDelta).join("；") || check.verdictReason;
-		lines.push(`| ${check.createdAt.slice(0, 10)} | ${market?.name ?? check.marketId}${check.candidateId ? ` / ${check.candidateId}` : ""} | ${check.decisionStatus ?? "策略结论"} · ${check.baselineSnapshotId} | ${evidence} | **${check.verdict}** | ${delta.replaceAll("|", "\\|")} |`);
+		// 市场名与 evidence 原先完全没转义：名字里一个 | 就能把整行错列。
+		lines.push(`| ${check.createdAt.slice(0, 10)} | ${escapeCell(market?.name ?? check.marketId)}${check.candidateId ? ` / ${check.candidateId}` : ""} | ${check.decisionStatus ?? "策略结论"} · ${check.baselineSnapshotId} | ${escapeCell(evidence)} | **${check.verdict}** | ${escapeCell(delta)} |`);
 	}
 	if (!checks.length) lines.push("| — | — | — | — | 尚无复盘记录 | — |");
 	lines.push("", "## 3. 错杀与漏放", "");
 	if (challenged.length) {
+		// 市场名与 verdictReason 原先拼在同一行、且市场名被模板的 **…** 包着，
+		// 与 report.ts 第 1 / 9 章是同一个跨字段配对形状，而且两个字段一个都没转义。
+		lines.push("| OutcomeCheck | 市场 | 判断 | 理由 |", "|---|---|---|---|");
 		for (const check of challenged) {
 			const market = store.markets.find((item) => item.id === check.marketId);
 			const label = check.decisionStatus === "no_go" ? "疑似错杀，建议重新入池" : check.decisionStatus === "go" ? "go 实绩失败，需归因与退出判断" : "结论受到挑战，需人工复看";
-			lines.push(`- **${market?.name ?? check.marketId}**（${check.id}）：${label}；${check.verdictReason}`);
+			lines.push(`| \`${check.id}\` | ${escapeCell(market?.name ?? check.marketId)} | ${label} | ${escapeCell(check.verdictReason)} |`);
 		}
 	} else lines.push("- 暂无 challenged 记录；inconclusive 不计为验证成功。");
 	lines.push("", "## 4. 策略校准建议", "");
@@ -898,8 +905,14 @@ export function renderRetroReport(store: CompassStore, generatedAt = new Date().
 	} else lines.push("- 当前没有足够的 challenged × rule 证据支持调阈值；不要凭单个案例修改策略。");
 	for (const row of stats.byStrategy) lines.push(`- ${row.strategy}：准确率 ${percent(row.accuracy)}（validated ${row.validated} / challenged ${row.challenged} / inconclusive ${row.inconclusive}）。`);
 	lines.push("", "## 5. 新沉淀经验", "");
-	if (reportLessons.length) for (const lesson of reportLessons.slice(0, 30)) lines.push(`- **${lesson.id}｜${lesson.title}**：${lesson.detail}（evidence: ${lesson.evidence.join("、")}）`);
-	else lines.push("- 本次尚未沉淀 Lesson。经验必须由复盘产生、挂非空 evidence，并经用户确认后保存。");
+	if (reportLessons.length) {
+		// 与 report.ts 第 9 章同款：title 曾被模板的 **…** 包住会提前闭合并把 detail 一起加粗，
+		// 且两个自由文本字段同行。各进一格即根治，顺带补上原先完全缺失的转义。
+		lines.push("| 经验卡 | 结论 | 说明 | evidence |", "|---|---|---|---|");
+		for (const lesson of reportLessons.slice(0, 30)) {
+			lines.push(`| \`${lesson.id}\` | ${escapeCell(lesson.title)} | ${escapeCell(lesson.detail)} | ${lesson.evidence.map((id) => `\`${id}\``).join("、")} |`);
+		}
+	} else lines.push("- 本次尚未沉淀 Lesson。经验必须由复盘产生、挂非空 evidence，并经用户确认后保存。");
 	lines.push("", "## 6. 下一步", "");
 	if (due.length) for (const item of due.slice(0, 30)) lines.push(`- [ ] ${item.marketName}（${item.group}，逾期 ${item.overdueDays} 天）：${item.suggestedAction}`);
 	else lines.push("- [x] 当前没有到期复盘对象。");

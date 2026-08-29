@@ -1479,11 +1479,15 @@ let reportOverlay = null;
 
 function closeReportOverlay() {
 	if (!reportOverlay) return;
-	const { element, onKeydown, onHashChange } = reportOverlay;
+	const { element, onKeydown, onHashChange, previouslyFocused } = reportOverlay;
 	document.removeEventListener("keydown", onKeydown);
 	window.removeEventListener("hashchange", onHashChange);
 	element.remove();
 	reportOverlay = null;
+	// isConnected 守卫不能省：onHashChange 触发的关闭意味着页面已经重渲染过一轮，
+	// 原触发按钮此刻是脱离文档的孤儿节点，focus() 它不报错，但焦点会静默掉回 <body>。
+	// preventScroll：弹窗期间背景是能滚的，不加会在关闭瞬间把页面拽回按钮所在位置
+	if (previouslyFocused?.isConnected && typeof previouslyFocused.focus === "function") previouslyFocused.focus({ preventScroll: true });
 }
 
 function reportTocHtml(toc) {
@@ -1501,10 +1505,11 @@ function buildReportOverlayHtml(result, rendered) {
 		`快照 ${result.snapshotId ?? "—"}`,
 	].join(" · ");
 	return `
-		<div class="report-modal" role="dialog" aria-modal="true" aria-label="五维报告">
+		<div class="report-focus-guard" tabindex="0" data-report-guard="start"></div>
+		<div class="report-modal" role="dialog" aria-modal="true" aria-labelledby="report-modal-title">
 			<div class="report-modal-header">
 				<div class="report-modal-heading">
-					<div class="report-modal-title cell-truncate">五维报告 · ${escapeHtml(result.marketName)}</div>
+					<div class="report-modal-title cell-truncate" id="report-modal-title">五维报告 · ${escapeHtml(result.marketName)}</div>
 					<div class="report-modal-meta mono cell-truncate">${escapeHtml(meta)} · 已存 ${escapeHtml(result.path)}</div>
 				</div>
 				<div class="report-modal-actions">
@@ -1515,24 +1520,67 @@ function buildReportOverlayHtml(result, rendered) {
 			</div>
 			<div class="report-modal-body">
 				${reportTocHtml(rendered.toc)}
-				<article class="report-doc" id="report-doc">${rendered.html}</article>
-				<pre class="report-source" id="report-source" hidden>${escapeHtml(result.markdown)}</pre>
+				<article class="report-doc" id="report-doc" tabindex="0" role="region" aria-label="报告正文">${rendered.html}</article>
+				<pre class="report-source" id="report-source" tabindex="0" role="region" aria-label="Markdown 源码" hidden>${escapeHtml(result.markdown)}</pre>
 			</div>
 		</div>
+		<div class="report-focus-guard" tabindex="0" data-report-guard="end"></div>
 	`;
 }
 
-function openReportOverlay(result) {
+function openReportOverlay(result, trigger) {
 	closeReportOverlay();
+	// 触发按钮显式传进来，不靠 document.activeElement 猜：生成那条路径上，点击处理器在
+	// await 之前就把按钮 disabled 了，浏览器随即把焦点退回 <body>，等 POST 回来再读
+	// activeElement 只会读到 body，关闭弹窗时焦点就还不回去了。兜底才读 activeElement，
+	// 且要排在 closeReportOverlay() 之后——弹窗顶弹窗时，上一个弹窗刚把焦点还给最初那个按钮
+	const previouslyFocused = trigger?.isConnected ? trigger : document.activeElement;
 	const element = document.createElement("div");
 	element.className = "report-overlay";
 	element.innerHTML = buildReportOverlayHtml(result, renderMarkdown(result.markdown));
+	// 只用来取「环的两端」和把跑出去的焦点拽回来，**不是**弹窗内可聚焦元素的穷举名单：
+	// Chrome 会把溢出的可滚动容器（报告里的宽表格 .md-table-wrap 就是，窄窗下必然出现）
+	// 自动纳入 Tab 序列，这类元素没有 tabindex 属性，任何选择器都枚举不到。弹窗内部的环绕
+	// 因此交给首尾哨兵，这里不做首尾判定。
+	// 每次按 Tab 现算而不是开弹窗时算一次：切到「Markdown 源码」视图会把 nav.report-toc 与
+	// #report-doc 设 hidden，藏起来的目录按钮与正文链接此刻必须退出名单；条目数也随报告而变
+	const focusables = () => [...element.querySelectorAll("button, a[href], #report-doc, #report-source")].filter((el) => !el.closest("[hidden]"));
 	const onKeydown = (event) => {
-		if (event.key === "Escape") closeReportOverlay();
+		if (event.key === "Escape") {
+			closeReportOverlay();
+			return;
+		}
+		if (event.key !== "Tab") return;
+		// 焦点还在弹窗里就一概放行原生 Tab，边界由首尾哨兵接管。别在这里按名单判首尾：
+		// 焦点完全可能停在名单外的元素上（见 focusables 的注释），那时若强行弹回名单端点，
+		// 环会被截成两个互不相通的圈——正文后半段正向再也走不到，反向则在末几项里打转
+		if (element.contains(document.activeElement)) return;
+		const items = focusables();
+		if (!items.length) return;
+		event.preventDefault();
+		(event.shiftKey ? items[items.length - 1] : items[0]).focus();
 	};
 	const onHashChange = () => closeReportOverlay();
-	reportOverlay = { element, onKeydown, onHashChange };
+	reportOverlay = { element, onKeydown, onHashChange, previouslyFocused };
 	document.body.appendChild(element);
+	// 原生 Tab 走到弹窗边界时会先落到哨兵上，这里再把它弹回另一端。这样环绕不依赖
+	// 「弹窗里有哪些可聚焦元素」这份注定会漏的名单，新往正文里塞什么都不用改这段。
+	// 已知的单向缺口：落点仍取自 focusables()，而窄窗下 DOM 末尾可能是名单枚举不到的溢出表格
+	// （.md-table-wrap），于是排在最后一个链接之后的宽表只能正向 Tab 走到、反向走不到。
+	// 不把 .md-table-wrap 补进名单是刻意的：它没有 tabindex，只有 Chrome 会自动让它可聚焦，
+	// Firefox / Safari 里对它 focus() 是空操作，焦点会卡死在哨兵上、下一次 Shift+Tab 直接逃出
+	// 弹窗——那比单向缺口严重得多。真要补，得连带给它加 tabindex 并重跑一轮跨浏览器验证
+	element.addEventListener("focusin", (event) => {
+		const guard = event.target.dataset?.reportGuard;
+		if (!guard) return;
+		const items = focusables();
+		if (!items.length) return;
+		(guard === "start" ? items[items.length - 1] : items[0]).focus();
+	});
+	// 焦点必须立刻挪进弹窗：留在背后的「生成五维报告」按钮上，用户随手一个回车就会再生成
+	// 一次报告、把当天那份 .md 覆盖掉。落点是正文而不是关闭按钮——这是个用来读长报告的弹窗，
+	// 焦点停在按钮上时空格会被当成点击直接关掉，方向键 / PageDown 滚的则是遮罩背后的页面
+	element.querySelector("#report-doc").focus();
 	document.addEventListener("keydown", onKeydown);
 	window.addEventListener("hashchange", onHashChange);
 	// 只有「按下」和「松开」都落在遮罩本身（弹窗以外的暗区）才关闭。
@@ -1560,6 +1608,9 @@ function openReportOverlay(result) {
 		doc.hidden = showSource;
 		if (toc) toc.hidden = showSource;
 		sourceBtn.textContent = showSource ? "渲染视图" : "Markdown 源码";
+		// 焦点可能正停在刚被 hidden 的目录按钮或正文上，浏览器会把它静默丢回 <body>；
+		// 主动送进新露出的那块，键盘与读屏都能接着往下读
+		(showSource ? source : doc).focus();
 	});
 
 	copyBtn.addEventListener("click", async () => {
@@ -1606,8 +1657,8 @@ function bindDossierReportButton(content, marketRef, isCurrent) {
 				<button type="button" class="btn btn-outline" id="dossier-report-open">查看最近报告</button>
 			`;
 			// 报告正文留在闭包里：重看不必再生成一次（生成会重算 GSE 并覆盖当天的 .md）
-			body.querySelector("#dossier-report-open").addEventListener("click", () => openReportOverlay(result));
-			openReportOverlay(result);
+			body.querySelector("#dossier-report-open").addEventListener("click", (event) => openReportOverlay(result, event.currentTarget));
+			openReportOverlay(result, btn);
 		} catch (error) {
 			if (!isCurrent()) return;
 			body.innerHTML = `<div class="error-panel">生成失败：${escapeHtml(error.message)}</div>`;

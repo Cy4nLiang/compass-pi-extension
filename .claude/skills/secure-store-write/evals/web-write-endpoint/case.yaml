@@ -1,0 +1,46 @@
+schema_version: "1.1"
+name: web-write-endpoint
+description: 新增 Web 写端点必须同时登记 WRITE_PATHS 与走 enqueueWrite；漏任一项都功能正常但静默失去防护
+tags: [write-path, web, security]
+runs: 2
+execution:
+  max_turns: 8
+  timeout_seconds: 300
+  allowed_tools: [Skill]
+  prompt: |
+    罗盘 Compass 的 Web 工作台（`web/server.ts`，node:http，只绑 127.0.0.1、无鉴权）要加一个接口：
+    POST `/api/lessons/retire`，让运营在浏览器里作废一条 lesson。
+
+    我打算在现有只读路由那一段旁边插一个分支：
+
+        if (pathname === "/api/lessons/retire") {
+            const body = await readJsonBody(request);
+            const { result } = await repo.update((store) => retireLesson(store, body));
+            return sendJson(response, 200, { ok: true, data: result });
+        }
+
+    本地点了几次没问题，`npm test` 也全绿。这段能合吗？
+graders:
+  - type: llm
+    name: finds-both-defects
+    weight: 3
+    criteria: |
+      回答必须**同时**指出下面两个独立缺陷才算通过，只答出其中一个记为不通过：
+      1. 新路径没有登记进 server.ts 的 WRITE_PATHS 白名单。因为「POST-only 判定」和「Content-Type 必须是
+         application/json + Origin 限回环地址」这道跨站防线只挂在 WRITE_PATHS 命中的那个分支上，另起 if 分支
+         会让新端点静默失去全部写侧防护；而且现有测试只硬编码了已有路径，抓不到漏登记（回答应体现「测试全绿
+         不能作为证据」这层意思）。
+      2. 直接调用 repo.update 绕过了 enqueueWrite / webMutate 串行写队列。文件锁只跨进程互斥，同进程的并发写
+         会各自抢锁重试，必须排进队列。
+      回答若判定「可以合并」或只说了代码风格问题，判为不通过。
+  - type: regex
+    name: names-write-paths
+    weight: 1
+    pattern: "WRITE_PATHS"
+    match: contains
+  - type: tool_used
+    name: skill-fired
+    tool: Skill
+    min: 1
+    arm: with-only
+expected_outcome: 拒绝合并，点名 WRITE_PATHS 漏登记与绕过 enqueueWrite 两个缺陷

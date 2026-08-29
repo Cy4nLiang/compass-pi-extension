@@ -1,0 +1,40 @@
+schema_version: "1.1"
+name: assert-store-compat
+description: 给 assertStore 加硬校验会让存量脏数据的 store 既读不出也写不进；必须改成可选字段 + ensureDefaults 回填
+tags: [write-path, persistence, compatibility]
+runs: 2
+execution:
+  max_turns: 8
+  timeout_seconds: 300
+  allowed_tools: [Skill]
+  prompt: |
+    复盘时发现存量数据里有几条 `OutcomeCheck` 的 `verdict` 是空字符串，前端渲染出来是一片空白。
+
+    我想在 `store.ts` 的 `assertStore` 里加一条硬校验：`verdict` 必须是 `validated` / `refuted` /
+    `inconclusive` 三者之一，否则抛错。这样脏数据一次性挡在门外，以后也进不来。
+
+    这么加有问题吗？
+graders:
+  - type: llm
+    name: catches-bricking
+    weight: 3
+    criteria: |
+      回答必须同时满足：
+      1. 明确判定这个改法危险 / 会把扩展弄砖，而不是「可以，注意一下就行」。
+      2. 说明机制：load 与 save 跑的是同一份 assertStore，一条不合规的存量记录会让 store 既读不出也写不进；
+         并且异常被包成 StoreIoError 后只显示「读取罗盘数据失败」之类的提示，看起来像文件损坏，而不是刚加的
+         校验太严，会把排障引向错误方向。两点机制答出「同一份校验同时管 load 和 save，存量记录会卡死读写」
+         这条即算通过，误导性报错是加分项。
+      3. 给出替代方案：新增字段一律可选 + ensureDefaults 回填或规范化；要收紧脏数据请放在写入侧或一次性迁移，
+         不要放进 load 也会跑的校验里。
+  - type: regex
+    name: names-the-escape-hatch
+    weight: 1
+    pattern: "ensureDefaults|StoreIoError|存量"
+    match: contains
+  - type: tool_used
+    name: skill-fired
+    tool: Skill
+    min: 1
+    arm: with-only
+expected_outcome: 判定会砖化，解释 load/save 共用 assertStore，给出可选字段 + ensureDefaults 回填的替代方案

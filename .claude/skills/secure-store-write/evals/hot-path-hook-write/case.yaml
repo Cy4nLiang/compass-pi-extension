@@ -1,0 +1,41 @@
+schema_version: "1.1"
+name: hot-path-hook-write
+description: 热路径 hook 绝不能开写事务；MCP 计量必须内存自增 + 安全点落账
+tags: [write-path, hooks, concurrency]
+runs: 2
+execution:
+  max_turns: 8
+  timeout_seconds: 300
+  allowed_tools: [Skill]
+  prompt: |
+    罗盘的 MCP 调用计量现在是在内存里累加、等到安全点才落盘，结果 pi 进程被强杀时这批计数就丢了，预算对不上账。
+
+    我打算改成实时落账：在 `index.ts` 的 `tool_result` hook 里直接
+    `await mutateStore(ctx, (store) => addUsage(store, sample))`，每次 MCP 调用都写一次库，落一次少丢一次。
+
+    这么改可以吗？
+graders:
+  - type: llm
+    name: rejects-hot-path-write
+    weight: 3
+    criteria: |
+      回答必须同时满足：
+      1. 明确判定不可以在 tool_result 里开写事务。
+      2. 说明规则：热路径 hook（before_agent_start / tool_call / tool_result / session_before_compact）
+         只做只读计算、展示增强、上下文注入与调用拦截，绝不开写事务；只有 session_start 与 session_shutdown
+         两个生命周期 hook 例外，且写入必须包在 withFileMutationQueue 内串行落盘。至少要点明「热路径只读、
+         生命周期 hook 才能写」这条边界。
+      3. 给出正确形状：tool_result 只做 O(1) 的内存 pending 自增，落账在安全点完成（随 mutateStore 顺带、
+         查看面 flush、session_shutdown 尽力）。
+      回答若同意实时落账、或只建议「加个 try/catch 兜住异常」，判为不通过。
+  - type: regex
+    name: names-the-safe-point
+    weight: 1
+    pattern: "session_shutdown|pending|安全点|生命周期"
+    match: contains
+  - type: tool_used
+    name: skill-fired
+    tool: Skill
+    min: 1
+    arm: with-only
+expected_outcome: 拒绝热路径写事务，给出内存自增 + 安全点落账的正确形状

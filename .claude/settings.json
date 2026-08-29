@@ -1,0 +1,30 @@
+{
+	"hooks": {
+		"PreToolUse": [
+			{
+				"matcher": "Edit|Write|NotebookEdit|Bash",
+				"hooks": [
+					{
+						"type": "command",
+						"command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/guard-compass-data.sh",
+						"args": [],
+						"timeout": 15,
+						"statusMessage": "检查是否在改罗盘经营数据…"
+					}
+				]
+			},
+			{
+				"matcher": "Bash",
+				"hooks": [
+					{
+						"type": "command",
+						"command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/precommit-gate.sh",
+						"args": [],
+						"timeout": 180,
+						"statusMessage": "提交前跑 npm run check + npm test…"
+					}
+				]
+			}
+		]
+	}
+}

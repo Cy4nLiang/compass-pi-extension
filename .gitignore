@@ -3,3 +3,9 @@ node_modules/
 
 # 防御性忽略：若在本仓库目录内直接启动 pi，会就地生成运行数据
 .pi/
+
+# Claude Code 的机器本地覆盖，不入库
+.claude/settings.local.json
+
+# Playwright MCP 验证 Web UI 时留下的一次性产物
+.playwright-mcp/

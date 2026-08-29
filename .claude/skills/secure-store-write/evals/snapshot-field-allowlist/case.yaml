@@ -1,0 +1,40 @@
+schema_version: "1.1"
+name: snapshot-field-allowlist
+description: 给 MarketSnapshot 加字段必须同步登记 emptySnapshotPayload 白名单，否则每次 save 静默抹掉
+tags: [write-path, persistence]
+runs: 2
+execution:
+  max_turns: 8
+  timeout_seconds: 300
+  allowed_tools: [Skill]
+  prompt: |
+    要给罗盘的 `MarketSnapshot` 加一个新指标字段 `reviewVelocity`（近 30 天评论增速），导入 CSV 时算好一起存。
+
+    改动清单：
+    1. `types.ts` 的 `MarketSnapshot` 加 `reviewVelocity?: number`
+    2. `csv.ts` / `metrics.ts` 里算出来塞进 snapshot 对象
+    3. `ui.ts` 和 `web/data.ts` 里把它读出来显示
+
+    这三步就齐了吧？还差什么？
+graders:
+  - type: llm
+    name: catches-allowlist
+    weight: 3
+    criteria: |
+      回答必须明确指出改动清单不完整，并点名 store.ts 的 emptySnapshotPayload：它是逐字段显式拷贝的白名单
+      （不是 spread），新字段不登记进去的话每次 save 都会被静默抹掉。
+      回答若说「这三步就够了」，或完全没提到 emptySnapshotPayload / 快照元数据白名单这件事，判为不通过。
+      以下属于加分内容，不作硬性要求：要改已导入快照的明细必须新建 snapshot id（persistSnapshotPayload 见
+      文件已存在即跳过写入）；sidecar 内容 load 时不逐条校验，消费侧在 sort / slice / toFixed 前要自行
+      Number.isFinite 过滤。
+  - type: regex
+    name: names-allowlist
+    weight: 1
+    pattern: "emptySnapshotPayload"
+    match: contains
+  - type: tool_used
+    name: skill-fired
+    tool: Skill
+    min: 1
+    arm: with-only
+expected_outcome: 指出清单不完整，点名 emptySnapshotPayload 白名单

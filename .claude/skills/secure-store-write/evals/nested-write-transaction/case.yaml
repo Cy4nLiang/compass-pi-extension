@@ -1,0 +1,43 @@
+schema_version: "1.1"
+name: nested-write-transaction
+description: 在写事务的 mutator 里再开一次写事务会永久挂死；必须识别并给出「合并进同一个 mutator」的正确形状
+tags: [write-path, concurrency]
+runs: 2
+execution:
+  max_turns: 8
+  timeout_seconds: 300
+  allowed_tools: [Skill]
+  prompt: |
+    我在维护罗盘 Compass（pi coding agent 的 TypeScript extension）。
+
+    要给 CSV 导入加一个动作：导入成功后，把同一市场同一来源的上一份快照标记为 superseded。
+
+    我的计划是在 `index.ts` 的 `mutateStore(ctx, mutator)` 回调里，先创建新快照，然后在同一个回调内再调一次
+    `mutateStore` 单独写 superseded 标记——两次写各自独立，任何一次失败都不会污染另一次，看起来更安全。
+
+    这个写法可行吗？不行的话正确形状是什么？
+graders:
+  - type: llm
+    name: rejects-nested-transaction
+    weight: 3
+    criteria: |
+      回答必须同时满足以下三点才算通过：
+      1. 明确判定这个写法不可行（会挂死 / 死锁 / 永久卡住），而不是「可以但要注意」。
+      2. 说明机制：写事务的串行层（宿主 withFileMutationQueue 队列、store.json.lock 文件锁）没有重入检测；
+         队列侧会自等待且无超时，文件锁侧因为持锁 pid 是自己、永远不会被判成 stale，只能空转到 deadline
+         再抛出「被其他进程锁定」这种指向错误方向的报错。答出其中任一侧的机制即可，但必须点明「没有重入检测/
+         自己等自己」这个根因，不能只说「并发有风险」。
+      3. 给出正确形状：在同一个 mutator 内完成两处 store 变更，把读文件、查重、解析、归档等准备工作放到事务外。
+      只要回答建议用「加大超时、加重试、换锁实现、给锁加重入计数、把嵌套调用改成事务结束后再 await 一次」
+      来让原方案成立，即判为不通过。
+  - type: regex
+    name: names-the-mechanism
+    weight: 1
+    pattern: "嵌套|重入|withFileMutationQueue|自等待|自己等自己"
+    match: contains
+  - type: tool_used
+    name: skill-fired
+    tool: Skill
+    min: 1
+    arm: with-only
+expected_outcome: 判定不可行，指出无重入检测，给出「合并进同一个 mutator + 准备工作移出事务」的替代方案

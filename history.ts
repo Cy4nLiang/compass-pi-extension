@@ -17,6 +17,7 @@ import type {
 } from "./types.ts";
 // 复盘报告与市场报告共用同一套「自由文本进 Markdown」的转义规则，别再内联复制一份。
 // report.ts 只 import type，反向无依赖，不成环。
+import { compareSnapshotRecency, compareSnapshotRecencyDesc } from "./defaults.ts";
 import { escapeCell } from "./report.ts";
 
 const DAY_MS = 86_400_000;
@@ -131,8 +132,14 @@ export interface SimilarMarketResult {
 }
 
 export interface OutcomeStats {
+	/** 对照次数：全部 OutcomeCheck 条数，不是比率分母 */
 	total: number;
+	/** validated + challenged 的原始条数（历史语义，非比率分母） */
 	conclusive: number;
+	/** 四率的分母：每个市场最新一条可判 check 只算一票（与 backtest alignment 同口径） */
+	ratedMarkets: number;
+	/** 无人工决策锚点的条数：策略自我对照，只留档不进任何比率 */
+	strategyOnly: number;
 	validated: number;
 	challenged: number;
 	inconclusive: number;
@@ -264,6 +271,19 @@ function candidateForMarket(store: CompassStore, marketId: string): Candidate | 
 	return store.candidates.find((candidate) => candidate.marketId === marketId);
 }
 
+// Lesson 召回分档，档与档之间不允许交叉：
+// 0 = 写了市场维度 scope 却一条都没命中 → 不召回；
+// LESSON_SCORE_GLOBAL = 没写市场维度 scope（含「只写了 metrics scope」）的通用经验，保底进
+//   召回池，但恒低于任何一条命中 scope 的专属经验——否则最新的通用条会把 limit=1/2/3 的注入
+//   面占满，专属经验永远排不进去；
+// LESSON_SCORE_KEYWORD = 命中关键词的起步分，再命中类目额外加 LESSON_SCORE_CATEGORY。
+// keywordHits 是 token 展开后的重合数（一个英文词组能贡献 3~6 个，且 for/holder 这类通用
+// token 会跨市场误命中），量纲不可信，只作同档内的次级排序并封顶。
+const LESSON_SCORE_GLOBAL = 1;
+const LESSON_SCORE_KEYWORD = 10;
+const LESSON_SCORE_CATEGORY = 100;
+const LESSON_KEYWORD_HITS_CAP = 5;
+
 function lessonMatchesMarket(lesson: Lesson, market: Market): number {
 	if (lesson.status !== "active") return 0;
 	const categories = new Set((lesson.scope.categories ?? []).map(normalizeHistoryText).filter(Boolean));
@@ -273,8 +293,11 @@ function lessonMatchesMarket(lesson: Lesson, market: Market): number {
 	const marketKeywords = historyKeywordSet([market.name, ...market.keywords]);
 	const keywordHits = setOverlapCount(scopedKeywords, marketKeywords);
 	const hasMarketScope = categories.size > 0 || scopedKeywords.size > 0;
-	if (hasMarketScope && categoryHit === 0 && keywordHits === 0) return 0;
-	return categoryHit * 10 + keywordHits + (hasMarketScope ? 0 : 1);
+	if (!hasMarketScope) return LESSON_SCORE_GLOBAL;
+	if (categoryHit === 0 && keywordHits === 0) return 0;
+	return categoryHit * LESSON_SCORE_CATEGORY
+		+ (keywordHits > 0 ? LESSON_SCORE_KEYWORD : 0)
+		+ Math.min(keywordHits, LESSON_KEYWORD_HITS_CAP);
 }
 
 export function matchingLessonsForMarket(store: CompassStore, marketId: string, limit = 20): Lesson[] {
@@ -614,13 +637,37 @@ export function actualsOutcomeVerdict(actuals: OutcomeActuals, targetDailyUnits 
 	return { verdict: "inconclusive", reason: `实绩处于观察区：日销 ${units}（目标 ${targetDailyUnits}），净利率 ${(margin * 100).toFixed(1)}%` };
 }
 
+// 可判 check：有人工决策锚点（go / no_go）且结论不是 inconclusive。
+// 与 service.ts 的 desiredOutcomeForCheck 是同一道判据——那边把它翻译成期望 outcome，这里只做筛选，
+// 两边共用本函数，杜绝「比率认这条、alignment 不认」的双口径。
+// decisionStatus 为空（粗筛 reject 但从未有人决策）的 check 只是策略结论的自我对照，
+// 不代表任何被验证过的人为判断，一律不进比率——否则从未决策的市场每周例行导入一次
+// 就能把「验证率」拉到任意数字（审计 G15）。
+export function isComparableCheck(check: OutcomeCheck): boolean {
+	return check.verdict !== "inconclusive" && (check.decisionStatus === "go" || check.decisionStatus === "no_go");
+}
+
+// 比率样本 = 每个市场最新一条可判 check。同一市场刷 N 次快照只算一票，
+// 否则长期跟踪对象会按对照次数主导四率（同一份 store 的 backtest alignment 却是按市场算的，
+// 两套权重就是审计 G16 的问题）。同毫秒并列时按 id 降序兜底：调用方传进来的数组有的是原始
+// 追加序、有的已按 createdAt 倒序排过，用数组下标做次序会让同一份 store 在不同入口算出不同的「最新」。
+export function latestComparableChecks(checks: readonly OutcomeCheck[]): OutcomeCheck[] {
+	const latest = new Map<string, OutcomeCheck>();
+	for (const check of [...checks].sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id))) {
+		if (isComparableCheck(check) && !latest.has(check.marketId)) latest.set(check.marketId, check);
+	}
+	return [...latest.values()];
+}
+
 export function outcomeStatistics(store: CompassStore, checks = store.outcomeChecks): OutcomeStats {
 	const validated = checks.filter((check) => check.verdict === "validated").length;
 	const challenged = checks.filter((check) => check.verdict === "challenged").length;
 	const inconclusive = checks.filter((check) => check.verdict === "inconclusive").length;
 	const conclusive = validated + challenged;
-	const go = checks.filter((check) => check.decisionStatus === "go" && check.verdict !== "inconclusive");
-	const noGo = checks.filter((check) => check.decisionStatus === "no_go" && check.verdict !== "inconclusive");
+	// 四率一律走去重样本；validated/challenged/inconclusive 与 total 保持原始条数语义（= 对照次数）
+	const rated = latestComparableChecks(checks);
+	const go = rated.filter((check) => check.decisionStatus === "go");
+	const noGo = rated.filter((check) => check.decisionStatus === "no_go");
 	const groups = new Map<string, { validated: number; challenged: number; inconclusive: number }>();
 	for (const check of checks) {
 		const run = check.baselineRunId ? store.strategyRuns.find((candidate) => candidate.id === check.baselineRunId) : undefined;
@@ -632,10 +679,12 @@ export function outcomeStatistics(store: CompassStore, checks = store.outcomeChe
 	return {
 		total: checks.length,
 		conclusive,
+		ratedMarkets: rated.length,
+		strategyOnly: checks.filter((check) => check.decisionStatus === undefined).length,
 		validated,
 		challenged,
 		inconclusive,
-		validationRate: conclusive ? validated / conclusive : null,
+		validationRate: rated.length ? rated.filter((check) => check.verdict === "validated").length / rated.length : null,
 		goAttainmentRate: go.length ? go.filter((check) => check.verdict === "validated").length / go.length : null,
 		noGoAccuracyRate: noGo.length ? noGo.filter((check) => check.verdict === "validated").length / noGo.length : null,
 		falseKillRate: noGo.length ? noGo.filter((check) => check.verdict === "challenged").length / noGo.length : null,
@@ -646,8 +695,12 @@ export function outcomeStatistics(store: CompassStore, checks = store.outcomeChe
 	};
 }
 
+// 天数只按整天算。小数一律回落缺省而不是 Math.floor：0.5 会被压成 0 天，
+// 那会让 retro_due 恒为到期、录了实绩也清不掉。保存侧（strategy.ts 的
+// POSITIVE_INTEGER_META_FIELDS）已经拒了这种值，这里是存量 store 的兜底。
 function positiveInteger(value: unknown, fallback: number): number {
-	return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+	if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return fallback;
+	return Number.isInteger(value) ? value : fallback;
 }
 
 export function retroDueConfig(meta?: Record<string, unknown>): RetroDueConfig {
@@ -736,11 +789,14 @@ export function dueRetroItems(
 				: undefined;
 			const decision = latestDecision(store, market.id);
 			const baseline = decision?.snapshotId ? store.snapshots.find((snapshot) => snapshot.id === decision.snapshotId) : undefined;
-			const evidenceAt = latestEvidenceSnapshot?.capturedAt ?? baseline?.capturedAt ?? decisionAt;
+			// 「未对照的新快照」同样按 (capturedAt, importedAt) 二元组比较：同日重导的修正版
+			// 若只比 capturedAt 会被判成「不比证据新」而永远不触发错杀回看。
+			// 退化到 decisionAt 时没有对应快照，用决策时刻兜底两端（importedAt 取同值）。
+			const evidenceRecency = latestEvidenceSnapshot ?? baseline ?? { capturedAt: decisionAt, importedAt: decisionAt };
 			const unseenSnapshot = store.snapshots
-				.filter((snapshot) => snapshot.marketId === market.id && snapshot.capturedAt > evidenceAt)
+				.filter((snapshot) => snapshot.marketId === market.id && compareSnapshotRecency(snapshot, evidenceRecency) > 0)
 				.filter((snapshot) => !store.outcomeChecks.some((outcome) => outcome.marketId === market.id && outcome.evidenceSnapshotId === snapshot.id))
-				.sort((a, b) => b.capturedAt.localeCompare(a.capturedAt))[0];
+				.sort(compareSnapshotRecencyDesc)[0];
 			const item = unseenSnapshot
 				? makeDueItem("no_go", market, candidate, unseenSnapshot.importedAt, now, `存在未对照的新快照 ${unseenSnapshot.id}`, "重放当时否决规则，检查是否错杀")
 				: makeDueItem("no_go", market, candidate, addDays(check?.createdAt ?? decisionAt, config.noGoDays), now, "no_go 抽样回看周期到期", "导入新快照后执行错杀回看");
@@ -799,7 +855,7 @@ export function renderHistoryBrief(
 	if (market) {
 		const candidate = candidateForMarket(store, market.id);
 		const decision = latestDecision(store, market.id);
-		const snapshots = store.snapshots.filter((item) => item.marketId === market.id).sort((a, b) => b.capturedAt.localeCompare(a.capturedAt));
+		const snapshots = store.snapshots.filter((item) => item.marketId === market.id).sort(compareSnapshotRecencyDesc);
 		const outcome = latestOutcome(store, market.id);
 		lines.push(`· 命中市场「${market.name}」：stage=${candidate?.stage ?? "—"}，${decision?.createdAt.slice(0, 10) ?? "未决策"} ${decision?.decisionStatus ?? candidate?.decisionStatus ?? "—"}（${decision?.reason ?? candidate?.decisionReason ?? "尚无最终理由"}）`);
 		if (snapshots[0]) lines.push(`· 最新快照：${snapshots[0].id} · ${snapshots[0].capturedAt.slice(0, 10)} · ${snapshots[0].source}${outcome ? `；最近复盘 ${outcome.verdict}（${outcome.id}）` : "；尚无复盘对照"}`);
@@ -839,7 +895,62 @@ function percent(value: number | null): string {
 	return value === null ? "—" : `${(value * 100).toFixed(1)}%`;
 }
 
-export function renderRetroReport(store: CompassStore, generatedAt = new Date().toISOString()): string {
+// 报告的「日」必须是运营看的本地日历日，而不是 UTC 日：原先标题、文件名与「本次沉淀经验」
+// 三处都取 generatedAt.slice(0, 10)，沪时早 8 点前生成会写成昨天并原子覆盖昨晚那份同名报告，
+// 8 点后又会把当天凌晨（UTC 仍属昨天）沉淀的 Lesson 漏出 §5——月界两侧同一张卡一含一漏。
+export interface LocalReportStamp {
+	/** 本地日历日 YYYY-MM-DD */
+	date: string;
+	/** 本地 24 小时钟 HHmm */
+	time: string;
+}
+
+export function localReportStamp(iso: string, timeZone?: string): LocalReportStamp {
+	const parsed = parseTime(iso);
+	// 解析不出时间戳就退回 ISO 前缀：宁可标题退化成 UTC 日，也不要让整份报告抛异常
+	if (parsed === undefined) return { date: iso.slice(0, 10), time: "0000" };
+	const parts = new Intl.DateTimeFormat("en-CA", {
+		timeZone,
+		year: "numeric",
+		month: "2-digit",
+		day: "2-digit",
+		hour: "2-digit",
+		minute: "2-digit",
+		hourCycle: "h23",
+	}).formatToParts(new Date(parsed));
+	const pick = (type: string): string => parts.find((part) => part.type === type)?.value ?? "";
+	return { date: `${pick("year")}-${pick("month")}-${pick("day")}`, time: `${pick("hour")}${pick("minute")}` };
+}
+
+// 文件名带本地 HHmm：同一天多次生成不再互相覆盖，且路径本身唯一，可直接当 sourceRetro 的配对键。
+// 落盘产物仍只有 .md，路径仍由调用方过 resolveOutputPath 限制在 .pi/compass/reports/ 内。
+export function retroReportFileName(generatedAt = new Date().toISOString(), timeZone?: string): string {
+	const stamp = localReportStamp(generatedAt, timeZone);
+	return `retro-${stamp.date}-${stamp.time}.md`;
+}
+
+export interface RetroReportOptions {
+	/** 本次报告的落盘路径（相对或绝对均可）：与 Lesson.sourceRetro 按文件名精确配对 */
+	outputPath?: string;
+	/** 上一份复盘报告的落盘时刻（ISO）：sourceRetro 缺失时「本次沉淀」时间窗的开区间下界 */
+	previousRetroAt?: string;
+	/** 日历时区，缺省用进程本地时区；测试传入以固定断言 */
+	timeZone?: string;
+}
+
+// sourceRetro 存的是 relative(ctx.cwd, output)，不同入口可能给相对或绝对路径，
+// 统一退到文件名比较——文件名已含本地日期 + HHmm，在同一个 reports 目录内唯一
+function retroPathKey(path: string | undefined): string | undefined {
+	const name = path?.split(/[\\/]/u).pop()?.trim();
+	return name ? name.toLowerCase() : undefined;
+}
+
+export function renderRetroReport(
+	store: CompassStore,
+	generatedAt = new Date().toISOString(),
+	dueConfig: RetroDueConfig = retroDueConfig(),
+	options: RetroReportOptions = {},
+): string {
 	const checks = [...store.outcomeChecks].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 	const stats = outcomeStatistics(store, checks);
 	const decisions = store.candidates.filter((candidate) => candidate.decisionStatus);
@@ -859,21 +970,38 @@ export function renderRetroReport(store: CompassStore, generatedAt = new Date().
 		for (const rule of run?.result.rules.filter((item) => item.status === "veto" || item.status === "fail") ?? []) blame.set(rule.id, (blame.get(rule.id) ?? 0) + 1);
 	}
 	const activeLessons = store.lessons.filter((lesson) => lesson.status === "active").sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-	const reportDate = generatedAt.slice(0, 10);
-	const reportLessons = activeLessons.filter((lesson) => lesson.createdAt.startsWith(reportDate) || lesson.sourceRetro?.includes(`retro-${reportDate}`));
-	const dueStrategy = store.strategies.filter((strategy) => strategy.id === "jingpu-daily10").sort((a, b) => b.version - a.version)[0];
-	const due = dueRetroItems(store, generatedAt, retroDueConfig(dueStrategy?.definition.meta));
+	const stamp = localReportStamp(generatedAt, options.timeZone);
+	const reportDate = stamp.date;
+	const outputKey = retroPathKey(options.outputPath);
+	const generatedTime = parseTime(generatedAt);
+	const windowStart = parseTime(options.previousRetroAt);
+	// 「本次沉淀」= 结构化归属 ∪ 时间窗兜底，取并集而不是二选一：
+	// ① sourceRetro 指向本次报告（/compass-retro 命令流落盘后回填）；
+	// ② 工具面直调 compass_retro action=save_lesson 不传 source_retro，只能靠时间窗——
+	//    调用方给得出上一份报告就用「上一份之后」，给不出就退到本地日历日当天。
+	// 错位的最坏情况必须是多列一条、绝不能是漏列，因此只收下界，不做别的裁剪。
+	const reportLessons = activeLessons.filter((lesson) => {
+		if (outputKey && retroPathKey(lesson.sourceRetro) === outputKey) return true;
+		const createdAt = parseTime(lesson.createdAt);
+		if (createdAt === undefined) return false;
+		if (generatedTime !== undefined && createdAt > generatedTime) return false;
+		if (windowStart !== undefined) return createdAt > windowStart;
+		return localReportStamp(lesson.createdAt, options.timeZone).date === reportDate;
+	});
+	// 复盘节奏由调用方注入（service.generateRetroReport 取默认策略 meta），
+	// history.ts 不再自己找「默认策略」，省掉一处会随 meta.name 静默失配的 id 字面量。
+	const due = dueRetroItems(store, generatedAt, dueConfig);
 	const lines = [
-		`# 罗盘复盘报告｜${generatedAt.slice(0, 10)}`,
+		`# 罗盘复盘报告｜${reportDate}`,
 		"",
-		`> 生成时间：${generatedAt} · OutcomeCheck ${checks.length} 条 · 本报告为经营复盘辅助，店铺实绩以 SP-API/后台为准。`,
+		`> 生成时间：${generatedAt} · 对照次数 ${checks.length} 次 · 比率样本 ${stats.ratedMarkets} 个市场（按市场去重：同一市场只取最新一条可判对照）· 本报告为经营复盘辅助，店铺实绩以 SP-API/后台为准。`,
 		"",
 		"## 1. 台账概览",
 		"",
 		`- 决策分布：go ${distribution.go} / waitlist ${distribution.waitlist} / no_go ${distribution.no_go}。`,
 		`- 平均决策周期：${averageCycle === null ? "—" : `${averageCycle.toFixed(1)} 天`}。`,
-		`- 验证率：${percent(stats.validationRate)}；go 达成率：${percent(stats.goAttainmentRate)}；no_go 正确率：${percent(stats.noGoAccuracyRate)}；错杀率：${percent(stats.falseKillRate)}。`,
-		`- 结论分布：validated ${stats.validated} / challenged ${stats.challenged} / inconclusive ${stats.inconclusive}。`,
+		`- 验证率：${percent(stats.validationRate)}；go 达成率：${percent(stats.goAttainmentRate)}；no_go 正确率：${percent(stats.noGoAccuracyRate)}；错杀率：${percent(stats.falseKillRate)}（四率按市场去重，样本 ${stats.ratedMarkets} 个市场；无决策锚点与 inconclusive 不计入）。`,
+		`- 结论分布（按对照次数 ${stats.total} 次）：validated ${stats.validated} / challenged ${stats.challenged} / inconclusive ${stats.inconclusive}。`,
 		"",
 		"## 2. 逐项对照",
 		"",
@@ -903,7 +1031,7 @@ export function renderRetroReport(store: CompassStore, generatedAt = new Date().
 	if (blame.size) {
 		for (const [rule, count] of [...blame.entries()].sort((a, b) => b[1] - a[1])) lines.push(`- 规则 \`${rule}\` 出现在 ${count} 条 challenged 基线中；先用 compass_retro action=backtest 验证阈值，再保存新策略版本。`);
 	} else lines.push("- 当前没有足够的 challenged × rule 证据支持调阈值；不要凭单个案例修改策略。");
-	for (const row of stats.byStrategy) lines.push(`- ${row.strategy}：准确率 ${percent(row.accuracy)}（validated ${row.validated} / challenged ${row.challenged} / inconclusive ${row.inconclusive}）。`);
+	for (const row of stats.byStrategy) lines.push(`- ${row.strategy}：准确率 ${percent(row.accuracy)}（按对照次数，未去重：validated ${row.validated} / challenged ${row.challenged} / inconclusive ${row.inconclusive}）。`);
 	lines.push("", "## 5. 新沉淀经验", "");
 	if (reportLessons.length) {
 		// 与 report.ts 第 9 章同款：title 曾被模板的 **…** 包住会提前闭合并把 detail 一起加粗，
@@ -922,5 +1050,5 @@ export function renderRetroReport(store: CompassStore, generatedAt = new Date().
 }
 
 export function snapshotsForMarket(store: CompassStore, marketId: string): MarketSnapshot[] {
-	return store.snapshots.filter((snapshot) => snapshot.marketId === marketId).sort((a, b) => b.capturedAt.localeCompare(a.capturedAt));
+	return store.snapshots.filter((snapshot) => snapshot.marketId === marketId).sort(compareSnapshotRecencyDesc);
 }

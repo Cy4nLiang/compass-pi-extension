@@ -1,8 +1,10 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
-import { budgetStatus, gateDefaultsLine, listRetroDue, listWorkbenchTodos } from "./service.ts";
+import { SNAPSHOT_FRESHNESS_DAYS, compareSnapshotRecencyDesc, snapshotNeedsRefresh } from "./defaults.ts";
+import { outcomeStatistics } from "./history.ts";
+import { budgetMonth, budgetStatus, gateDefaultsLine, listRetroDue, listWorkbenchTodos } from "./service.ts";
 import { todoResolutionBadge } from "./todo.ts";
-import { CANDIDATE_STAGES, STAGE_LABELS, TODO_GROUP_LABELS, TODO_PRIORITIES, type CompassStore, type TodoPriority, type WorkbenchTodo } from "./types.ts";
+import { CANDIDATE_STAGES, STAGE_LABELS, TODO_GROUP_LABELS, TODO_PRIORITIES, type CompassStore, type WorkbenchTodo } from "./types.ts";
 
 const TAB_NAMES = ["总览", "待办", "市场", "候选池", "预算", "复盘"] as const;
 
@@ -25,8 +27,10 @@ export function compactDashboardSummary(store: CompassStore): string {
 	const todos = listWorkbenchTodos(store);
 	const due = todos.filter((todo) => todo.kind === "retro_due").length;
 	const urgent = todos.filter((todo) => todo.priority === 1).length;
-	const conclusive = store.outcomeChecks.filter((check) => check.verdict !== "inconclusive");
-	const validationRate = conclusive.length ? `${(conclusive.filter((check) => check.verdict === "validated").length / conclusive.length * 100).toFixed(0)}%` : "—";
+	// 口径唯一所有者是 history.outcomeStatistics（按市场去重、只算有人工决策锚点的 check）；
+	// 这里曾自己抄一遍 validated/(validated+challenged)，与复盘报告和 Web 总览各算各的
+	const rate = outcomeStatistics(store).validationRate;
+	const validationRate = rate === null ? "—" : `${(rate * 100).toFixed(0)}%`;
 	// 已提交待 agent 验证的条目：运营看得见「球在会话侧」，避免提交后无声等待
 	const pendingVerify = todos.filter((todo) => todo.resolution?.status === "submitted").length;
 	return `${store.markets.length} 市场 · ${active} 活跃候选 · ${review} 待复核 · ${rejected} 否决 · ${due} 待复盘 · ${todos.length} 待办${urgent ? `（P1 ${urgent}）` : ""}${pendingVerify ? ` · 待验证 ${pendingVerify}` : ""} · 验证率 ${validationRate} · 本月 ¥${spent.toFixed(0)}`;
@@ -108,10 +112,10 @@ export class CompassDashboard {
 			review: this.store.candidates.filter((candidate) => candidate.gateOutcome === "review").length,
 			reject: this.store.candidates.filter((candidate) => candidate.gateOutcome === "reject").length,
 		};
-		const snapshots = [...this.store.snapshots].sort((a, b) => b.capturedAt.localeCompare(a.capturedAt));
+		const snapshots = [...this.store.snapshots].sort(compareSnapshotRecencyDesc);
 		const stale = this.store.markets.filter((market) => {
 			const snapshot = snapshots.find((item) => item.marketId === market.id);
-			return !snapshot || ageDays(snapshot.capturedAt) > 30;
+			return snapshotNeedsRefresh(snapshot ? ageDays(snapshot.capturedAt) : null);
 		}).length;
 		const budgets = budgetStatus(this.store);
 		const spent = budgets.reduce((sum, pool) => sum + pool.spentCny, 0);
@@ -119,7 +123,7 @@ export class CompassDashboard {
 
 		add("");
 		add(` ${th.fg("accent", th.bold("经营快照"))}`);
-		add(` 市场 ${th.fg("text", String(this.store.markets.length))}  ·  候选 ${th.fg("text", String(this.store.candidates.length))}  ·  30天过期 ${stale ? th.fg("warning", String(stale)) : th.fg("success", "0")}  ·  本月数据成本 ${th.fg("text", `¥${spent.toFixed(2)}`)}`);
+		add(` 市场 ${th.fg("text", String(this.store.markets.length))}  ·  候选 ${th.fg("text", String(this.store.candidates.length))}  ·  ${SNAPSHOT_FRESHNESS_DAYS.screen}天过期 ${stale ? th.fg("warning", String(stale)) : th.fg("success", "0")}  ·  本月数据成本 ${th.fg("text", `¥${spent.toFixed(2)}`)}`);
 		add(` Gate  ${th.fg("success", `通过 ${outcomes.pass}`)}  /  ${th.fg("warning", `复核 ${outcomes.review}`)}  /  ${th.fg("error", `否决 ${outcomes.reject}`)}  ·  预算熔断 ${fused ? th.fg("error", String(fused)) : th.fg("success", "0")}`);
 		add("");
 		add(` ${th.fg("accent", th.bold("阶段流水线"))}`);
@@ -202,7 +206,7 @@ export class CompassDashboard {
 		const nameWidth = Math.max(18, Math.min(42, width - 42));
 		add(` ${padAnsi(th.fg("muted", "市场"), nameWidth)} ${padAnsi(th.fg("muted", "Gate"), 8)} ${padAnsi(th.fg("muted", "Score"), 8)} ${th.fg("muted", "快照 / 来源")}`);
 		for (const market of [...this.store.markets].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).slice(0, 20)) {
-			const snapshot = this.store.snapshots.filter((item) => item.marketId === market.id).sort((a, b) => b.capturedAt.localeCompare(a.capturedAt))[0];
+			const snapshot = this.store.snapshots.filter((item) => item.marketId === market.id).sort(compareSnapshotRecencyDesc)[0];
 			const candidate = this.store.candidates.find((item) => item.marketId === market.id);
 			const outcome = candidate?.gateOutcome;
 			const gate = outcome === "pass" ? th.fg("success", "PASS") : outcome === "reject" ? th.fg("error", "REJECT") : outcome === "review" ? th.fg("warning", "REVIEW") : th.fg("dim", "—");
@@ -258,7 +262,7 @@ export class CompassDashboard {
 		const th = this.theme;
 		const pools = budgetStatus(this.store);
 		add("");
-		add(` ${th.fg("accent", th.bold("数据源与预算 · 当月"))}`);
+		add(` ${th.fg("accent", th.bold(`数据源与预算 · ${budgetMonth()} (UTC)`))}`);
 		const sourceWidth = Math.max(14, Math.min(24, width - 50));
 		add(` ${padAnsi(th.fg("muted", "数据源"), sourceWidth)} ${padAnsi(th.fg("muted", "档位"), 6)} ${padAnsi(th.fg("muted", "已用/上限"), 16)} ${padAnsi(th.fg("muted", "调用"), 12)} ${th.fg("muted", "状态")}`);
 		for (const pool of pools) {
@@ -273,5 +277,6 @@ export class CompassDashboard {
 		const total = this.store.costEvents.reduce((sum, event) => sum + event.amountCny, 0);
 		add("");
 		add(` ${th.fg("muted", `累计成本 ¥${total.toFixed(2)} · 可归因到市场 ¥${attributed.toFixed(2)} · 归因率 ${total > 0 ? ((attributed / total) * 100).toFixed(0) : "100"}%`)}`);
+		add(` ${th.fg("dim", "结算月按 UTC 计：北京时间每月 1 日 08:00 额度清零")}`);
 	}
 }

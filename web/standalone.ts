@@ -30,6 +30,11 @@ async function main(): Promise<void> {
 	const storePath = join(projectRoot, ".pi", "compass", "store.json");
 	if (!existsSync(storePath)) {
 		console.warn(`警告：${storePath} 不存在，罗盘工作台将以空数据启动（尚未导入过任何市场）`);
+		// 最常见的误启动：在 Extension 仓库目录内跑 `npm run web`，于是把仓库自己当成了宿主项目根，
+		// 页面全空却看不出原因。只说「以空数据启动」不足以让人反应过来，这里点破目录走错了。
+		if (/[/\\]\.pi[/\\]extensions[/\\][^/\\]+$/.test(projectRoot)) {
+			console.warn("提示：当前目录看起来是 Extension 仓库目录而非宿主项目根。请回到宿主项目根启动，或用 COMPASS_ROOT=../../.. 指定它");
+		}
 	}
 
 	const port = resolvePort(process.argv.slice(2));

@@ -353,3 +353,27 @@ test("todos DTO carries resolution summaries, status badges, and the resolved pa
 	// 懒加载红线：DTO 不得序列化快照明细
 	assert.ok(!JSON.stringify(data).includes('"listings"'));
 });
+
+// —— 审计 M92 回归 ——
+// importMarketAndScreen / marketsData / overviewData / readFile / join —— 无需新增 import
+test("markets freshness 覆盖 screen_only 档且 30 天边界仍算粗筛可用", async () => {
+	const store = createEmptyStore("2026-01-01T00:00:00.000Z");
+	ensureDefaults(store, "test");
+	const csv = await readFile(join(here, "../examples/demo-market.csv"), "utf8");
+	for (const [name, capturedAt] of [["边界30天", "2026-07-27T00:00:00.000Z"], ["超期31天", "2026-07-26T00:00:00.000Z"]] as const) {
+		const parsed = parseMarketCsv(csv, { source: "sellersprite", capturedAt });
+		importMarketAndScreen(store, { marketName: name, parsed, capturedAt, actor: "tester", runScreen: true });
+	}
+	const markets = marketsData(store, NOW);
+	const edge = markets.rows.find((row) => row.name === "边界30天");
+	const over = markets.rows.find((row) => row.name === "超期31天");
+	assert.equal(edge?.snapshotAgeDays, 30);
+	assert.equal(edge?.freshness, "screen_only");
+	assert.equal(edge?.freshnessLabel, "仅适合粗筛（≤30天）");
+	assert.equal(over?.snapshotAgeDays, 31);
+	assert.equal(over?.freshness, "stale");
+	assert.equal(over?.freshnessLabel, "已过期（>30天）");
+	assert.equal(markets.freshnessCounts.screen_only, 1);
+	assert.equal(markets.freshnessCounts.stale, 1);
+	assert.equal(overviewData(store, NOW).kpi.staleMarkets30d, 1, "边界 30 天不计入待补数");
+});

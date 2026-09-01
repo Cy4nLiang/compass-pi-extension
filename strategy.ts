@@ -1,11 +1,15 @@
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
+import { DEFAULT_TARGET_DAILY_UNITS, DEFAULT_TARGET_MONTHLY_UNITS } from "./defaults.ts";
 import { qualifyRankDepth } from "./metrics.ts";
 import type {
 	ListingRecord,
+	MetricEvidence,
 	MetricMap,
+	MetricScalar,
 	RuleEvaluation,
 	StrategyDefinition,
 	StrategyEvaluation,
+	StrategyMode,
 } from "./types.ts";
 
 export interface StrategyContext {
@@ -17,6 +21,67 @@ export interface StrategyContext {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+// MetricMap 是 JSON 往返出来的普通对象，原型上挂着 constructor / __proto__ / toString /
+// valueOf / hasOwnProperty。直接下标读会把这些原型属性当成「存在但没有 value」的指标：
+// missing 不再传播，require 规则凭空 pass，违反「缺失硬指标 → 结论为 review」。
+// 指标查表一律先过 Object.hasOwn（与 parsePrimary 里 LITERALS 的写法保持一致）。
+// qualify_rank_depth 的口径描述形状（metrics.ts 的 targetDependentMetrics 生成）。
+// 它不是诊断，追加进 derived 证据只会并列两段互斥口径。
+// 数字部分要容忍小数：monthly_units_q 只被 POSITIVE_META_FIELDS 要求「有限正数」，
+// 不要求整数，写 250.5 时 metrics 生成的就是「月销≥250.5 的 listing 数」，
+// 用 \\d+ 匹配不到就会重新串出两段口径。
+const SCOPE_NOTE = /^月销≥[\d.]+ 的 listing 数$/u;
+
+function readMetric(metrics: MetricMap, name: string): MetricEvidence | undefined {
+	return Object.hasOwn(metrics, name) ? metrics[name] : undefined;
+}
+
+// 取标量：键不存在、指标对象为空、value 为 null，或 JSON 往返把 value 键整个丢掉
+// （`{value: undefined}` 序列化后不落盘），统一折成 null 表示「缺数据」。
+function readMetricValue(metrics: MetricMap, name: string): MetricScalar {
+	return readMetric(metrics, name)?.value ?? null;
+}
+
+// 评分维度白名单：与 calculateDimensionScores 的返回键一一对应。
+// 返回类型写成 Record<ScoringDimension, number>，任何一边漏改都会在 tsc 阶段报错。
+export const SCORING_DIMENSIONS = ["demand", "competition", "unit_economics", "product", "risk"] as const;
+export type ScoringDimension = (typeof SCORING_DIMENSIONS)[number];
+
+// 归一化口径白名单：percentile 由 scanMarkets 做同批分位化，none 表示保留策略引擎的有界基准分。
+const NORMALIZE_MODES = ["percentile", "none"] as const;
+
+// meta 里必须是「有限正数」的数值字段：写了就得是正数，只有整条不写才回落缺省。
+const POSITIVE_META_FIELDS = [
+	"target_daily_units",
+	"monthly_units_q",
+] as const;
+
+// 天数字段还要求是**正整数**：下游 history.ts 的 positiveInteger 会 Math.floor，
+// 0.5 天会被压成 0 天 —— retro_due 于是恒为到期、录了实绩也清不掉，且全程无报错。
+// 与其让它静默劣化，不如在保存策略时就拒绝。
+const POSITIVE_INTEGER_META_FIELDS = [
+	"retro_go_days",
+	"retro_testing_stale_days",
+	"retro_waitlist_days",
+	"retro_no_go_days",
+	"retro_review_days",
+] as const;
+
+function positiveMetaNumber(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+// 月销门槛（QRD 的 q）的唯一读取口径。存量 store 里的 definition 没经过新版校验就直接落盘，
+// 所以这里仍然做防御式回落，而不是假设 parseStrategyYaml 已经把非法值全挡在门外。
+export function strategyTargetMonthlyUnits(definition?: StrategyDefinition): number {
+	return positiveMetaNumber(definition?.meta?.monthly_units_q) ?? DEFAULT_TARGET_MONTHLY_UNITS;
+}
+
+// 日均目标单量的唯一读取口径，回落规则同上。
+export function strategyTargetDailyUnits(definition?: StrategyDefinition): number {
+	return positiveMetaNumber(definition?.meta?.target_daily_units) ?? DEFAULT_TARGET_DAILY_UNITS;
 }
 
 function rankedTop100(listings: ListingRecord[]): ListingRecord[] {
@@ -47,9 +112,26 @@ export function parseStrategyYaml(yaml: string): StrategyDefinition {
 	if (raw.meta.display_name !== undefined && typeof raw.meta.display_name !== "string") {
 		throw new Error("策略 meta.display_name 必须是字符串");
 	}
+	// 数值口径在这里定型：不再放行 "300个" / "500" / -5 / 0 / null 之类靠下游 Number() 各自解释的写法
+	for (const field of POSITIVE_META_FIELDS) {
+		const value = raw.meta[field];
+		if (value === undefined) continue;
+		if (positiveMetaNumber(value) === undefined) {
+			// 数字原样打印（NaN/Infinity 不被 JSON.stringify 吞成 null），其余带引号回显运营写的原文
+			throw new Error(`策略 meta.${field} 必须是有限正数，实际为 ${typeof value === "number" ? value : JSON.stringify(value)}`);
+		}
+	}
+	for (const field of POSITIVE_INTEGER_META_FIELDS) {
+		const value = raw.meta[field];
+		if (value === undefined) continue;
+		if (positiveMetaNumber(value) === undefined || !Number.isInteger(value)) {
+			throw new Error(`策略 meta.${field} 必须是正整数天数（下游按整天计算，0.5 会被截成 0 天让复盘永远到期），实际为 ${typeof value === "number" ? value : JSON.stringify(value)}`);
+		}
+	}
 	if (!Array.isArray(raw.stages) || raw.stages.length === 0) throw new Error("策略 stages 至少需要一个阶段");
 	if (!isRecord(raw.scoring) || !isRecord(raw.scoring.weights)) throw new Error("策略 scoring.weights 必填");
 
+	const ruleIds = new Set<string>();
 	const stages = raw.stages.map((stageValue, stageIndex) => {
 		if (!isRecord(stageValue) || typeof stageValue.stage !== "string" || !Array.isArray(stageValue.rules)) {
 			throw new Error(`stages[${stageIndex}] 必须包含 stage 与 rules`);
@@ -63,6 +145,10 @@ export function parseStrategyYaml(yaml: string): StrategyDefinition {
 			if (typeof ruleValue.id !== "string" || typeof ruleValue.when !== "string") {
 				throw new Error(`stages[${stageIndex}].rules[${ruleIndex}] 的 id 与 when 必须是字符串`);
 			}
+			if (!ruleValue.id.trim()) throw new Error(`stages[${stageIndex}].rules[${ruleIndex}] 的 id 不能为空`);
+			// 复盘重放、命中统计、Web 详情都按 rule id 对齐，重复 id 会让证据张冠李戴
+			if (ruleIds.has(ruleValue.id)) throw new Error(`规则 id 重复：${ruleValue.id}，同一策略内必须全局唯一`);
+			ruleIds.add(ruleValue.id);
 			// Parse once during validation so invalid expressions fail before a version is saved.
 			evaluateExpression(ruleValue.when, { metrics: {}, listings: [] });
 			return {
@@ -77,6 +163,11 @@ export function parseStrategyYaml(yaml: string): StrategyDefinition {
 
 	const weights: Record<string, number> = {};
 	for (const [name, value] of Object.entries(raw.scoring.weights)) {
+		// 维度是 calculateDimensionScores 硬编码的五个，拼错的键既拿不到真实维度分，
+		// 又会以 50 分的伪维度混进加权总分，所以直接拒绝
+		if (!(SCORING_DIMENSIONS as readonly string[]).includes(name)) {
+			throw new Error(`scoring.weights.${name} 不是可用维度，只能取 ${SCORING_DIMENSIONS.join(" / ")}`);
+		}
 		if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
 			throw new Error(`scoring.weights.${name} 必须是非负数字`);
 		}
@@ -84,6 +175,10 @@ export function parseStrategyYaml(yaml: string): StrategyDefinition {
 	}
 	if (Object.values(weights).reduce((sum, value) => sum + value, 0) <= 0) {
 		throw new Error("scoring.weights 合计必须大于 0");
+	}
+	const normalize = raw.scoring.normalize;
+	if (normalize !== undefined && (typeof normalize !== "string" || !(NORMALIZE_MODES as readonly string[]).includes(normalize))) {
+		throw new Error(`策略 scoring.normalize 只能取 ${NORMALIZE_MODES.join(" / ")}`);
 	}
 
 	const meta: StrategyDefinition["meta"] = { ...raw.meta, name: raw.meta.name.trim() };
@@ -97,7 +192,7 @@ export function parseStrategyYaml(yaml: string): StrategyDefinition {
 		stages,
 		scoring: {
 			weights,
-			normalize: typeof raw.scoring.normalize === "string" ? raw.scoring.normalize : undefined,
+			normalize,
 		},
 	};
 }
@@ -189,6 +284,10 @@ interface EvalValue {
 	value: unknown;
 	missing: boolean;
 	references: Set<string>;
+	// 表达式自带阈值的函数（目前只有 qualify_rank_depth(q)）在求值过程中产出的证据：
+	// 规则 evidence 必须是「这条表达式真正算的那个数」，不能拿 context.metrics 里按 meta q
+	// 算的另一个数冒充（M15：evidence 显示 22、表达式实际求 4）。只在顶层结果上出现。
+	derived?: Record<string, MetricEvidence>;
 }
 
 function mergeReferences(...values: EvalValue[]): Set<string> {
@@ -211,6 +310,8 @@ class ExpressionParser {
 	private index = 0;
 	private readonly tokens: Token[];
 	private readonly context: StrategyContext;
+	// 本次表达式里带阈值的函数调用产出的证据，evaluateExpression 在顶层一次性带出
+	readonly derivedEvidence = new Map<string, MetricEvidence>();
 
 	constructor(tokens: Token[], context: StrategyContext) {
 		this.tokens = tokens;
@@ -344,10 +445,10 @@ class ExpressionParser {
 				return this.callFunction(name, args);
 			}
 			if (Object.hasOwn(LITERALS, name)) return { value: LITERALS[name], missing: false, references: new Set() };
-			const metric = this.context.metrics[name];
+			const value = readMetricValue(this.context.metrics, name);
 			return {
-				value: metric?.value ?? undefined,
-				missing: !metric || metric.value === null,
+				value: value ?? undefined,
+				missing: value === null,
 				references: new Set([name]),
 			};
 		}
@@ -363,8 +464,37 @@ class ExpressionParser {
 			if (!Number.isFinite(threshold) || threshold < 0) throw new Error("qualify_rank_depth(q) 的 q 必须是非负数字");
 			const top = rankedTop100(this.context.listings);
 			const hasSales = top.some((listing) => listing.monthlySales !== undefined);
+			const depth = hasSales ? qualifyRankDepth(top, threshold) : null;
+			// 证据 = 这条表达式自己算出来的那个数，口径就是表达式里的 threshold。
+			// 底座沿用 context 里的同名证据（source / capturedAt / confidence / sampleSize 与它同源），
+			// 手工构造的 context 可能没有该项，那就不产出 derived，退回原来的取值方式。
+			// **已知边界**：derivedEvidence 以指标名为键，装不下同名的两份证据。同一条表达式里
+			// 写两次 qualify_rank_depth(q) 且 q 不同时（如「≥300 有 20 个 或 ≥800 有 5 个」这种
+			// 两档门槛），只会留下最后一次调用的阈值与取值，前一档在规则证据里看不到。
+			// 求值结果本身是对的，错的只是证据展示。要真正支持得改 evidence 的数据结构
+			// （波及 types.ts 的 RuleEvaluation 与 service.ts 的消费点），是产品取舍、留给人拍板。
+			// 走 readMetric 而不是直接下标：与本文件其余取指标的路径同口径（Object.hasOwn），
+			// 否则原型链上的同名属性会被当成真证据。
+			const basis = readMetric(this.context.metrics, "qualify_rank_depth");
+			if (basis) {
+				// note 用**追加**而不是覆盖：明细缺失时 basis.note 里写的是「为什么算不出来」，
+				// 直接覆盖成口径描述会把唯一的诊断线索抹掉。两者都留着，口径在前、诊断在后。
+				const scope = `月销≥${threshold} 的 listing 数`;
+				this.derivedEvidence.set("qualify_rank_depth", {
+					...basis,
+					value: depth,
+					// 只追加**诊断型** note。metrics.ts 的 targetDependentMetrics 给这个指标写的 note
+				// 永远是 `月销≥<q> 的 listing 数`（与 value 是否为 null 无关），那是口径描述不是诊断；
+				// 无条件追加会串成「月销≥300 的 listing 数；月销≥300 的 listing 数」，阈值不同时更会
+				// 并列两个互斥口径，让人无从判断这条 null 按哪个 q 算。真正的诊断只有 service.ts 那条
+				// 「快照明细缺失…」，按「形状不是口径描述」来认，比按 value===null 稳（后者筛不掉
+				// 「冻结 q 与策略 q 相同、但冻结值本身就是 null」这一格）。
+				note: depth === null && basis.note && !SCOPE_NOTE.test(basis.note) ? `${scope}；${basis.note}` : scope,
+					targetMonthlyUnits: threshold,
+				});
+			}
 			return {
-				value: hasSales ? qualifyRankDepth(top, threshold) : undefined,
+				value: hasSales ? depth ?? undefined : undefined,
 				missing: !hasSales,
 				references,
 			};
@@ -374,11 +504,15 @@ class ExpressionParser {
 }
 
 export function evaluateExpression(expression: string, context: StrategyContext): EvalValue {
-	return new ExpressionParser(tokenize(expression), context).parse();
+	const parser = new ExpressionParser(tokenize(expression), context);
+	const result = parser.parse();
+	return parser.derivedEvidence.size
+		? { ...result, derived: Object.fromEntries(parser.derivedEvidence) }
+		: result;
 }
 
 function metricNumber(metrics: MetricMap, name: string): number | undefined {
-	const value = metrics[name]?.value;
+	const value = readMetricValue(metrics, name);
 	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
@@ -391,7 +525,7 @@ function average(values: Array<number | undefined>): number {
 	return known.length ? known.reduce((sum, value) => sum + value, 0) / known.length : 50;
 }
 
-export function calculateDimensionScores(metrics: MetricMap, targetMonthlyUnits = 300): Record<string, number> {
+export function calculateDimensionScores(metrics: MetricMap, targetMonthlyUnits = DEFAULT_TARGET_MONTHLY_UNITS): Record<ScoringDimension, number> {
 	const qrd = metricNumber(metrics, "qualify_rank_depth");
 	const waistSales = metricNumber(metrics, "waist_monthly_sales");
 	const keywordVolume = metricNumber(metrics, "keyword_search_volume");
@@ -432,10 +566,10 @@ export function calculateDimensionScores(metrics: MetricMap, targetMonthlyUnits 
 	]);
 
 	const riskValues: Array<number | undefined> = ["risk_overall", "cert_status", "ip_risk_level", "policy_flag", "logistics_risk"].map((name) => {
-		const value = metrics[name]?.value;
+		const value = readMetricValue(metrics, name);
 		return value === "pass" || value === "clear" ? 100 : value === "review" ? 45 : value === "red" ? 0 : undefined;
 	});
-	const season = metrics.season_flag?.value;
+	const season = readMetricValue(metrics, "season_flag");
 	riskValues.push(season === "clear" ? 100 : season === "strong" ? 25 : season === "review" ? 50 : undefined);
 	const risk = average(riskValues);
 
@@ -451,7 +585,7 @@ export function calculateDimensionScores(metrics: MetricMap, targetMonthlyUnits 
 export function evaluateStrategy(
 	strategy: StrategyDefinition,
 	context: StrategyContext,
-	mode: "screen" | "full" = "full",
+	mode: StrategyMode = "full",
 ): StrategyEvaluation {
 	const stages = mode === "screen" ? strategy.stages.filter((stage) => stage.stage === "market_screen") : strategy.stages;
 	const rules: RuleEvaluation[] = [];
@@ -464,11 +598,21 @@ export function evaluateStrategy(
 				const references = [...evaluation.references];
 				const missing = references.filter((reference) => {
 					if (reference === "qualify_rank_depth") return !rankedTop100(context.listings).some((listing) => listing.monthlySales !== undefined);
-					return !context.metrics[reference] || context.metrics[reference].value === null;
+					return readMetricValue(context.metrics, reference) === null;
 				});
 				for (const name of missing) missingMetrics.add(name);
+				// 表达式自带阈值的引用（qualify_rank_depth(q)）以本次求值产出的证据为准，
+				// 其余引用照常取 context.metrics
 				const evidence = Object.fromEntries(
-					references.map((reference) => [reference, context.metrics[reference] ?? (reference === "qualify_rank_depth" ? context.metrics.qualify_rank_depth : undefined)]),
+					// derived 由 Object.fromEntries 生成、带完整 Object.prototype，直接下标会把
+					// toString / constructor 这类原型属性当成真证据（存量 store 的 metrics 是 JSON 往返对象，
+					// 正是 readMetric 要防的场景）。与同文件 readMetric 保持同一口径。
+					references.map((reference) => [
+						reference,
+						evaluation.derived && Object.hasOwn(evaluation.derived, reference)
+							? evaluation.derived[reference]
+							: readMetric(context.metrics, reference),
+					]),
 				);
 
 				if (evaluation.missing) {
@@ -529,11 +673,13 @@ export function evaluateStrategy(
 		: rules.some((rule) => ["review", "missing", "error"].includes(rule.status))
 			? "review"
 			: "pass";
-	const dimensionScores = calculateDimensionScores(context.metrics, context.targetMonthlyUnits ?? 300);
+	const dimensionScores: Record<string, number> = calculateDimensionScores(context.metrics, context.targetMonthlyUnits ?? DEFAULT_TARGET_MONTHLY_UNITS);
 	const weightEntries = Object.entries(strategy.scoring.weights);
 	const totalWeight = weightEntries.reduce((sum, [, weight]) => sum + weight, 0);
+	// 存量 store 里的 definition 绕过了 parseStrategyYaml，可能仍存着 constructor 之类的原型键：
+	// 用 hasOwn 取值，避免把 Object.prototype 上的函数乘进总分得到 NaN
 	const score = totalWeight > 0
-		? weightEntries.reduce((sum, [dimension, weight]) => sum + (dimensionScores[dimension] ?? 50) * weight, 0) / totalWeight
+		? weightEntries.reduce((sum, [dimension, weight]) => sum + (Object.hasOwn(dimensionScores, dimension) ? dimensionScores[dimension] : 50) * weight, 0) / totalWeight
 		: 50;
 
 	return {

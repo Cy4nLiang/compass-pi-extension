@@ -453,15 +453,27 @@ test("divergence suppression tracks the compared-snapshot set, not just its newe
 	addSnapshot(store, "st1", "m1", "2026-08-18T00:00:00.000Z", {}, "sorftime");
 	// 水位口径与 metricDivergences 同源：各来源最新快照的指纹（Task 3 勾选时落同一个值）
 	const watermark = divergenceWatermarks(store).get("m1");
-	assert.equal(watermark, "sellersprite@2026-08-20T00:00:00.000Z|sorftime@2026-08-18T00:00:00.000Z");
+	// 指纹带 #importedAt：只比 capturedAt 无法区分「同一天重导的修正版」，
+	// 修正版改写了参与比较的快照却不改指纹 = 已勾选条目继续被抑制 = 漏提醒。
+	assert.equal(watermark, "sellersprite@2026-08-20T00:00:00.000Z#2026-08-20T00:00:00.000Z|sorftime@2026-08-18T00:00:00.000Z#2026-08-18T00:00:00.000Z");
 	addResolution(store, "todo_metric_divergence_m1", "metric_divergence", resolvedFields({ snapshotWatermark: watermark }));
 	const divergentMarkets = [{ marketId: "m1", metrics: ["cr3"] }];
 	const divergences = () => derive(store, { divergentMarkets }).filter((todo) => todo.kind === "metric_divergence");
 	// 等值边界：参与比较的快照集合未变，仍抑制
 	assert.equal(divergences().length, 0);
-	// 同来源同 capturedAt 重复导出：metricDivergences 仍取先入库那条，参与比较的值不变 → 仍抑制
+	// 同来源、同 capturedAt、同 importedAt（addSnapshot 让两者相等，构造出完全并列）：
+	// 稳定排序仍取先入库那条，参与比较的值不变 → 仍抑制
 	addSnapshot(store, "st1_dup", "m1", "2026-08-18T00:00:00.000Z", {}, "sorftime");
 	assert.equal(divergences().length, 0);
+	// G6：同一天重导的修正版（capturedAt 相同、importedAt 更晚）会替换 sorftime 参与比较的快照，
+	// 偏差事实已被改写 → 水位必须失效浮出（漏提醒防线）
+	store.snapshots.push({
+		id: "st1_fixed", marketId: "m1", source: "sorftime",
+		capturedAt: "2026-08-18T00:00:00.000Z", importedAt: "2026-08-18T09:30:00.000Z",
+		rowCount: 0, listings: [], keywords: [], metrics: {}, warnings: [],
+	});
+	assert.equal(divergences()[0]?.resolution?.lapsed, true, "同日重导的修正版改写偏差事实后不得继续抑制");
+	store.snapshots = store.snapshots.filter((snapshot) => snapshot.id !== "st1_fixed");
 	// 回填补录：capturedAt 早于全市场最新，但替换了 sorftime 参与比较的快照，偏差事实已被改写 → 必须浮出
 	addSnapshot(store, "st2", "m1", "2026-08-19T00:00:00.000Z", {}, "sorftime");
 	assert.equal(divergences()[0]?.resolution?.lapsed, true, "回填补录改写偏差事实后不得继续抑制（漏提醒防线）");
@@ -548,3 +560,59 @@ test("resolution records that cannot match an active todo are defensively ignore
 	delete store.todoResolutions;
 	assert.equal(derive(store, { divergentMarkets }).filter((todo) => todo.kind === "metric_divergence").length, 1);
 });
+
+// —— 审计 M92 回归 ——
+// 收敛到 snapshotFreshness 后钉住边界：恰好 30 天不算过期，第 31 天才浮出
+test("snapshot_stale 的 30 天边界含端点，lead 无快照的 7 天宽限期同样含端点", () => {
+	const store = baseStore();
+	addMarket(store, "m1", "刚好30天");
+	addCandidate(store, "c1", "m1", "screen");
+	addSnapshot(store, "s1", "m1", "2026-07-27T00:00:00.000Z");
+	addMarket(store, "m2", "31天");
+	addCandidate(store, "c2", "m2", "screen");
+	addSnapshot(store, "s2", "m2", "2026-07-26T00:00:00.000Z");
+	addMarket(store, "m3", "建卡7天无快照");
+	addCandidate(store, "c3", "m3", "lead", { createdAt: "2026-08-19T00:00:00.000Z" });
+	addMarket(store, "m4", "建卡8天无快照");
+	addCandidate(store, "c4", "m4", "lead", { createdAt: "2026-08-18T00:00:00.000Z" });
+
+	const stale = derive(store).filter((todo) => todo.kind === "snapshot_stale");
+	assert.deepEqual(stale.map((todo) => todo.marketId).sort(), ["m2", "m4"]);
+	assert.equal(stale.find((todo) => todo.marketId === "m2")?.reason, "最新快照已 31 天（>30 天）");
+	assert.equal(stale.find((todo) => todo.marketId === "m4")?.reason, "建卡已 8 天仍无快照，无法进入粗筛");
+});
+
+// —— 审计 M13/G15 回归 ——
+test("import-triggered screen runs and inconclusive checks never silence a challenged retro", () => {
+	const store = baseStore();
+	addMarket(store, "m1", "market one");
+	addCandidate(store, "cand1", "m1", "testing");
+	store.outcomeChecks.push({
+		id: "chk1",
+		marketId: "m1",
+		candidateId: "cand1",
+		decisionStatus: "no_go",
+		baselineSnapshotId: "s0",
+		evidenceSnapshotId: "s1",
+		deltas: [],
+		verdict: "challenged",
+		verdictReason: "qrd 显著恶化",
+		elapsedDays: 30,
+		createdAt: "2026-08-15T00:00:00.000Z",
+		actor: "t",
+	});
+	const surfaced = () => derive(store).filter((todo) => todo.kind === "retro_challenged").length;
+	assert.equal(surfaced(), 1);
+	const strategyLog = (id: string, createdAt: string, trigger?: "manual" | "auto_import") => {
+		store.decisionLog.push({ id, marketId: "m1", type: "strategy", trigger, conclusion: "screen Gate=pass，Score=67.9", reason: "全部规则通过", actor: "ops", createdAt });
+	};
+	strategyLog("d1", "2026-08-16T00:00:00.000Z", "auto_import");
+	assert.equal(surfaced(), 1);
+	strategyLog("d2", "2026-08-17T00:00:00.000Z");
+	assert.equal(surfaced(), 1);
+	store.outcomeChecks.push({ ...store.outcomeChecks[0], id: "chk2", verdict: "inconclusive", verdictReason: "重放证据没有晚于 T0", createdAt: "2026-08-18T00:00:00.000Z" });
+	assert.equal(surfaced(), 1);
+	strategyLog("d3", "2026-08-19T00:00:00.000Z", "manual");
+	assert.equal(surfaced(), 0);
+});
+

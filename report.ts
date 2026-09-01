@@ -1,3 +1,5 @@
+import { FRESHNESS_SHORT_LABELS, snapshotFreshness } from "./defaults.ts";
+import { strategyTargetMonthlyUnits } from "./strategy.ts";
 import type {
 	Candidate,
 	DecisionLog,
@@ -164,10 +166,8 @@ export interface MarketReportData {
 export function renderMarketReport(data: MarketReportData): GeneratedReport {
 	const { market, snapshot, strategy, metrics, evaluation, candidate, risk, review, profit, decisions, outcomeChecks, lessons, divergences, attributedCostCny, fusedBudgetSources } = data;
 	const ageDays = Math.max(0, Math.floor((Date.now() - Date.parse(snapshot.capturedAt)) / 86_400_000));
-	const freshness = ageDays <= 7 ? "深研新鲜" : ageDays <= 30 ? "仅适合粗筛" : "已过期，建议补数";
-	const targetMonthlyUnits = typeof strategy.definition.meta.monthly_units_q === "number" && Number.isFinite(strategy.definition.meta.monthly_units_q)
-		? strategy.definition.meta.monthly_units_q
-		: 300;
+	const freshness = FRESHNESS_SHORT_LABELS[snapshotFreshness(ageDays)];
+	const targetMonthlyUnits = strategyTargetMonthlyUnits(strategy.definition);
 	const costs = attributedCostCny;
 
 	const lines: string[] = [

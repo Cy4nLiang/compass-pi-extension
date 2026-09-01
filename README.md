@@ -66,6 +66,8 @@ Agent 会先调用 `compass_tools`，按需动态激活相关工具。
 | `compass_history` | 时间线、决策检索、相似市场、OutcomeCheck 统计与经验卡 |
 | `compass_retro` | 到期复盘、快照对照、实绩录入、复盘报告、策略回测与 Lesson 管理 |
 
+所有带 `strategy_id` 的工具（`compass_market_scan`、`compass_market_report`、`compass_strategy_run`、`compass_strategy_manage` 的 `get`/`clone`、`compass_retro` 的 `backtest`）用同一种写法：策略 id、策略名称，或 `id@vN` 锁定历史版本；不写 `@vN` 时一律取该策略的最新版本。
+
 ## Slash commands
 
 - `/compass-help`：在 pi 会话中显示运营使用手册
@@ -73,7 +75,7 @@ Agent 会先调用 `compass_tools`，按需动态激活相关工具。
 - `/compass-web [端口|stop]`：启动本地浏览器版工作台（八页：总览/待办/市场/市场档案/候选池/预算/复盘/导入），无参复用已在跑的服务，数字参数指定端口，`stop` 关闭
 - `/compass-import <csv>`：交互导入
 - `/compass-report [market_id|市场名]`：生成报告并作为 TUI 会话条目显示
-- `/compass-strategy [strategy_id]`：编辑 YAML 并保存新版本
+- `/compass-strategy [策略 id|名称|id@vN]`：编辑 YAML 并保存新版本（写 `@vN` 可基于历史版本改，保存仍是追加新版本）
 - `/compass-retro`：交互式复盘会（到期项 → 对照/实绩 → 报告 → Lesson）
 - `/compass-history-brief on|off`：切换本会话自动历史速览与工具尾注
 
@@ -90,12 +92,19 @@ Agent 会先调用 `compass_tools`，按需动态激活相关工具。
 也可以完全脱离 pi 独立启动：
 
 ```bash
-cd .pi/extensions/compass
-npm run web                          # 默认端口 4780
-COMPASS_WEB_PORT=5000 npm run web    # 或 npm run web -- --port 5000
+node --experimental-strip-types .pi/extensions/compass/web/standalone.ts              # 默认端口 4780
+node --experimental-strip-types .pi/extensions/compass/web/standalone.ts --port 5000  # 或 COMPASS_WEB_PORT=5000
 ```
 
-`COMPASS_ROOT` 环境变量指定宿主项目根目录（默认当前目录）；`Ctrl+C` 优雅退出。
+**必须在宿主项目根目录执行**：工作台把当前目录当作宿主项目根，去读它下面的 `.pi/compass/store.json`。`COMPASS_ROOT` 环境变量可显式指定宿主项目根（默认当前目录）；`Ctrl+C` 优雅退出。
+
+在 `.pi/extensions/compass/` 目录里跑 `npm run web` 也能起服务，但宿主项目根会被算成这个仓库自己、读不到你的数据，页面一片空白——真要在仓库目录里起，必须补上 `COMPASS_ROOT`：
+
+```bash
+cd .pi/extensions/compass && COMPASS_ROOT=../../.. npm run web
+```
+
+启动时若打印「`.../.pi/compass/store.json` 不存在，将以空数据启动」，就是启动目录不对。
 
 **仅绑定 `127.0.0.1`，不做鉴权（本机单用户模型）：不要用端口转发把它暴露到局域网或公网**——工作台能读写全部选品经营数据。
 
@@ -128,17 +137,27 @@ Extension：
 
 ## CSV 字段
 
-支持 UTF-8、UTF-16LE/BE，逗号/Tab/分号/竖线分隔和带引号字段。中英文别名覆盖：
+支持 UTF-8（含 BOM）、UTF-16LE/BE；不是合法 UTF-8 时自动尝试按 GB18030（GBK）回退解码并给出告警，表头仍是乱码且几乎映射不到列时拒绝导入而不是落一份空指标快照。分隔符按「每行计数一致性」嗅探，逗号/Tab/分号/竖线分隔和带引号字段都支持。中英文别名覆盖：
 
 - ASIN、标题、排名、价格、星级、评论数、月销量、月销售额；
 - 品牌、卖家类型/是否 Amazon 自营、上架日期/月龄、类目；
 - 关键词、搜索量、建议 CPC。
 
-Sorftime 等 MCP 在线调用由罗盘自动计量（按次计入 `sorftime` 预算池，默认只计数；单价仅用于折算成本，配置**月度金额上限或次数上限**后按「金额或次数任一达 80%/100%」告警/熔断，熔断时会拦截后续调用并提示解除方式）。已知局限：`mcpScript` 批量脚本内的调用无法归因不计量；会话异常退出会丢失最后一批未落盘计数；跨月交界的最后一批计数记入落盘当月。`.xlsx` 尚未直接解析，请先使用工具的官方 CSV 导出。自定义策略的 `screen` 模式只执行阶段名为 `market_screen` 的规则；若没有该阶段或规则为空，会转人工复核，不会判绿。报告自定义输出路径必须位于 `.pi/compass/reports/` 且使用 `.md` 扩展名。完全相同文件的 SHA-256 会被拒绝重复导入；同市场不同日期的新 CSV 仍会追加不可变快照并自动做历史对照。
+数值列的解析口径（缺数据一律按缺失处理，不伪装成 0）：
+
+- **占位文本**（`暂无` / `未知` / `待定` / `TBD` / `?` / `--` / `N/A` / `NaN` / Excel 错误值 / 只有货币符号等）判为缺失，不再算成 `0`；真实的 `0`（如评论数为 0）照常保留。整份文件里这类单元格会汇总成一条告警，并按列名给出条数。
+- **一格多值**不猜测：`4.5 (1,234)`、`5 x 3 x 2` 判为缺失；`4.5 out of 5 stars`、`4.5/5` 这类五分制写法取分子。量词后缀（`万`/`千`/`亿`/`k`/`m`）只在紧跟数字时生效，`5cm`、`100 km` 不会被当成百万。
+- **评分列**额外做 0–5 范围校验，百分制与越界值判为缺失。
+- **上架日期**支持 ISO（含毫秒与时区）、`2024/1/5`、`2024.1.5`、`2024年1月5日` 与 Excel 序列号；该列识别率低于 50% 时给出告警。
+- **关键词行去重**：宽表导出常把同一个流量词复制到每条 listing 行上，这类文件会按关键词折叠后再合计搜索量（否则词族搜索量会按行数放大一个量级），并提示「疑似宽表布局、词族可能不完整」。
+- **AMZ 自营占比**按月销加权，有效样本是「卖家类型与月销量**同时**有值」的行；有效样本不足半数时按缺失处理转人工复核，不从少数已标记行反推出 0% 或 100%。告警会点名到底缺的是自营列还是月销量列。
+- **主词 CPC 为 0** 视为「无竞价数据」而非零成本流量，CPC 承受度 Gate 转待复核。
+
+Sorftime 等 MCP 在线调用由罗盘自动计量（按次计入 `sorftime` 预算池，默认只计数；单价仅用于折算成本，配置**月度金额上限或次数上限**后按「金额或次数任一达 80%/100%」告警/熔断，熔断时会拦截后续调用并提示解除方式，池被 `enabled=false` 禁用时同样直接拦截；**计次口径**是「请求有没有发到服务端」——成功、服务端返回业务错误、30 秒超时、请求发出后被中断或取消都算一次，认证/连接/退避/审批等请求根本没发出去的失败不算；**结算月按 UTC 月计**——北京时间每月 1 日 08:00 整额度清零，1 日凌晨 0–8 点的调用仍记上个月）。已知局限：`mcpScript` 批量脚本内的调用无法归因不计量；会话异常退出会丢失最后一批未落盘计数；跨月交界（同样以 UTC 月界为准）的最后一批计数记入落盘当月。`.xlsx` 尚未直接解析，请先使用工具的官方 CSV 导出。自定义策略的 `screen` 模式只执行阶段名为 `market_screen` 的规则；若没有该阶段或规则为空，会转人工复核，不会判绿。报告自定义输出路径必须位于 `.pi/compass/reports/` 且使用 `.md` 扩展名。完全相同文件的 SHA-256 会被拒绝重复导入；同市场不同日期的新 CSV 仍会追加不可变快照，并对**已有人工决策**的市场自动做历史对照。
 
 ## 历史与复盘
 
-新快照与决策基线相隔至少 7 天时，导入流程会自动重放 `no_go` 的原 veto/fail 规则并写入 `OutcomeCheck`。`validated` 表示既有判断得到后验支持，`challenged` 只表示建议人工复看，`inconclusive` 表示证据不足；系统不会自动翻转候选决策。go 品应通过 `compass_retro action=record_actuals` 录入日销、TACOS、退货率和净利率。
+**该市场已有人工决策留痕（`compass_pool decide`）**、且新快照与该决策的基线快照相隔至少 7 天时，导入流程会自动重放 `no_go` 的原 veto/fail 规则并写入 `OutcomeCheck`；从未做过决策的市场不会自动对照——需要看「策略结论本身站不站得住」时，用 `compass_retro action=check` 显式发起。「验证率」只统计挂到人工决策锚点的对照，无锚点的策略自我对照单列、不进比率。`validated` 表示既有判断得到后验支持，`challenged` 只表示建议人工复看，`inconclusive` 表示证据不足；系统不会自动翻转候选决策。go 品应通过 `compass_retro action=record_actuals` 录入日销、TACOS、退货率和净利率。验证率、go 达成率、no_go 正确率与错杀率**按市场去重**：同一市场刷再多次快照也只取最新一条可判对照、只算一票，无决策锚点与 `inconclusive` 的对照不计入；对照次数单独列出，与 `compass_retro action=backtest` 的一致率同口径。
 
 Lesson 必须关联现存的 `chk_*`、`dec_*` 或 `run_*` evidence。默认复盘周期为 go 30 天、testing 停留 60 天、waitlist 45 天、no_go 抽样 90 天、review 30 天，可在策略 `meta` 中调整。罗盘会按选品意图注入有预算上限的历史速览；直接读取 `store.json`/快照 sidecar 会被护栏拦截，请使用 `compass_history`。
 

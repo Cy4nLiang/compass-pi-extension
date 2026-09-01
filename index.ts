@@ -14,11 +14,15 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Box, Markdown, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { DOMAIN_TOOLS, rankTools, searchTerms } from "./catalog.ts";
+import { compareSnapshotRecencyDesc, snapshotTtlDays } from "./defaults.ts";
 import { estimateProfit, normalizeProfitInput } from "./economics.ts";
-import { capHistoryLines, marketMatchesPrompt, renderHistoryBrief, renderSessionLedger, type SessionLedgerItem } from "./history.ts";
+import { capHistoryLines, marketMatchesPrompt, renderHistoryBrief, renderSessionLedger, retroReportFileName, type SessionLedgerItem } from "./history.ts";
 import { performCsvImport } from "./importer.ts";
 import {
 	backtestStrategies,
+	type BacktestAlignmentSide,
+	budgetMonth,
 	budgetStatus,
 	buildStrategyContext,
 	candidateDetail,
@@ -34,6 +38,7 @@ import {
 	findCandidate,
 	findDuplicateImport,
 	findMarket,
+	findStrategyVersion,
 	generateRetroReport,
 	historyLessons,
 	historyOutcomes,
@@ -42,12 +47,11 @@ import {
 	historyTimeline,
 	importContentHash,
 	importHistoryNote,
-	latestStrategy,
+	latestSnapshotIfPresent,
 	leadHistoryNote,
 	listPoolCandidates,
 	listRetroDue,
 	listWorkbenchTodos,
-	mainCpcForMarket,
 	marketAmazonLinks,
 	generateMarketReport,
 	listStrategies,
@@ -59,6 +63,7 @@ import {
 	recordRetroActuals,
 	recordRisk,
 	reopenTodoResolution,
+	resolveProfitCpc,
 	retireLesson,
 	runStrategy,
 	saveLesson,
@@ -73,7 +78,7 @@ import {
 } from "./service.ts";
 import { CompassRepository } from "./store.ts";
 import { DEEP_RESEARCH_REQUIRED_FIELDS, todoResolutionBadge } from "./todo.ts";
-import { CANDIDATE_STAGES, DECISION_STATUSES, SNAPSHOT_SOURCES, TODO_KINDS, TODO_RESOLUTION_STATUS_LABELS, TODO_RESOLUTION_STATUSES, type CandidateStage, type CompassStore, type DecisionLog, type DecisionStatus, type OutcomeActuals, type ReviewTheme } from "./types.ts";
+import { CANDIDATE_STAGES, DECISION_LOG_TYPES, DECISION_STATUSES, GATE_OUTCOMES, POLICY_FLAGS, REVIEW_THEME_CATEGORIES, REVIEW_THEME_FIXABILITIES, RISK_STATUSES, SEASON_FLAGS, SNAPSHOT_SOURCES, STRATEGY_MODES, TODO_KINDS, TODO_RESOLUTION_STATUS_LABELS, TODO_RESOLUTION_STATUSES, type CandidateStage, type CompassStore, type DecisionLog, type DecisionStatus, type OutcomeActuals, type ReviewTheme } from "./types.ts";
 import { compactDashboardSummary, CompassDashboard } from "./ui.ts";
 import { startCompassWebServer, type CompassWebServer } from "./web/server.ts";
 
@@ -147,64 +152,12 @@ function bashReadsHistoryStore(cwd: string, command: string): boolean {
 	return command.includes(absoluteStore) || command.includes(absoluteSnapshots);
 }
 
-const DOMAIN_TOOLS = [
-	"compass_lead",
-	"compass_import_csv",
-	"compass_market_scan",
-	"compass_market_report",
-	"compass_profit_estimate",
-	"compass_strategy_run",
-	"compass_strategy_manage",
-	"compass_pool",
-	"compass_risk_check",
-	"compass_reviews_record",
-	"compass_budget",
-	"compass_todo",
-	"compass_asin_history",
-	"compass_keyword_metrics",
-	"compass_data_route",
-	"compass_history",
-	"compass_retro",
-] as const;
-
-const TOOL_CATALOG: Array<{ name: (typeof DOMAIN_TOOLS)[number]; keywords: string; description: string }> = [
-	{ name: "compass_lead", keywords: "lead clue keyword root 线索 灵感 词根 市场 创建", description: "把词根、竞品或榜单灵感建立为线索和候选卡" },
-	{ name: "compass_import_csv", keywords: "import csv 导入 卖家精灵 西柚 sorftime 快照 市场", description: "导入卖家精灵/Sorftime/通用 CSV，生成不可变市场快照" },
-	{ name: "compass_market_scan", keywords: "scan search market 市场 扫描 粗筛 筛选 qrd 新品", description: "扫描本地市场库并按 Gate、QRD、新品占比筛选" },
-	{ name: "compass_market_report", keywords: "report 报告 五维 证据 evidence 决策", description: "生成带证据链的五维选品报告" },
-	{ name: "compass_profit_estimate", keywords: "profit economics 利润 毛利 cpc fba 回本 资金", description: "计算毛利、BE-CPC、三情景净利和启动资金" },
-	{ name: "compass_strategy_run", keywords: "strategy run gate score gse 策略 执行 评分", description: "运行版本化 GSE 策略" },
-	{ name: "compass_strategy_manage", keywords: "strategy yaml edit clone 策略 编辑 复制 版本", description: "列出、读取、保存、复制策略 YAML" },
-	{ name: "compass_pool", keywords: "pool kanban candidate stage decision go waitlist no_go amazon 候选池 看板 移动 决策 链接 竞品", description: "管理候选池并记录阶段、Gate 与最终 go/waitlist/no_go 状态及原因；get 输出附 Amazon 搜索与竞品链接" },
-	{ name: "compass_risk_check", keywords: "risk patent trademark cert policy 风险 专利 商标 认证 擦边 季节", description: "记录五类风险清单与官方证据链接" },
-	{ name: "compass_reviews_record", keywords: "review pain kano 差评 评论 痛点 聚类 产品力", description: "保存差评主题、可改良性和预估星级差" },
-	{ name: "compass_budget", keywords: "budget cost quota source 预算 成本 配额 数据源 熔断 计量 调用次数", description: "查看、配置预算池并按市场记账；MCP 计量源可配单价与次数上限" },
-	{ name: "compass_todo", keywords: "todo task priority 待办 优先级 清单 人工 干预 复核 补数 处理 处理结果 提交 验证 核验 勾选 已处理 重开 闭环", description: "查看工作台待办清单（5 级优先级 + 处理状态）；闭环四类待办的提交处理结果、agent 验证、勾选已处理与重开" },
-	{ name: "compass_asin_history", keywords: "asin history bsr price 历史 价格 评论", description: "读取同一 ASIN 跨快照历史" },
-	{ name: "compass_keyword_metrics", keywords: "keyword search volume cpc 关键词 搜索量", description: "读取关键词跨快照指标" },
-	{ name: "compass_data_route", keywords: "route source freshness cost 数据 路由 新鲜度 补数", description: "按阶段、字段、新鲜度和预算规划数据源" },
-	{ name: "compass_history", keywords: "history retro 历史 复盘 相似 经验 教训 回看 验证 timeline outcome lesson", description: "统一查询时间线、决策检索、相似市场、复盘台账与经验卡" },
-	{ name: "compass_retro", keywords: "retro outcome actuals backtest lesson 复盘 实绩 回测 经验 验证 错杀", description: "执行到期复盘、快照对照、实绩录入、策略回测与经验管理" },
-];
-
 function actorName(explicit?: string): string {
 	return explicit?.trim() || process.env.USER || process.env.USERNAME || "pi-user";
 }
 
 function details(input: Omit<CompassDetails, "kind">): CompassDetails {
 	return { kind: TOOL_DETAILS_KIND, ...input };
-}
-
-function searchTerms(query: string): string[] {
-	const chunks = query.normalize("NFKC").toLocaleLowerCase().match(/[A-Za-z0-9_]+|[\u4e00-\u9fff]+/gu) ?? [];
-	const terms = new Set<string>();
-	for (const chunk of chunks) {
-		terms.add(chunk);
-		if (/^[\u4e00-\u9fff]+$/u.test(chunk)) {
-			for (let index = 0; index < chunk.length - 1; index++) terms.add(chunk.slice(index, index + 2));
-		}
-	}
-	return [...terms];
 }
 
 function textResult(text: string, toolDetails: CompassDetails) {
@@ -439,7 +392,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			market_name: Type.String({ minLength: 1, description: "细分市场/关键词族名称" }),
 			source: Type.Optional(StringEnum(SNAPSHOT_SOURCES)),
 			keywords: Type.Optional(Type.Array(Type.String())),
-			captured_at: Type.Optional(Type.String({ description: "ISO 时间；默认当前时间" })),
+			captured_at: Type.Optional(Type.String({ description: "采集时间，默认当前时间。口径（批次三的显式契约）：`YYYY-MM-DD` 按 UTC 零点解释；带时区的完整 ISO（如 2026-09-01T10:00:00+08:00）按其时区解释；**`YYYY/MM/DD` 与不带时区的 ISO 按运行机器的本地时区解释**——UTC+8 下 `2026/09/01` 会落到 `2026-08-31T16:00Z`，即前一个 UTC 日，可能导致新导入被判定为旧于已有快照。要跨机器一致请始终用 `YYYY-MM-DD` 或带时区的完整 ISO。取值须落在 [2000-01-01, 当前时间+36 小时] 内。" })),
 			run_screen: Type.Optional(Type.Boolean({ description: "导入后运行默认粗筛 Gate；默认 true" })),
 			actor: Type.Optional(Type.String()),
 		}),
@@ -481,8 +434,8 @@ export default function compassExtension(pi: ExtensionAPI): void {
 		description: "扫描已导入的本地市场快照，按默认或指定策略做粗筛，并按综合分排序。可过滤 Gate、QRD、新品占比和 CPC 承受度；输出不超过45KB。",
 		parameters: Type.Object({
 			query: Type.Optional(Type.String()),
-			strategy_id: Type.Optional(Type.String()),
-			outcome: Type.Optional(StringEnum(["pass", "review", "reject"] as const)),
+			strategy_id: Type.Optional(Type.String({ description: "策略 id、名称或 id@vN（写 @vN 锁定历史版本，不写则用最新版）" })),
+			outcome: Type.Optional(StringEnum(GATE_OUTCOMES)),
 			min_qrd: Type.Optional(Type.Number({ minimum: 0 })),
 			min_new_listing_share: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
 			max_cpc_ratio: Type.Optional(Type.Number({ minimum: 0 })),
@@ -500,7 +453,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 				limit: params.limit,
 			});
 			const table = ["market_id | 市场 | Gate | Score | QRD | 新品占比 | 快照年龄", ...rows.map((row) => {
-				const qrd = row.snapshot.metrics.qualify_rank_depth?.value ?? "—";
+				const qrd = row.qrd ?? "—";
 				const newShare = row.snapshot.metrics.new_listing_share_12m?.value;
 				return `${row.market.id} | ${row.market.name} | ${row.evaluation.outcome} | ${row.evaluation.score} | ${qrd} | ${typeof newShare === "number" ? `${(newShare * 100).toFixed(1)}%` : "—"} | ${row.ageDays}d`;
 			})];
@@ -516,7 +469,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 		description: "为一个市场生成完整五维 GSE 报告，包含数据来源、时间、置信度、多源偏差、风险、利润与决策回放，并写入项目 .pi/compass/reports；自定义 output_path 也必须位于该目录内且使用 .md；输出不超过45KB。",
 		parameters: Type.Object({
 			market_ref: Type.String({ description: "market_id 或唯一市场名称" }),
-			strategy_id: Type.Optional(Type.String()),
+			strategy_id: Type.Optional(Type.String({ description: "策略 id、名称或 id@vN（写 @vN 锁定历史版本，不写则用最新版）" })),
 			output_path: Type.Optional(Type.String({ description: ".pi/compass/reports/ 内的 Markdown 输出路径（必须为 .md）" })),
 		}),
 		async execute(_id, params, _signal, _update, ctx) {
@@ -566,8 +519,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 				const store = await readStore(ctx);
 				const market = findMarket(store, params.market_ref);
 				marketId = market.id;
-				const mainCpc = mainCpcForMarket(store, market.id);
-				if (cpc === undefined && mainCpc !== undefined) cpc = mainCpc;
+				cpc = resolveProfitCpc(store, market.id, cpc);
 			}
 			const input = normalizeProfitInput({
 				marketId,
@@ -610,8 +562,8 @@ export default function compassExtension(pi: ExtensionAPI): void {
 		description: "在指定市场快照上运行版本化 GSE 策略。screen 只跑市场粗筛；full 跑需求、竞争、单位经济、产品力和风险。缺数据一律转复核，不伪装成通过。",
 		parameters: Type.Object({
 			market_ref: Type.String(),
-			strategy_id: Type.Optional(Type.String()),
-			mode: Type.Optional(StringEnum(["screen", "full"] as const)),
+			strategy_id: Type.Optional(Type.String({ description: "策略 id、名称或 id@vN（写 @vN 锁定历史版本，不写则用最新版）" })),
+			mode: Type.Optional(StringEnum(STRATEGY_MODES)),
 			actor: Type.Optional(Type.String()),
 		}),
 		async execute(_id, params, _signal, _update, ctx) {
@@ -620,6 +572,8 @@ export default function compassExtension(pi: ExtensionAPI): void {
 				strategyRef: params.strategy_id,
 				mode: params.mode ?? "full",
 				actor: actorName(params.actor),
+				// 运营/agent 显式重跑：这条才算对 retro_challenged 的处置动作
+				trigger: "manual",
 			}));
 			const failures = run.result.rules.filter((rule) => rule.status !== "pass");
 			const lines = failures.map((rule) => `[${rule.status}] ${rule.stage}/${rule.id}: ${rule.message}`);
@@ -639,10 +593,10 @@ export default function compassExtension(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "compass_strategy_manage",
 		label: "Compass Strategy Manage",
-		description: "管理个性化策略：list 列最新版本，get 读取 YAML，save 将 YAML 保存为不可覆盖的新版本，clone 复制模板。表达式由安全 DSL 解释器执行，不使用 eval。",
+		description: "管理个性化策略：list 列最新版本，get 读取 YAML，save 将 YAML 保存为不可覆盖的新版本，clone 复制模板。save 的归属由 YAML 的 meta.name 决定（可另传 strategy_id 声明目标策略链，不一致会报错）；只改显示名请改 meta.display_name。表达式由安全 DSL 解释器执行，不使用 eval。",
 		parameters: Type.Object({
 			action: StringEnum(["list", "get", "save", "clone"] as const),
-			strategy_id: Type.Optional(Type.String()),
+			strategy_id: Type.Optional(Type.String({ description: "策略 id、名称或 id@vN（写 @vN 锁定历史版本，不写则用最新版）" })),
 			yaml: Type.Optional(Type.String()),
 			new_name: Type.Optional(Type.String()),
 			change_note: Type.Optional(Type.String()),
@@ -657,12 +611,17 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			}
 			if (params.action === "get") {
 				if (!params.strategy_id) throw new Error("get 需要 strategy_id");
-				const strategy = latestStrategy(await readStore(ctx), params.strategy_id);
+				const strategy = findStrategyVersion(await readStore(ctx), params.strategy_id);
 				return textResult(strategy.yaml, details({ title: `${strategy.name}@v${strategy.version}`, status: "success", summary: strategy.changeNote ?? "无版本说明" }));
 			}
 			if (params.action === "save") {
 				if (!params.yaml) throw new Error("save 需要 yaml");
-				const { result: strategy } = await mutateStore(ctx, (store) => saveStrategyVersion(store, { yaml: params.yaml as string, actor: actorName(params.actor), changeNote: params.change_note }));
+				const { result: strategy } = await mutateStore(ctx, (store) => {
+					// 传了 strategy_id 就是「往这条已有链追加版本」：先确认链存在，
+					// 再把解析出的 id 交给 saveStrategyVersion 与 meta.name 对账，不一致就报错而不是静默新建
+					const expectedId = params.strategy_id ? findStrategyVersion(store, params.strategy_id).id : undefined;
+					return saveStrategyVersion(store, { yaml: params.yaml as string, actor: actorName(params.actor), changeNote: params.change_note, expectedId });
+				});
 				return textResult(`${strategy.id}@v${strategy.version}\n${strategy.yaml}`, details({ title: "策略版本已保存", status: "success", summary: `${strategy.name}@v${strategy.version}` }));
 			}
 			if (!params.strategy_id || !params.new_name) throw new Error("clone 需要 strategy_id 与 new_name");
@@ -681,7 +640,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			action: StringEnum(["list", "get", "move", "decide"] as const),
 			candidate_ref: Type.Optional(Type.String({ description: "candidate_id、market_id 或唯一市场名" })),
 			stage: Type.Optional(StringEnum(CANDIDATE_STAGES)),
-			outcome: Type.Optional(StringEnum(["pass", "review", "reject"] as const)),
+			outcome: Type.Optional(StringEnum(GATE_OUTCOMES)),
 			decision_status: Type.Optional(StringEnum(DECISION_STATUSES)),
 			reason: Type.Optional(Type.String()),
 			actor: Type.Optional(Type.String()),
@@ -741,7 +700,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 		renderResult: renderCompassResult,
 	});
 
-	const RiskStatusSchema = StringEnum(["pass", "review", "red", "unknown"] as const);
+	const RiskStatusSchema = StringEnum(RISK_STATUSES);
 	pi.registerTool({
 		name: "compass_risk_check",
 		label: "Compass Risk Check",
@@ -750,8 +709,8 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			market_ref: Type.String(),
 			cert_status: RiskStatusSchema,
 			ip_risk_level: RiskStatusSchema,
-			season_flag: StringEnum(["clear", "strong", "review", "unknown"] as const),
-			policy_flag: StringEnum(["clear", "review", "red", "unknown"] as const),
+			season_flag: StringEnum(SEASON_FLAGS),
+			policy_flag: StringEnum(POLICY_FLAGS),
 			logistics_risk: RiskStatusSchema,
 			evidence: Type.Optional(Type.Array(Type.Object({
 				category: Type.String(),
@@ -791,10 +750,10 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			review_count: Type.Integer({ minimum: 0 }),
 			themes: Type.Array(Type.Object({
 				name: Type.String(),
-				category: StringEnum(["quality", "size", "damage", "expectation", "usability", "other"] as const),
+				category: StringEnum(REVIEW_THEME_CATEGORIES),
 				count: Type.Integer({ minimum: 0 }),
 				share: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
-				fixability: StringEnum(["factory", "packaging", "copy", "none", "unknown"] as const),
+				fixability: StringEnum(REVIEW_THEME_FIXABILITIES),
 				evidence: Type.Optional(Type.Array(Type.String(), { maxItems: 10 })),
 				recommendation: Type.Optional(Type.String()),
 			}), { minItems: 1 }),
@@ -825,7 +784,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "compass_budget",
 		label: "Compass Budget",
-		description: "预算池操作：status 查看各数据源当月消耗与调用次数/80%告警/100%熔断；record 按市场归因成本；configure 配置来源、档位、月上限，以及 MCP 计量的 cost_per_call_cny（单价，0=只计数）与 monthly_call_limit（月次数上限，0=清除）。",
+		description: "预算池操作：status 查看各数据源当月（结算月按 UTC 计，北京时间每月 1 日 08:00 清零）消耗与调用次数/80%告警/100%熔断；record 按市场归因成本；configure 配置来源、档位、月上限，以及 MCP 计量的 cost_per_call_cny（单价，0=只计数）与 monthly_call_limit（月次数上限，0=清除）。",
 		parameters: Type.Object({
 			action: StringEnum(["status", "record", "configure"] as const),
 			source: Type.Optional(Type.String()),
@@ -844,9 +803,11 @@ export default function compassExtension(pi: ExtensionAPI): void {
 		async execute(_id, params, _signal, _update, ctx) {
 			if (params.action === "status") {
 				// flush 降级路径下用 pending 合并保持数字新鲜（正常路径 pending 已清空，合并为空操作）
-				const pools = budgetStatus(await readStoreFlushingUsage(ctx), undefined, pendingCallCounts());
+				// 结算月显式算一次并回显：UTC 月，避免工具输出的数字与运营脑内的本地月对不上
+				const month = budgetMonth();
+				const pools = budgetStatus(await readStoreFlushingUsage(ctx), month, pendingCallCounts());
 				const lines = pools.map((pool) => `${pool.source} | ${pool.tier} | ¥${pool.spentCny}/¥${pool.monthlyLimitCny || 0} | calls=${pool.callCount}${pool.monthlyCallLimit !== undefined ? `/${pool.monthlyCallLimit}` : ""} | ${pool.state} | ${pool.enabled ? "enabled" : "disabled"}`);
-				return textResult(lines.join("\n"), details({ title: "数据预算", status: pools.some((pool) => pool.state === "fused") ? "warning" : "success", summary: `${pools.length} 个预算池 · 本月 ¥${pools.reduce((sum, pool) => sum + pool.spentCny, 0).toFixed(2)}`, lines }));
+				return textResult(lines.join("\n"), details({ title: "数据预算", status: pools.some((pool) => pool.state === "fused") ? "warning" : "success", summary: `${pools.length} 个预算池 · ${month} (UTC) ¥${pools.reduce((sum, pool) => sum + pool.spentCny, 0).toFixed(2)}`, lines }));
 			}
 			if (params.action === "record") {
 				if (!params.source || params.amount_cny === undefined) throw new Error("record 需要 source 与 amount_cny");
@@ -869,7 +830,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			"工作台待办清单与人工处理闭环。",
 			"list（默认）：推导需人工干预的事项（预算熔断/复盘 challenged/Gate复核/待决策/补数据/补证据/到期复盘/预算告警/快照过期/多源偏差），P1 最高–P5 最低，逾期超 30 天升 1 级；多数事项解决后自动消失。",
 			"闭环四类（metric_divergence / budget_warning / budget_fused / deep_missing_data）没有系统内动作可消除，须走「提交处理结果 → agent 验证 → 勾选已处理」，list 输出附处理状态徽标。",
-			"submit：代运营录入处理说明与证据（URL 或项目内文件路径）。verify：**验证是你的活**——用 action=list resolution_status=submitted 拉待验证队列，逐条核对提交材料与 store 实况后给 verdict；判据不满足或证据不足一律 reject，不得为了清单好看而放行。complete：勾选已处理（仅验证通过后可用）。reopen：拉回重新处理，必填理由。",
+			"submit：代运营录入处理说明与证据（URL 或项目内文件路径）。verify：**验证是你的活**——用 action=list resolution_status=submitted 拉待验证队列，逐条核对提交材料与 store 实况后给 verdict；判据不满足或证据不足一律 reject，不得为了清单好看而放行。complete：勾选已处理（仅验证通过后可用；若提交后水位已变——新导出 / 新预算月 / 重入深研——或条目已离开活跃清单，服务端会拒绝，出路是重新 submit 走新一轮）。reopen：拉回重新处理，必填理由。",
 		].join("\n"),
 		parameters: Type.Object({
 			action: Type.Optional(StringEnum(["list", "submit", "verify", "complete", "reopen"] as const)),
@@ -1020,7 +981,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			const rows = store.snapshots
 				.filter((snapshot) => !marketId || snapshot.marketId === marketId)
 				.flatMap((snapshot) => snapshot.listings.filter((listing) => listing.asin?.toUpperCase() === asin).map((listing) => ({ snapshot, listing })))
-				.sort((a, b) => b.snapshot.capturedAt.localeCompare(a.snapshot.capturedAt))
+				.sort((a, b) => compareSnapshotRecencyDesc(a.snapshot, b.snapshot))
 				.slice(0, params.limit ?? 50);
 			const lines = rows.map(({ snapshot, listing }) => `${snapshot.capturedAt} | ${snapshot.source} | rank=${listing.rank} | price=${listing.price ?? "—"} | rating=${listing.rating ?? "—"} | reviews=${listing.reviewCount ?? "—"} | monthly_sales=${listing.monthlySales ?? "—"}`);
 			return textResult(lines.join("\n") || `未找到 ${asin}`, details({ title: `ASIN 历史 · ${asin}`, status: rows.length ? "success" : "warning", summary: `${rows.length} 个快照`, lines: lines.slice(0, 12) }));
@@ -1044,7 +1005,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 					const candidate = keyword.keyword.normalize("NFKC").toLocaleLowerCase();
 					return params.exact ? candidate === needle : candidate.includes(needle);
 				}).map((keyword) => ({ snapshot, keyword })))
-				.sort((a, b) => b.snapshot.capturedAt.localeCompare(a.snapshot.capturedAt))
+				.sort((a, b) => compareSnapshotRecencyDesc(a.snapshot, b.snapshot))
 				.slice(0, params.limit ?? 50);
 			const lines = rows.map(({ snapshot, keyword }) => `${snapshot.capturedAt} | ${snapshot.source} | ${keyword.keyword} | volume=${keyword.searchVolume ?? "—"} | cpc=${keyword.cpc ?? "—"} | rank=${keyword.rank ?? "—"}`);
 			return textResult(lines.join("\n") || `未找到关键词 ${params.keyword}`, details({ title: `关键词指标 · ${params.keyword}`, status: rows.length ? "success" : "warning", summary: `${rows.length} 条记录`, lines: lines.slice(0, 12) }));
@@ -1067,7 +1028,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			category: Type.Optional(Type.String()),
 			metric: Type.Optional(Type.String()),
 			decision_status: Type.Optional(StringEnum(DECISION_STATUSES)),
-			types: Type.Optional(Type.Array(StringEnum(["lead", "import", "strategy", "stage_move", "decision", "risk", "profit", "review", "retro"] as const))),
+			types: Type.Optional(Type.Array(StringEnum(DECISION_LOG_TYPES))),
 			actor: Type.Optional(Type.String()),
 			since: Type.Optional(Type.String()),
 			until: Type.Optional(Type.String()),
@@ -1114,7 +1075,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 				const outcomeMarketRef = params.candidate_ref ? findCandidate(store, params.candidate_ref).marketId : params.market_ref;
 				const result = historyOutcomes(store, outcomeMarketRef);
 				const stats = result.stats;
-				const header = `total=${stats.total} | validated=${stats.validated} | challenged=${stats.challenged} | inconclusive=${stats.inconclusive} | validation_rate=${stats.validationRate === null ? "—" : (stats.validationRate * 100).toFixed(1) + "%"} | go_attainment=${stats.goAttainmentRate === null ? "—" : (stats.goAttainmentRate * 100).toFixed(1) + "%"} | no_go_accuracy=${stats.noGoAccuracyRate === null ? "—" : (stats.noGoAccuracyRate * 100).toFixed(1) + "%"} | false_kill=${stats.falseKillRate === null ? "—" : (stats.falseKillRate * 100).toFixed(1) + "%"}`;
+				const header = `checks=${stats.total} | rated_markets=${stats.ratedMarkets} | validated=${stats.validated} | challenged=${stats.challenged} | inconclusive=${stats.inconclusive} | validation_rate=${stats.validationRate === null ? "—" : (stats.validationRate * 100).toFixed(1) + "%"} | go_attainment=${stats.goAttainmentRate === null ? "—" : (stats.goAttainmentRate * 100).toFixed(1) + "%"} | no_go_accuracy=${stats.noGoAccuracyRate === null ? "—" : (stats.noGoAccuracyRate * 100).toFixed(1) + "%"} | false_kill=${stats.falseKillRate === null ? "—" : (stats.falseKillRate * 100).toFixed(1) + "%"}（四率按市场去重：每市场只取最新一条可判对照）`;
 				const limitedChecks = result.checks.slice(0, params.limit ?? 200);
 				const lines = limitedChecks.map((check) => `${check.createdAt} | ${check.id} | ${check.marketId} | decision=${check.decisionStatus ?? "—"} | verdict=${check.verdict} | elapsed=${check.elapsedDays}d | ${check.verdictReason}`);
 				return textResult([header, ...lines, ...stats.byStrategy.map((item) => `strategy ${item.strategy} | accuracy=${item.accuracy === null ? "—" : (item.accuracy * 100).toFixed(1) + "%"} | ${item.validated}/${item.challenged}/${item.inconclusive}`)].join("\n"), details({ title: "复盘台账", status: stats.challenged ? "warning" : "success", summary: `${stats.total} 条 · 验证率 ${stats.validationRate === null ? "—" : (stats.validationRate * 100).toFixed(1) + "%"}`, lines: [header, ...lines.slice(0, 10)], data: resultData({ payload: { checks: limitedChecks, stats } }) }));
@@ -1143,8 +1104,8 @@ export default function compassExtension(pi: ExtensionAPI): void {
 				net_margin: Type.Optional(Type.Number({ maximum: 1 })),
 				note: Type.Optional(Type.String()),
 			})),
-			strategy_id: Type.Optional(Type.String({ description: "策略 id 或 id@vN" })),
-			baseline_strategy_id: Type.Optional(Type.String({ description: "基线策略 id 或 id@vN" })),
+			strategy_id: Type.Optional(Type.String({ description: "策略 id、名称或 id@vN（写 @vN 锁定历史版本，不写则用最新版）" })),
+			baseline_strategy_id: Type.Optional(Type.String({ description: "基线策略 id、名称或 id@vN（写 @vN 锁定历史版本，不写则用最新版）" })),
 			lesson: Type.Optional(Type.Object({
 				title: Type.String(),
 				detail: Type.String(),
@@ -1181,9 +1142,12 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			}
 			if (params.action === "report") {
 				const store = await readStore(ctx);
-				const markdown = generateRetroReport(store);
 				const repo = repository(ctx);
-				const output = repo.resolveOutputPath(params.output_path, `retro-${new Date().toISOString().slice(0, 10)}.md`);
+				const generatedAt = new Date().toISOString();
+				// 「上一份复盘报告」必须在写本次之前探，写完再探会探到自己；只读、在写事务之外
+				const previousRetroAt = await repo.latestRetroReportAt();
+				const output = repo.resolveOutputPath(params.output_path, retroReportFileName(generatedAt));
+				const markdown = generateRetroReport(store, generatedAt, { outputPath: relative(ctx.cwd, output), previousRetroAt });
 				await withFileMutationQueue(output, () => repo.writeReport(output, markdown));
 				const path = relative(ctx.cwd, output);
 				return textResult(markdown, details({ title: "罗盘复盘报告", status: store.outcomeChecks.some((check) => check.verdict === "challenged") ? "warning" : "success", summary: `${store.outcomeChecks.length} 条对照 · ${listRetroDue(store).length} 个到期`, path, data: resultData({ payload: { path } }) }));
@@ -1193,8 +1157,11 @@ export default function compassExtension(pi: ExtensionAPI): void {
 				const result = backtestStrategies(await readStore(ctx), params.strategy_id, params.baseline_strategy_id);
 				const matrix = Object.entries(result.matrix).sort().map(([flip, count]) => `${flip}=${count}`).join(" | ");
 				const lines = result.flips.map((row) => `${row.marketId} | ${row.marketName} | ${row.baselineOutcome}→${row.strategyOutcome} | score ${row.baselineScore}→${row.strategyScore} | ${row.snapshotId}`);
-				const header = `${result.baselineStrategy} vs ${result.strategy} | markets=${result.rows.length} | flips=${result.flips.length} | checks=${result.alignment.comparableChecks} | alignment ${result.alignment.baseline === null ? "—" : (result.alignment.baseline * 100).toFixed(1) + "%"}→${result.alignment.strategy === null ? "—" : (result.alignment.strategy * 100).toFixed(1) + "%"}`;
-				return textResult([header, matrix, ...lines].join("\n"), details({ title: "策略回测", status: result.flips.length ? "warning" : "success", summary: header, lines: [matrix, ...lines.slice(0, 12)], data: resultData({ payload: result }) }));
+				// 弃权（review）单列，否则“多弃权”的严格策略会白捡分；覆盖告诉运营这个百分比到底用了几条样本
+				const alignmentText = (side: BacktestAlignmentSide) => `${side.rate === null ? "—" : (side.rate * 100).toFixed(1) + "%"}（一致 ${side.correct}/已判定 ${side.decided} · 弃权 ${side.abstained} · 覆盖 ${side.decided}/${result.alignment.comparableChecks}${side.coverage === null || side.coverage < 0.5 ? " · 样本不足，别据此调阈值" : ""}）`;
+				const header = `${result.baselineStrategy} vs ${result.strategy} | markets=${result.markets} | flips=${result.flips.length} | 可比对照=${result.alignment.comparableChecks} | 基线对齐 ${alignmentText(result.alignment.baseline)} → 新策略对齐 ${alignmentText(result.alignment.strategy)}`;
+				const alignmentLines = result.rows.filter((row) => row.checkId).map((row) => `${row.checkId} | ${row.marketName} | ${row.mode} | ${row.baselineOutcome}→${row.strategyOutcome} | ${row.snapshotId}`);
+				return textResult([header, matrix, ...lines, ...alignmentLines].join("\n"), details({ title: "策略回测", status: result.flips.length ? "warning" : "success", summary: header, lines: [matrix, ...lines.slice(0, 12), ...alignmentLines.slice(0, 12)], data: resultData({ payload: result }) }));
 			}
 			if (params.action === "save_lesson") {
 				if (!params.lesson) throw new Error("save_lesson 需要 lesson（evidence 必须非空）");
@@ -1229,9 +1196,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 				testing: ["daily_units", "tacos", "return_rate"],
 			};
 			const fields = params.fields?.length ? params.fields : defaults[params.stage];
-			const snapshot = store.snapshots
-				.filter((item) => item.marketId === market.id)
-				.sort((a, b) => b.capturedAt.localeCompare(a.capturedAt))[0];
+			const snapshot = latestSnapshotIfPresent(store, market.id);
 			if (!snapshot) {
 				const plan = ["C档：先从卖家精灵/Sorftime 官方导出 CSV，或使用用户主动触发的 Compass 浏览器伴侣采集首个快照；成本≈¥0"];
 				const summary = `尚无快照 · 缺 ${fields.length}/${fields.length} 字段 · 先完成 C 档采集`;
@@ -1239,7 +1204,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			}
 			const metrics = buildStrategyContext(store, market.id).context.metrics;
 			const age = Math.max(0, Math.floor((Date.now() - Date.parse(snapshot.capturedAt)) / 86_400_000));
-			const maxAge = params.stage === "lead" || params.stage === "screen" ? 30 : params.stage === "testing" ? 1 : 7;
+			const maxAge = snapshotTtlDays(params.stage);
 			const missing = fields.filter((field) => metrics[field]?.value === undefined || metrics[field]?.value === null);
 			const stale = age > maxAge;
 			const budgets = budgetStatus(store);
@@ -1279,13 +1244,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			limit: Type.Optional(Type.Integer({ minimum: 1, maximum: DOMAIN_TOOLS.length })),
 		}),
 		async execute(_id, params) {
-			const terms = searchTerms(params.query);
-			let matches = TOOL_CATALOG.map((item) => ({
-				...item,
-				score: terms.reduce((score, term) => score + (`${item.name} ${item.keywords} ${item.description}`.toLocaleLowerCase().includes(term) ? 1 : 0), 0),
-			})).filter((item) => params.load_all || item.score > 0).sort((a, b) => b.score - a.score);
-			if (!matches.length) matches = TOOL_CATALOG.filter((item) => ["compass_lead", "compass_import_csv", "compass_market_scan", "compass_market_report", "compass_strategy_run"].includes(item.name)).map((item) => ({ ...item, score: 0 }));
-			matches = matches.slice(0, params.load_all ? DOMAIN_TOOLS.length : params.limit ?? 5);
+			const { matches } = rankTools(params.query, { loadAll: params.load_all, limit: params.limit });
 			const active = pi.getActiveTools();
 			const added = matches.map((item) => item.name).filter((name) => !active.includes(name));
 			pi.setActiveTools([...new Set([...active, ...added])]);
@@ -1307,7 +1266,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 		return box;
 	});
 
-	pi.registerEntryRenderer("compass-report", (entry, options, _theme) => {
+	pi.registerEntryRenderer("compass-report", (entry, _options, _theme) => {
 		const data = entry.data as { markdown?: string; title?: string };
 		return new Markdown(data.markdown ?? `# ${data.title ?? "罗盘报告"}`, 1, 0, getMarkdownTheme());
 	});
@@ -1353,7 +1312,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			if (!path) return;
 			const marketName = await ctx.ui.input("市场/关键词族名称", "yoga mat strap");
 			if (!marketName) return;
-			const source = await ctx.ui.select("数据来源", ["auto", "sellersprite", "sorftime", "keepa", "compass_browser", "manual_csv", "generic_csv"]);
+			const source = await ctx.ui.select("数据来源", [...SNAPSHOT_SOURCES]);
 			if (!source) return;
 			const imported = await performImport(ctx, { path, marketName, source, runScreen: true });
 			rememberTouch({ marketId: imported.market.id, candidateId: imported.candidate.id, action: "import", conclusion: `粗筛=${imported.screenRun?.result.outcome ?? "未运行"}${imported.outcomeCheck ? `；复盘=${imported.outcomeCheck.verdict}` : ""}`, ids: [imported.snapshot.id, ...(imported.outcomeCheck ? [imported.outcomeCheck.id] : [])] });
@@ -1439,7 +1398,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 				if (!selected) return;
 				ref = selected.split(" · ")[0];
 			}
-			const strategy = latestStrategy(store, ref);
+			const strategy = findStrategyVersion(store, ref);
 			const edited = await ctx.ui.editor(`编辑 ${strategy.name}@v${strategy.version}`, strategy.yaml);
 			if (!edited || edited === strategy.yaml) return;
 			const note = await ctx.ui.input("版本说明", `基于 v${strategy.version} 调整`);
@@ -1504,11 +1463,16 @@ export default function compassExtension(pi: ExtensionAPI): void {
 				due = due.filter((candidate) => candidate.candidateId !== candidateId);
 			}
 			const store = await readStore(ctx);
-			const markdown = generateRetroReport(store);
 			const repo = repository(ctx);
-			const output = repo.resolveOutputPath(undefined, `retro-${new Date().toISOString().slice(0, 10)}.md`);
-			await withFileMutationQueue(output, () => repo.writeReport(output, markdown));
+			const generatedAt = new Date().toISOString();
+			// 同上：先探上一份，再落本次；下面刷新报告时复用这两个值，
+			// 保证「本次沉淀」的时间窗与文件名都锚在同一次生成上
+			const previousRetroAt = await repo.latestRetroReportAt();
+			const output = repo.resolveOutputPath(undefined, retroReportFileName(generatedAt));
 			const outputPath = relative(ctx.cwd, output);
+			const reportOptions = { outputPath, previousRetroAt };
+			const markdown = generateRetroReport(store, generatedAt, reportOptions);
+			await withFileMutationQueue(output, () => repo.writeReport(output, markdown));
 			pi.appendEntry("compass-report", { title: "罗盘复盘报告", markdown, path: outputPath });
 			ctx.ui.notify(`复盘报告已保存：${outputPath}`, "info");
 			const save = await ctx.ui.confirm("沉淀经验", "本次复盘发现的规律是否保存为 lesson？");
@@ -1523,7 +1487,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			const keywords = (await ctx.ui.input("适用关键词（逗号分隔，可空）", "") ?? "").split(/[,，]+/u).map((item) => item.trim()).filter(Boolean);
 			const metrics = (await ctx.ui.input("关联指标（逗号分隔，可空）", "") ?? "").split(/[,，]+/u).map((item) => item.trim()).filter(Boolean);
 			const { result: lesson, store: lessonStore } = await mutateStore(ctx, (data) => saveLesson(data, { title, detail, scope: { categories, keywords, metrics }, evidence, sourceRetro: outputPath, actor: actorName() }));
-			await withFileMutationQueue(output, () => repo.writeReport(output, generateRetroReport(lessonStore)));
+			await withFileMutationQueue(output, () => repo.writeReport(output, generateRetroReport(lessonStore, generatedAt, reportOptions)));
 			rememberTouch({ action: "retro.save_lesson", conclusion: lesson.title, ids: [lesson.id, ...lesson.evidence] });
 			ctx.ui.notify(`已保存经验卡 ${lesson.id}，复盘报告已刷新`, "info");
 		},
@@ -1609,6 +1573,8 @@ export default function compassExtension(pi: ExtensionAPI): void {
 				const duplicate = findDuplicateImport(store, hash);
 				if (duplicate) return { block: true, reason: `重复 CSV：已于 ${duplicate.importedAt} 导入为 ${duplicate.id}；请复用历史快照或导入真正的新数据。` };
 			}
+			// 未命中任何拦截：显式交还 undefined，语义同「不干预」（pi 的 ExtensionHandler 允许返回 void）
+			return undefined;
 		} catch {
 			return;
 		}

@@ -150,6 +150,17 @@ function formatDateTime(iso) {
 	return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
+// 预算页专用：成本事件按 **UTC 日** 显示。预算月本身是 UTC 月，同屏再混本地日会出现
+// 「标题写 2026-08、事件卡写 09-01」的自相矛盾（UTC+8 的 00:00–08:00 必然发生）。
+// 本地时间放进 title，鼠标悬停可查。
+function formatUtcDateShort(iso) {
+	if (!iso) return "—";
+	const d = new Date(iso);
+	if (Number.isNaN(d.getTime())) return "—";
+	const pad = (n) => String(n).padStart(2, "0");
+	return `${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
+}
+
 function formatDateShort(iso) {
 	if (!iso) return "—";
 	const d = new Date(iso);
@@ -427,7 +438,7 @@ function renderBudgetPanel(data) {
 	return `
 		<div class="panel col-panel">
 			<div class="panel-header">
-				<div class="panel-title">数据源预算 · 当月</div>
+				<div class="panel-title">数据源预算 · ${escapeHtml(data.budgetMonth)} (UTC)</div>
 				<div class="panel-hint">80% 告警 · 100% 熔断</div>
 			</div>
 			<div class="col-panel-body scroll-x">
@@ -511,7 +522,7 @@ function todoResolutionHint(todo) {
 	if (resolution.lapsed) return "勾选后出现了新事实（新快照 / 新预算月 / 深研重入），条目重新浮出：重开后重新提交";
 	if (resolution.status === "submitted") return `已提交，等待 pi 会话中的 agent 验证：compass_todo action=verify todo_id=${todo.id}`;
 	if (resolution.status === "rejected") return `验证驳回：${resolution.verdictReason || "未留理由"}；按理由补充材料后重新提交`;
-	if (resolution.status === "verified") return "agent 已验证通过，可勾选已处理";
+	if (resolution.status === "verified") return "agent 已验证通过，可勾选已处理；若提交后出现了新事实（新导出 / 新预算月 / 深研重入），勾选会被服务端拒绝，改用「重新提交」走新一轮";
 	if (resolution.status === "reopened") return "已重开，请重新提交处理结果";
 	return "";
 }
@@ -564,8 +575,11 @@ function buildTodoActionsHtml(todo) {
 	// 待验证：只给徽标，不给任何操作入口——球在 agent 那边
 	if (status === "submitted") return "";
 	if (status === "verified") {
+		// 「重新提交」是勾选被拒后的唯一出路（提交时的水位已失效）：服务端用同一判据放行，
+		// 水位没变时点它会被拒回「已验证通过，请直接勾选已处理」，不会误伤正常流程
 		return `
 			<button type="button" class="btn btn-outline todo-row-btn" data-todo-action="ask-complete">勾选已处理</button>
+			<button type="button" class="btn btn-outline todo-row-btn" data-todo-action="toggle-submit">重新提交</button>
 			<span class="todo-confirm" data-todo-confirm hidden>
 				<button type="button" class="btn btn-accent-fill todo-row-btn" data-todo-action="complete">确认勾选</button>
 				<button type="button" class="btn btn-outline todo-row-btn" data-todo-action="cancel-complete">取消</button>
@@ -598,7 +612,7 @@ function renderTodoRow(todo) {
 	// 闭环四类：链接区 + 操作区分离（按钮不能嵌在 <a> 内），行下挂状态提示与行内表单
 	const status = todo.resolution ? todo.resolution.status : null;
 	const lapsed = Boolean(todo.resolution && todo.resolution.lapsed);
-	const canSubmit = !status || status === "rejected" || status === "reopened";
+	const canSubmit = !status || status === "rejected" || status === "reopened" || status === "verified";
 	return `
 		<div class="todo-closable" data-todo-id="${escapeHtml(todo.id)}">
 			<div class="todo-row todo-row-closable p${todo.priority}">
@@ -845,7 +859,9 @@ function renderMarketTableRow(row) {
 	const gate = row.gateOutcome ? `<span class="mono ${GATE_TONES[row.gateOutcome] || ""}" style="font-size:11px;">${GATE_LABELS[row.gateOutcome] || row.gateOutcome}</span>` : `<span class="cell-dim">—</span>`;
 	const score = row.score !== null ? `<span class="mono ${archived ? "cell-muted" : "tone-accent"}">${row.score.toFixed(1)}</span>` : `<span class="cell-dim">—</span>`;
 	const decision = row.decisionStatus ? `<span class="${DECISION_TONES[row.decisionStatus] || ""}">${DECISION_LABELS[row.decisionStatus] || row.decisionStatus}</span>` : `<span class="cell-dim">—</span>`;
-	const qrd = row.qrd !== null ? `<span class="mono ${marketQrdClass(row)}">${row.qrd}</span>` : `<span class="mono cell-dim">—</span>`;
+	// 逐行标注口径：该数是按导入时那条策略的 q 冻结的，列头无法用一个数代表所有行
+	const qrdTitle = row.qrdTargetUnits !== null && row.qrdTargetUnits !== undefined ? ` title="月销≥${row.qrdTargetUnits} 的 listing 数"` : "";
+	const qrd = row.qrd !== null ? `<span class="mono ${marketQrdClass(row)}"${qrdTitle}>${row.qrd}</span>` : `<span class="mono cell-dim">—</span>`;
 	const share = row.newListingShare !== null ? `<span class="mono ${marketShareClass(row)}">${formatPercent(row.newListingShare, 1)}</span>` : `<span class="mono cell-dim">—</span>`;
 	const cpc = row.mainCpc !== null ? `<span class="mono ${archived ? "cell-muted" : ""}">$${row.mainCpc.toFixed(2)}</span>` : `<span class="mono cell-dim">—</span>`;
 	const snapshot = row.snapshotAgeDays !== null
@@ -886,7 +902,7 @@ function buildMarketsHtml(data) {
 		<div class="panel market-table-panel">
 			<div class="data-table-row data-table-head" style="grid-template-columns: ${MARKET_TABLE_COLUMNS};">
 				<div>市场</div><div>Gate</div><div class="cell-right">Score</div><div>阶段</div><div>决策</div>
-				<div class="cell-right">QRD(300)</div><div class="cell-right">新品占比</div><div class="cell-right">主词CPC</div>
+				<div class="cell-right">QRD</div><div class="cell-right">新品占比</div><div class="cell-right">主词CPC</div>
 				<div class="cell-right">快照 / 来源</div><div class="cell-right">更新</div>
 			</div>
 			<div class="market-table-rows" id="market-table-rows"></div>
@@ -989,7 +1005,7 @@ function buildBudgetHtml(data) {
 	const eventsHtml = data.events.map((event) => `
 		<div class="cost-event-card">
 			<div class="cost-event-head">
-				<span class="mono cell-muted">${formatDateShort(event.createdAt)}</span>
+				<span class="mono cell-muted" title="本地时间 ${escapeHtml(formatDateTime(event.createdAt))}">${formatUtcDateShort(event.createdAt)}</span>
 				<span class="cost-event-source">${escapeHtml(event.source)}</span>
 				<span class="mono tone-success" style="margin-left:auto;">${formatMoney(event.amountCny)}</span>
 			</div>
@@ -999,7 +1015,7 @@ function buildBudgetHtml(data) {
 	`).join("");
 	return `
 		<div class="filter-toolbar">
-			<div class="filter-toolbar-title"><span style="font-size:15px; font-weight:700;">数据源与预算</span><span class="cell-dim">·</span><span class="mono cell-muted">${escapeHtml(data.month)}</span></div>
+			<div class="filter-toolbar-title"><span style="font-size:15px; font-weight:700;">数据源与预算</span><span class="cell-dim">·</span><span class="mono cell-muted" title="预算按 UTC 月结算：北京时间每月 1 日 08:00 额度清零">${escapeHtml(data.month)} (UTC)</span></div>
 			<div style="display:flex; gap:10px;">
 				<div class="btn btn-outline btn-disabled" title="记账功能即将上线，可在 pi 中使用 compass_budget record">记一笔成本</div>
 				<div class="btn btn-outline btn-disabled" title="配置功能即将上线，可在 pi 中使用 compass_budget configure">配置数据源</div>
@@ -1025,7 +1041,7 @@ function buildBudgetHtml(data) {
 			</div>
 			<div class="col-flow">
 				<div class="panel col-panel" style="flex:1 1 auto;">
-					<div class="panel-header"><div class="panel-title">成本事件流</div><div class="panel-hint">本月 <span class="mono">${data.events.length}</span> 条</div></div>
+					<div class="panel-header"><div class="panel-title">成本事件流</div><div class="panel-hint">本月（UTC）<span class="mono">${data.events.length}</span> 条 · 日期为 UTC</div></div>
 					<div class="col-panel-body scroll-x">
 						${eventsHtml}
 						${data.events.length === 0 ? `<div class="cost-event-empty">本月暂无手工记账；MCP 调用自动计量，安全点落账</div>` : ""}
@@ -1037,6 +1053,7 @@ function buildBudgetHtml(data) {
 						<div class="rule-row"><span class="rule-dot" style="background:var(--c-warning);"></span><span>80% 用量 → 告警</span></div>
 						<div class="rule-row"><span class="rule-dot" style="background:var(--c-error);"></span><span>100% 用量 → 熔断，硬拦截付费 MCP 调用</span></div>
 						<div class="rule-row"><span class="rule-dot" style="background:var(--c-text-muted);"></span><span class="cell-muted">成本事件可归因到市场，进入市场档案的累计成本</span></div>
+						<div class="rule-row"><span class="rule-dot" style="background:var(--c-text-muted);"></span><span class="cell-muted">结算月按 UTC 计：北京时间每月 1 日 08:00 额度清零，凌晨 0–8 点的调用仍记上月</span></div>
 					</div>
 				</div>
 			</div>
@@ -1113,7 +1130,7 @@ function buildRetroHtml(data) {
 			<div class="kpi-card">
 				<div class="kpi-label">OutcomeCheck</div>
 				<div class="kpi-value">${s.checks}</div>
-				<div class="kpi-sub">基线快照 vs 实绩的对照记录</div>
+				<div class="kpi-sub">对照次数；比率按市场去重，不按次数</div>
 			</div>
 			<div class="kpi-card">
 				<div class="kpi-label">verdict 分布</div>
@@ -1132,7 +1149,7 @@ function buildRetroHtml(data) {
 			<div class="kpi-card">
 				<div class="kpi-label">验证率</div>
 				<div class="kpi-value ${s.validationRate === null ? "cell-muted" : ""}">${formatPercent(s.validationRate)}</div>
-				<div class="kpi-sub">validated ÷ (validated+challenged)，排除 inconclusive</div>
+				<div class="kpi-sub">只统计挂到人工决策的对照，按市场去重：每市场取最新一条可判对照（样本 ${s.ratedMarkets} 个市场）${s.strategyOnly ? `；另有 ${s.strategyOnly} 条无决策锚点不计入` : ""}</div>
 			</div>
 		</div>
 		<div style="display:grid; grid-template-columns: 1fr 1fr; gap:14px; flex:1 1 auto; min-height:0;">
@@ -2423,8 +2440,15 @@ function bindImportSubmit(content, state, isCurrent) {
 			errorEl.hidden = false;
 			return;
 		}
+		// 前端拦一次给即时反馈，措辞与后端 normalizeCapturedAt 的中文错误一致；
+		// 后端的 [2000-01-01, now+36h] 区间校验仍是唯一权威边界。
 		if (capturedAt && !/^\d{4}-\d{2}-\d{2}$/.test(capturedAt)) {
 			errorEl.textContent = "日期格式需为 YYYY-MM-DD";
+			errorEl.hidden = false;
+			return;
+		}
+		if (capturedAt && capturedAt > todayLocalDate()) {
+			errorEl.textContent = "采集日期不能晚于今天，请核对后重填";
 			errorEl.hidden = false;
 			return;
 		}
@@ -2536,10 +2560,56 @@ async function handleRoute() {
 
 	// parseRoute 的输出是闭合的 8 个名字，全部在 PAGE_RENDERERS 里有对应渲染器
 	const renderer = PAGE_RENDERERS[route.name];
-	await renderer(content, isCurrent, route.param);
+	// 各 render* 只 catch 了 fetchApi，模板拼接阶段的同步异常接不住：store 里混进脏类型时
+	// data.ts 原样透传（assertStore 不校验 candidates[].score），拼到 `score.toFixed(1)` 就抛，
+	// 异常一路冒到 hashchange 监听器外，页面永久停在「加载中…」且控制台之外毫无线索
+	// （实测 #/overview、#/pool、#/pool/<id> 三条路由都会）。接住后至少给出可读原因；
+	// 路由本身不受影响，切别的 tab 仍能离开这一页。
+	try {
+		await renderer(content, isCurrent, route.param);
+	} catch (error) {
+		if (!isCurrent()) return;
+		content.innerHTML = `<div class="error-panel">页面渲染失败：${escapeHtml(errorMessage(error))}<br>可切换到其他标签页继续使用；若反复出现，多半是 .pi/compass/store.json 被手工改坏了。</div>`;
+		console.error("罗盘页面渲染失败", error);
+	}
 }
 
+function errorMessage(reason) {
+	return reason instanceof Error ? reason.message : String(reason);
+}
+
+// 最后一道兜底：handleRoute 的 try/catch 只覆盖它自己那一层。渲染器里 fire-and-forget 的异步
+// 与各种事件回调（表单提交、筛选、弹窗）抛出的错误走不到那里，同样会把页面留在半截状态。
+// 这里把原因写进 #content，免得用户只看到一个不动的界面。
+function reportFatal(reason) {
+	console.error("罗盘未捕获错误", reason);
+	const content = document.getElementById("content");
+	if (!content) return;
+	content.innerHTML = `<div class="error-panel">页面出错：${escapeHtml(errorMessage(reason))}<br>请刷新页面重试。</div>`;
+}
+
+window.addEventListener("unhandledrejection", (event) => reportFatal(event.reason));
+// 非捕获阶段的 window error 只收脚本错误；静态资源加载失败不冒泡到这里，由 index.html 的内联 onerror 兜
+window.addEventListener("error", (event) => reportFatal(event.error ?? event.message));
+
 window.addEventListener("hashchange", handleRoute);
+// 路由的唯一入口是 hashchange，而浏览器对「href 与当前 hash 完全相同」的链接根本不派发该事件，
+// 于是这类链接点了没反应。实测八条路由下共 7 处（六个 tab 的激活项 + #/import 下的顶栏「导入 CSV」），
+// 外加导入成功页的「继续导入下一个」——最后这条卡死的是「连续导入下一个市场」的主路径。
+// 统一在这里补：同 hash 时阻止默认行为并直接重跑一遍路由（语义 = 刷新当前页），
+// 不同 hash 仍旧交给浏览器改地址栏、由 hashchange 驱动。
+function onSameHashLinkClick(event) {
+	// 修饰键点击是「在新标签页打开」，不能拦
+	if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+	// 用「有没有 closest」判元素而不是 instanceof Element：event.target 也可能是 document
+	const target = event.target;
+	const link = target && typeof target.closest === "function" ? target.closest('a[href^="#/"]') : null;
+	if (!link || link.getAttribute("href") !== location.hash) return;
+	event.preventDefault();
+	void handleRoute();
+}
+
+document.addEventListener("click", onSameHashLinkClick);
 window.addEventListener("DOMContentLoaded", () => {
 	renderShell();
 	handleRoute();

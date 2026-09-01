@@ -1,9 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { lstatSync, readFileSync, readlinkSync, realpathSync } from "node:fs";
-import { chmod, mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, open, readdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
 import {
+	DECISION_LOG_TYPES,
+	DECISION_STATUSES,
+	GATE_OUTCOMES,
+	OUTCOME_VERDICTS,
 	RESOLVABLE_TODO_KINDS,
 	TODO_RESOLUTION_BASIS_ANCHORS,
 	TODO_RESOLUTION_STATUSES,
@@ -11,6 +15,12 @@ import {
 	type MarketSnapshot,
 	type ResolvableTodoKind,
 } from "./types.ts";
+
+// 残留锁判 stale 的年龄阈值。合法持锁只覆盖「抢锁→load→改内存→saveUnlocked」这一段：
+// 真实 25 快照实测约 15~25ms，合成 2000 快照约 190~265ms，写事务内不允许有网络/LLM 等待（见
+// skills/secure-store-write §1），所以 5 分钟是三个数量级的余量。反方向不能激进：误杀活锁后两个
+// 进程会各自通过 assertCurrentVersion 再先后 rename，后写者静默覆盖先写者且双方都不报错。
+const STALE_LOCK_MAX_AGE_MS = 5 * 60_000;
 
 const STORE_NEEDS_MIGRATION_WRITE = Symbol("compass-store-needs-migration-write");
 type MigratingStore = CompassStore & { [STORE_NEEDS_MIGRATION_WRITE]?: boolean };
@@ -59,6 +69,16 @@ function nextUpdatedAt(previous: string): string {
 
 function assertString(record: Record<string, unknown>, field: string, path: string): void {
 	if (typeof record[field] !== "string" || !record[field]) throw new Error(`罗盘数据字段 ${path}.${field} 损坏`);
+}
+
+// 抑制水位对象的形状校验：记录级 basis 与 attempt 级 basisAtSubmit 共用同一形状。
+// 两者都是可选字段——缺失即合法（语义由 service 的状态机决定），只在存在时校验字段类型
+function assertBasisShape(value: unknown, path: string): void {
+	if (value === undefined) return;
+	if (!isRecord(value)) throw new Error(`罗盘数据字段 ${path} 损坏`);
+	for (const field of ["month", "snapshotWatermark", "stageEnteredAt"]) {
+		if (value[field] !== undefined && (typeof value[field] !== "string" || !value[field])) throw new Error(`罗盘数据字段 ${path}.${field} 损坏`);
+	}
 }
 
 function assertRecordArray(record: Record<string, unknown>, field: string, optional = false): Record<string, unknown>[] {
@@ -111,8 +131,8 @@ function assertStore(value: unknown): asserts value is CompassStore {
 	for (const [index, candidate] of arrays.candidates.entries()) {
 		for (const field of ["id", "marketId", "stage"]) assertString(candidate, field, `candidates[${index}]`);
 		if (!Array.isArray(candidate.tags)) throw new Error(`罗盘数据字段 candidates[${index}].tags 损坏`);
-		if (candidate.gateOutcome !== undefined && !( ["pass", "review", "reject"] as unknown[]).includes(candidate.gateOutcome)) throw new Error(`罗盘数据字段 candidates[${index}].gateOutcome 损坏`);
-		if (candidate.decisionStatus !== undefined && !( ["go", "waitlist", "no_go"] as unknown[]).includes(candidate.decisionStatus)) throw new Error(`罗盘数据字段 candidates[${index}].decisionStatus 损坏`);
+		if (candidate.gateOutcome !== undefined && !(GATE_OUTCOMES as readonly unknown[]).includes(candidate.gateOutcome)) throw new Error(`罗盘数据字段 candidates[${index}].gateOutcome 损坏`);
+		if (candidate.decisionStatus !== undefined && !(DECISION_STATUSES as readonly unknown[]).includes(candidate.decisionStatus)) throw new Error(`罗盘数据字段 candidates[${index}].decisionStatus 损坏`);
 		for (const field of ["gateReason", "gateReasonAt", "gateReasonActor", "stageReason", "stageReasonAt", "stageReasonActor", "decisionReason", "decisionAt", "decisionActor"]) {
 			if (candidate[field] !== undefined && typeof candidate[field] !== "string") throw new Error(`罗盘数据字段 candidates[${index}].${field} 损坏`);
 		}
@@ -131,13 +151,13 @@ function assertStore(value: unknown): asserts value is CompassStore {
 	}
 	for (const [index, decision] of arrays.decisionLog.entries()) {
 		for (const field of ["id", "marketId", "type", "conclusion", "reason", "actor", "createdAt"]) assertString(decision, field, `decisionLog[${index}]`);
-		if (!( ["lead", "import", "strategy", "stage_move", "decision", "risk", "profit", "review", "retro"] as unknown[]).includes(decision.type)) throw new Error(`罗盘数据字段 decisionLog[${index}].type 损坏`);
-		if (decision.decisionStatus !== undefined && !( ["go", "waitlist", "no_go"] as unknown[]).includes(decision.decisionStatus)) throw new Error(`罗盘数据字段 decisionLog[${index}].decisionStatus 损坏`);
+		if (!(DECISION_LOG_TYPES as readonly unknown[]).includes(decision.type)) throw new Error(`罗盘数据字段 decisionLog[${index}].type 损坏`);
+		if (decision.decisionStatus !== undefined && !(DECISION_STATUSES as readonly unknown[]).includes(decision.decisionStatus)) throw new Error(`罗盘数据字段 decisionLog[${index}].decisionStatus 损坏`);
 	}
 	for (const [index, check] of arrays.outcomeChecks.entries()) {
 		for (const field of ["id", "marketId", "baselineSnapshotId", "verdict", "verdictReason", "createdAt", "actor"]) assertString(check, field, `outcomeChecks[${index}]`);
-		if (!( ["validated", "challenged", "inconclusive"] as unknown[]).includes(check.verdict)) throw new Error(`罗盘数据字段 outcomeChecks[${index}].verdict 损坏`);
-		if (check.decisionStatus !== undefined && !( ["go", "waitlist", "no_go"] as unknown[]).includes(check.decisionStatus)) throw new Error(`罗盘数据字段 outcomeChecks[${index}].decisionStatus 损坏`);
+		if (!(OUTCOME_VERDICTS as readonly unknown[]).includes(check.verdict)) throw new Error(`罗盘数据字段 outcomeChecks[${index}].verdict 损坏`);
+		if (check.decisionStatus !== undefined && !(DECISION_STATUSES as readonly unknown[]).includes(check.decisionStatus)) throw new Error(`罗盘数据字段 outcomeChecks[${index}].decisionStatus 损坏`);
 		if (typeof check.elapsedDays !== "number" || !Number.isInteger(check.elapsedDays) || check.elapsedDays < 0) throw new Error(`罗盘数据字段 outcomeChecks[${index}].elapsedDays 损坏`);
 		if (!Array.isArray(check.deltas)) throw new Error(`罗盘数据字段 outcomeChecks[${index}].deltas 损坏`);
 		for (const [deltaIndex, delta] of check.deltas.entries()) {
@@ -230,6 +250,7 @@ function assertStore(value: unknown): asserts value is CompassStore {
 				if (typeof item.ref !== "string" || !item.ref.trim()) throw new Error(`罗盘数据字段 ${evidencePath}.ref 必须非空`);
 				if (item.note !== undefined && typeof item.note !== "string") throw new Error(`罗盘数据字段 ${evidencePath}.note 损坏`);
 			}
+			assertBasisShape(attempt.basisAtSubmit, `${attemptPath}.basisAtSubmit`);
 			if (attempt.verdict !== undefined) {
 				if (!(["pass", "reject"] as unknown[]).includes(attempt.verdict)) throw new Error(`罗盘数据字段 ${attemptPath}.verdict 损坏`);
 				if (typeof attempt.verdictReason !== "string" || !attempt.verdictReason.trim()) throw new Error(`罗盘数据字段 ${attemptPath}.verdictReason 必须非空`);
@@ -246,12 +267,7 @@ function assertStore(value: unknown): asserts value is CompassStore {
 			for (const field of ["reopenedAt", "reopenedBy"]) assertString(reopen, field, reopenPath);
 			if (typeof reopen.reason !== "string" || !reopen.reason.trim()) throw new Error(`罗盘数据字段 ${reopenPath}.reason 必须非空`);
 		}
-		if (resolution.basis !== undefined) {
-			if (!isRecord(resolution.basis)) throw new Error(`罗盘数据字段 ${path}.basis 损坏`);
-			for (const field of ["month", "snapshotWatermark", "stageEnteredAt"]) {
-				if (resolution.basis[field] !== undefined && (typeof resolution.basis[field] !== "string" || !resolution.basis[field])) throw new Error(`罗盘数据字段 ${path}.basis.${field} 损坏`);
-			}
-		}
+		assertBasisShape(resolution.basis, `${path}.basis`);
 		const lastVerdict = resolution.attempts[resolution.attempts.length - 1].verdict;
 		const expectedVerdict: Record<string, unknown> = { submitted: undefined, rejected: "reject", verified: "pass", resolved: "pass" };
 		if (resolution.status !== "reopened" && lastVerdict !== expectedVerdict[resolution.status as string]) {
@@ -264,6 +280,26 @@ function assertStore(value: unknown): asserts value is CompassStore {
 			if (typeof basis?.[anchor] !== "string" || !basis[anchor]) throw new Error(`罗盘数据字段 ${path} 的 resolved 状态缺少水位锚点 ${anchor}`);
 		}
 		if (resolution.status === "reopened" && resolution.reopens.length === 0) throw new Error(`罗盘数据字段 ${path} 的 reopened 状态缺少重开留痕`);
+	}
+}
+
+// 写事务的版本判定（乐观锁）只需要顶层 updatedAt 一个字段，不必把整份 store.json 重新 parse
+// （真实 591 KB store 上这一笔占 update(noop) 的 26%）。正则从 ^\{ 锚定、且只放行标量顶层键，
+// 因此匹配成功必定取到顶层 updatedAt；遇到嵌套对象/数组、缩进、转义、非 ISO 字符一律不匹配，
+// 回退全量 parse。绝不能换成裸的 /"updatedAt":"…"/：键序被人手改过时它会取到 markets[0].updatedAt，
+// 那是乐观锁的判定输入，取错即漏判并发写。
+const STORE_HEAD_UPDATED_AT = /^\{(?:"[A-Za-z0-9_]+":(?:"[^"\\]*"|-?\d+(?:\.\d+)?|true|false|null),)*"updatedAt":"([0-9A-Za-z:.+-]*)"/;
+
+async function readStoreHead(path: string): Promise<string> {
+	const handle = await open(path, "r");
+	try {
+		const buffer = Buffer.allocUnsafe(256);
+		const { bytesRead } = await handle.read(buffer, 0, 256, 0);
+		// latin1：256 字节可能切在多字节 UTF-8 中间，按 utf8 解会产生替换字符；
+		// 锚定正则在捕获组前只匹配 ASCII，截断只会导致不匹配→回退，不会误取
+		return buffer.subarray(0, bytesRead).toString("latin1");
+	} finally {
+		await handle.close();
 	}
 }
 
@@ -343,10 +379,11 @@ export class CompassRepository {
 		this.lockPath = `${this.storePath}.lock`;
 	}
 
-	private resolveSnapshotDataPath(dataFile: string): string {
+	private resolveSnapshotDataPath(dataFile: string, snapshotRoot?: string): string {
 		if (isAbsolute(dataFile)) throw new Error("快照数据文件路径必须为相对路径");
 		const candidate = canonicalPath(resolve(this.projectRoot, dataFile));
-		const root = canonicalPath(this.snapshotDataDir);
+		// snapshotRoot 由写事务一次算好传进来（循环不变量）；省略时按原样每次自算，读侧走的就是这条
+		const root = snapshotRoot ?? canonicalPath(this.snapshotDataDir);
 		if (!pathWithin(this.projectRoot, root) || !pathWithin(root, candidate)) throw new Error("快照数据文件路径越界");
 		return candidate;
 	}
@@ -440,21 +477,24 @@ export class CompassRepository {
 				try {
 					const lockStat = await stat(this.lockPath);
 					const currentLock = await readFile(this.lockPath, "utf8");
-					let stale = Date.now() - lockStat.mtimeMs > 30_000;
+					// 两级判定：① 持锁进程确定已死（ESRCH）立即回收；② 进程还活着、属于别的用户
+					// （EPERM）或 pid 读不出来时不下断言，退回 mtime 年龄判据。pid 会被系统复用，
+					// 「存活」不等于「还在写罗盘」——旧实现让存活无条件否决 mtime，崩溃残留锁的 pid
+					// 一旦被复用就永远回收不了，每次写空转满 10 秒后失败。
+					let stale = Date.now() - lockStat.mtimeMs > STALE_LOCK_MAX_AGE_MS;
 					const lockPid = Number(currentLock.split("\n", 1)[0]);
 					if (Number.isInteger(lockPid) && lockPid > 0) {
 						try {
 							process.kill(lockPid, 0);
-							stale = false;
 						} catch (processError) {
-							stale = (processError as NodeJS.ErrnoException).code === "ESRCH";
+							if ((processError as NodeJS.ErrnoException).code === "ESRCH") stale = true;
 						}
 					}
 					if (stale) await this.unlinkLockIfOwned(currentLock);
 				} catch (statError) {
 					if ((statError as NodeJS.ErrnoException).code !== "ENOENT") throw statError;
 				}
-				if (Date.now() >= deadline) throw new StoreIoError(`罗盘数据文件被其他进程锁定超过 10 秒：${this.storePath}`);
+				if (Date.now() >= deadline) throw new StoreIoError(`罗盘数据文件被其他进程锁定超过 10 秒：${this.storePath}；确认没有其他 pi 会话或 Web 工作台在运行后，删除锁文件 ${this.lockPath} 再重试`);
 				// 重试定时器必须持有 event loop 引用（默认 ref）：调用方正在 await 这次写入，
 				// unref 会让 loop 一空进程就退，pending 的写静默丢失（CI 上两个锁测试
 				// 正是死于「Promise resolution is still pending but the event loop has
@@ -481,10 +521,11 @@ export class CompassRepository {
 		}
 	}
 
-	private async persistSnapshotPayload(snapshot: MarketSnapshot): Promise<void> {
-		await mkdir(this.snapshotDataDir, { recursive: true, mode: 0o700 });
+	// snapshotRoot 必填：调用方必须先 mkdir 出 snapshotDataDir 再算它的 canonicalPath，
+	// 一次写事务只算一次。做成必填而非带默认值，是为了让将来新增的调用方被类型检查拦下来想清楚。
+	private async persistSnapshotPayload(snapshot: MarketSnapshot, snapshotRoot: string): Promise<void> {
 		const dataFile = snapshot.dataFile ?? relative(this.projectRoot, resolve(this.snapshotDataDir, `${safeBaseName(snapshot.id)}.json`));
-		const dataPath = this.resolveSnapshotDataPath(dataFile);
+		const dataPath = this.resolveSnapshotDataPath(dataFile, snapshotRoot);
 		snapshot.dataFile = relative(this.projectRoot, dataPath);
 		try {
 			await stat(dataPath);
@@ -497,7 +538,9 @@ export class CompassRepository {
 
 	private async assertCurrentVersion(store: CompassStore): Promise<void> {
 		try {
-			const current = JSON.parse(await readFile(this.storePath, "utf8")) as unknown;
+			// 先读前 256 字节取顶层 updatedAt；键序异常 / 缩进 / 空文件 / 非对象一律不匹配，回退全量解析
+			const fastUpdatedAt = STORE_HEAD_UPDATED_AT.exec(await readStoreHead(this.storePath))?.[1];
+			const current = fastUpdatedAt !== undefined ? { updatedAt: fastUpdatedAt } : (JSON.parse(await readFile(this.storePath, "utf8")) as unknown);
 			if (!isRecord(current) || current.updatedAt !== store.updatedAt) {
 				throw new StoreIoError(`罗盘数据在本次读取后已被其他进程更新：${this.storePath}`);
 			}
@@ -516,7 +559,14 @@ export class CompassRepository {
 		};
 		assertStore(validationStore);
 		await mkdir(this.dataDir, { recursive: true, mode: 0o700 });
-		for (const snapshot of store.snapshots) await this.persistSnapshotPayload(snapshot);
+		if (store.snapshots.length > 0) {
+			// mkdir 与 snapshots 根目录的 realpath 都是循环不变量：原实现对每个快照各做一次，
+			// N=2000 时白花 mkdir 33 ms + realpath 29 ms。提到循环外不改变语义——
+			// 越界判定（pathWithin 双检）与 dataFile 归一仍逐快照执行，一个都不能少。
+			await mkdir(this.snapshotDataDir, { recursive: true, mode: 0o700 });
+			const snapshotRoot = canonicalPath(this.snapshotDataDir);
+			for (const snapshot of store.snapshots) await this.persistSnapshotPayload(snapshot, snapshotRoot);
+		}
 		const persisted: CompassStore = {
 			...store,
 			snapshots: store.snapshots.map((snapshot) => snapshot.dataFile ? emptySnapshotPayload(snapshot) : snapshot),
@@ -562,6 +612,30 @@ export class CompassRepository {
 		const reportsRoot = canonicalPath(this.reportsDir);
 		if (!pathWithin(this.projectRoot, reportsRoot) || !pathWithin(reportsRoot, resolvedCandidate)) throw new Error("报告输出路径必须位于 .pi/compass/reports 目录内");
 		return resolvedCandidate;
+	}
+
+	// 上一份复盘报告的落盘时刻（ISO），没有报告时返回 undefined。
+	// 用文件 mtime 而不是解析文件名里的日期：文件名里的是生成机器的本地日历日，
+	// 跨时区反解回瞬时会错一天。必须在写入本次报告之前调用，否则会探到自己。
+	// 只读、不加锁、失败一律 fail open（返回 undefined 让「本次沉淀」退回本地日历日窗口）。
+	async latestRetroReportAt(): Promise<string | undefined> {
+		let entries: string[];
+		try {
+			entries = await readdir(this.reportsDir);
+		} catch {
+			return undefined;
+		}
+		let latest: number | undefined;
+		for (const name of entries) {
+			if (!/^retro-.+\.md$/iu.test(name)) continue;
+			try {
+				const info = await stat(resolve(this.reportsDir, name));
+				if (info.isFile() && (latest === undefined || info.mtimeMs > latest)) latest = info.mtimeMs;
+			} catch {
+				// 列目录与 stat 之间文件被移走：跳过该条
+			}
+		}
+		return latest === undefined ? undefined : new Date(latest).toISOString();
 	}
 
 	async archiveRaw(fileName: string, content: Buffer, capturedAt: string): Promise<string> {

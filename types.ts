@@ -15,6 +15,23 @@ export type CandidateStage = (typeof CANDIDATE_STAGES)[number];
 export const DECISION_STATUSES = ["go", "waitlist", "no_go"] as const;
 export const SNAPSHOT_SOURCES = ["auto", "sellersprite", "sorftime", "keepa", "compass_browser", "manual_csv", "generic_csv"] as const;
 
+// 其余领域枚举同样「常量是唯一真相源、类型由它派生」：入口层校验（index.ts 的 StringEnum /
+// ui.select）与持久化白名单（store.ts 的 assertStore）一律引用这些常量，禁止再抄字面量。
+// 三层各抄一份的老写法一旦漏改，症状是「数据看着没问题却报 XX 损坏」，极难定位。
+export const GATE_OUTCOMES = ["pass", "review", "reject"] as const;
+export const OUTCOME_VERDICTS = ["validated", "challenged", "inconclusive"] as const;
+export const RISK_STATUSES = ["pass", "review", "red", "unknown"] as const;
+export const SEASON_FLAGS = ["clear", "strong", "review", "unknown"] as const;
+export const POLICY_FLAGS = ["clear", "review", "red", "unknown"] as const;
+export const STRATEGY_MODES = ["screen", "full"] as const;
+export const REVIEW_THEME_CATEGORIES = ["quality", "size", "damage", "expectation", "usability", "other"] as const;
+export const REVIEW_THEME_FIXABILITIES = ["factory", "packaging", "copy", "none", "unknown"] as const;
+
+// ★ 回滚兼容红线 ★ 旧版 assertStore 对 decisionLog.type 是严格白名单：**新增取值会让回滚后的
+// store 打不开**。要给决策日志加维度，一律加可选字段（如 trigger / strategyRunId），不要加取值。
+// 收敛成一处常量正是为了让「改这里」显眼到必须先想清楚回滚代价。
+export const DECISION_LOG_TYPES = ["lead", "import", "strategy", "stage_move", "decision", "risk", "profit", "review", "retro"] as const;
+
 // 阶段中文标签：TUI 与 Web 共用的领域词汇（七个工作阶段 + archived 归档）
 export const STAGE_LABELS: Record<CandidateStage, string> = {
 	lead: "线索",
@@ -26,10 +43,16 @@ export const STAGE_LABELS: Record<CandidateStage, string> = {
 	review: "复盘",
 	archived: "归档",
 };
-export type GateOutcome = "pass" | "review" | "reject";
+export type GateOutcome = (typeof GATE_OUTCOMES)[number];
 export type DecisionStatus = (typeof DECISION_STATUSES)[number];
-export type OutcomeVerdict = "validated" | "challenged" | "inconclusive";
-export type RiskStatus = "pass" | "review" | "red" | "unknown";
+export type OutcomeVerdict = (typeof OUTCOME_VERDICTS)[number];
+export type RiskStatus = (typeof RISK_STATUSES)[number];
+export type SeasonFlag = (typeof SEASON_FLAGS)[number];
+export type PolicyFlag = (typeof POLICY_FLAGS)[number];
+export type StrategyMode = (typeof STRATEGY_MODES)[number];
+export type ReviewThemeCategory = (typeof REVIEW_THEME_CATEGORIES)[number];
+export type ReviewThemeFixability = (typeof REVIEW_THEME_FIXABILITIES)[number];
+export type DecisionLogType = (typeof DECISION_LOG_TYPES)[number];
 export type Confidence = number;
 export type MetricScalar = number | string | boolean | null;
 
@@ -40,6 +63,11 @@ export interface MetricEvidence {
 	confidence: Confidence;
 	sampleSize?: number;
 	note?: string;
+	// 仅 q（目标月销）相关指标写入：标明这份证据是按哪个 q 算出来的。
+	// 老证据没有本字段 = 口径未知；读侧只在「口径确认与当前 q 相同」时才敢沿用冻结值。
+	// 可选字段：emptySnapshotPayload 整体透传 metrics、assertStore 不逐条校验 metrics，
+	// 故无需动持久化白名单与硬校验，旧版扩展回滚后忽略即可。
+	targetMonthlyUnits?: number;
 }
 
 export type MetricMap = Record<string, MetricEvidence>;
@@ -88,7 +116,6 @@ export interface Market {
 	category?: string;
 	createdAt: string;
 	updatedAt: string;
-	latestSnapshotId?: string;
 }
 
 export interface MarketSnapshot {
@@ -195,8 +222,8 @@ export interface RiskRecord {
 	candidateId?: string;
 	certStatus: RiskStatus;
 	ipRiskLevel: RiskStatus;
-	seasonFlag: "clear" | "strong" | "review" | "unknown";
-	policyFlag: "clear" | "review" | "red" | "unknown";
+	seasonFlag: SeasonFlag;
+	policyFlag: PolicyFlag;
 	logisticsRisk: RiskStatus;
 	overall: RiskStatus;
 	evidence: RiskEvidenceItem[];
@@ -207,10 +234,10 @@ export interface RiskRecord {
 
 export interface ReviewTheme {
 	name: string;
-	category: "quality" | "size" | "damage" | "expectation" | "usability" | "other";
+	category: ReviewThemeCategory;
 	count: number;
 	share?: number;
-	fixability: "factory" | "packaging" | "copy" | "none" | "unknown";
+	fixability: ReviewThemeFixability;
 	evidence?: string[];
 	recommendation?: string;
 }
@@ -298,23 +325,34 @@ export interface StrategyRun {
 	strategyVersion: number;
 	marketId: string;
 	snapshotId: string;
-	mode: "screen" | "full";
+	mode: StrategyMode;
 	result: StrategyEvaluation;
 	runAt: string;
 	actor: string;
 }
 
+// 决策日志的触发来源。只有 "manual" 才算对 retro_challenged 的人工处置动作；字段缺失
+// （存量日志、将来忘了传的调用方）一律按「非手动」处理——最坏是多提醒一次，绝不漏提醒。
+// 刻意做成新增**可选字段**而不是新增 decisionLog.type 取值：旧版 assertStore 对 type 是
+// 严格白名单，新增取值会让回滚后的 store 打不开；未知可选字段被旧版忽略并原样保留。
+export type DecisionTrigger = "manual" | "auto_import";
+
 export interface DecisionLog {
 	id: string;
 	candidateId?: string;
 	marketId: string;
-	type: "lead" | "import" | "strategy" | "stage_move" | "decision" | "risk" | "profit" | "review" | "retro";
+	type: DecisionLogType;
+	trigger?: DecisionTrigger;
 	conclusion: string;
 	decisionStatus?: DecisionStatus;
 	reason: string;
 	snapshotId?: string;
 	strategyId?: string;
 	strategyVersion?: number;
+	// 决策落定时依据的那次策略运行（可选）：决策锚定的是「当下最新快照」，而策略来自
+	// candidate.latestStrategyRunId，两者可以落在不同快照上。只有新决策会写，旧记录靠
+	// findRetroBaseline 的读侧回退补齐，因此保持可选、不做写回迁移。
+	strategyRunId?: string;
 	actor: string;
 	createdAt: string;
 }
@@ -455,6 +493,9 @@ export interface TodoResolutionAttempt {
 	submittedBy: string;
 	note: string;
 	evidence: TodoEvidenceRef[];
+	// 提交时刻的抑制水位快照：勾选时重算并与之比对，拦住「提交→勾选之间新到达、无人核对的事实」。
+	// 可选——本字段上线前的旧记录没有，一律按「水位已失效」处理（宁可多走一轮提交，绝不放行可能漏提醒的勾选）
+	basisAtSubmit?: TodoResolutionBasis;
 	verdict?: TodoResolutionVerdict;
 	verdictReason?: string;
 	verifiedAt?: string;

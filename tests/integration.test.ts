@@ -1178,6 +1178,34 @@ test("pid 被复用的残留锁：持锁 pid 存活也按 mtime 年龄回收", a
 // 实跑：修前 10048ms 抛 StoreIoError（用例失败）；修后 58.070708ms 通过。
 
 
+// —— code-review 回归：锁被回收后不得静默覆盖 ——
+test("写事务进行中锁被回收：响亮失败，而不是覆盖抢锁方刚写入的内容", async () => {
+	// 回收策略无论把阈值取多长都消不掉这个失败模式——笔记本休眠、SIGSTOP、NFS 卡顿
+	// 都能让一个**活着**的写事务持锁超过任何静态阈值。原持有者若照常 rename，
+	// 就会盖掉抢锁方刚写完的内容，且两边都不报错。这里模拟「锁在 mutator 执行期间被别人换掉」。
+	const root = await mkdtemp(join(tmpdir(), "compass-lock-stolen-"));
+	try {
+		const repo = new CompassRepository(root);
+		await mkdir(repo.dataDir, { recursive: true });
+		await repo.save(createEmptyStore());
+
+		await assert.rejects(
+			repo.update(async (store) => {
+				store.markets.push({ id: "mine", name: "mine", keywords: [], createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() });
+				// 抢锁方回收了我们的锁并换上自己的：unlinkLockIfOwned 之后另起一把
+				await writeFile(repo.lockPath, "99999\nthief-token\n2026-01-01T00:00:00.000Z\n", "utf8");
+			}),
+			/锁已被回收/,
+			"锁易主后必须中止写入并说明原因",
+		);
+
+		// 关键：我们的改动没有落盘，抢锁方的世界观完好
+		assert.deepEqual((await repo.load()).markets, [], "中止的写事务不得留下任何痕迹");
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
 // —— 审计 M31 回归 ——
 test("新鲜的活锁不会被抢走：写入排队到持锁方释放为止", async () => {
 	const root = await mkdtemp(join(tmpdir(), "compass-live-lock-"));

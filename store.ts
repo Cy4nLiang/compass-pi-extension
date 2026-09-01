@@ -456,6 +456,28 @@ export class CompassRepository {
 		}
 	}
 
+	// 当前写事务持有的锁令牌。写队列保证同一实例同时只有一个 withStoreLock 在跑，
+	// 所以单个字段足够；未持锁时为 undefined。
+	private heldLock: string | undefined;
+
+	// 落盘前复核：锁被判 stale 回收后，原持有者若照常 rename 就会静默覆盖抢锁方写入的内容，
+	// 且两边都不报错——这是回收策略无论取多长阈值都消不掉的那个失败模式（笔记本休眠、
+	// SIGSTOP、NFS 卡顿都能跨过任何静态阈值）。这里把它变成一次响亮失败。
+	private async assertStillHoldingLock(): Promise<void> {
+		if (this.heldLock === undefined) return;
+		let current: string;
+		try {
+			current = await readFile(this.lockPath, "utf8");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			current = "";
+		}
+		if (current === this.heldLock) return;
+		throw new StoreIoError(
+			`本次写入的锁已被回收（${this.lockPath}），为避免覆盖其他进程刚写入的内容，这次写入已中止；请重试。若反复出现，说明有写事务卡在 ${STALE_LOCK_MAX_AGE_MS / 60_000} 分钟以上（进程被挂起、磁盘或网络存储卡顿），先排查那一头`,
+		);
+	}
+
 	private async unlinkLockIfOwned(lockContent: string): Promise<void> {
 		try {
 			if ((await readFile(this.lockPath, "utf8")) === lockContent) await unlink(this.lockPath);
@@ -502,9 +524,11 @@ export class CompassRepository {
 				await delay(50);
 			}
 		}
+		this.heldLock = lockContent;
 		try {
 			return await operation();
 		} finally {
+			this.heldLock = undefined;
 			await this.unlinkLockIfOwned(lockContent);
 		}
 	}
@@ -572,6 +596,9 @@ export class CompassRepository {
 			snapshots: store.snapshots.map((snapshot) => snapshot.dataFile ? emptySnapshotPayload(snapshot) : snapshot),
 		};
 		assertStore(persisted);
+		// 复核放在 rename 之前、所有校验与 sidecar 落盘之后：这时才是真正会改变
+		// 「别人读到什么」的那一步。
+		await this.assertStillHoldingLock();
 		await this.writeAtomic(this.storePath, `${JSON.stringify(persisted)}\n`, 0o600);
 		await chmod(this.storePath, 0o600).catch(() => undefined);
 	}

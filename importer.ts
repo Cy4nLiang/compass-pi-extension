@@ -28,10 +28,28 @@ export interface CsvImportInput {
 	runScreen?: boolean;
 }
 
-export function normalizeCapturedAt(value?: string): string {
-	if (!value) return new Date().toISOString();
+// capturedAt 上界余量：Web 向导按运营本地日发纯日期，被解释成该日 UTC 零点，
+// UTC+14 的运营在本地 00:00 导入就天然超前「现在」14 小时；再留一天给「CSV 导出日期
+// 标的是明天」的跨时区情形。存量 store 实测最大超前 7.99 小时，36 小时余量充足。
+const CAPTURED_AT_MAX_AHEAD_MS = 36 * 3_600_000;
+// 下界：罗盘只服务在售 Amazon 市场，2000 年前的采集日期必然是手滑（1026 / 0226 之类）
+const CAPTURED_AT_MIN_MS = Date.UTC(2000, 0, 1);
+
+// 只校验「可解析」会让一次手滑（2026 打成 2062）永久占住该市场的「最新快照」：
+// 读侧 ageDays 一律 Math.max(0, …) 夹零 → 新鲜度恒 deep_fresh、snapshot_stale 永不浮出，
+// 而全仓库没有删除快照的入口，运营无法自救。校验放在这一层（不放 assertStore）：
+// load 与 save 跑同一份 assertStore，收紧后存量脏记录会让 store 既读不出也写不进。
+export function normalizeCapturedAt(value?: string, now = Date.now()): string {
+	if (!value) return new Date(now).toISOString();
 	const date = new Date(value);
-	if (!Number.isFinite(date.getTime())) throw new Error(`captured_at 无效：${value}；请使用合法的 ISO 时间`);
+	const time = date.getTime();
+	if (!Number.isFinite(time)) throw new Error(`captured_at 无效：${value}；请使用合法的 ISO 时间`);
+	if (time > now + CAPTURED_AT_MAX_AHEAD_MS) {
+		throw new Error(`captured_at 不能晚于当前时间 36 小时：${value}；快照一经写入不可删除，请核对采集日期后重导`);
+	}
+	if (time < CAPTURED_AT_MIN_MS) {
+		throw new Error(`captured_at 过早：${value}；有效范围自 2000-01-01 起，请核对采集日期后重导`);
+	}
 	return date.toISOString();
 }
 
@@ -59,7 +77,10 @@ export async function performCsvImport(deps: CsvImportDeps, input: CsvImportInpu
 	const duplicate = findDuplicateImport(await deps.repo.load(), fileHash);
 	if (duplicate) throw new Error(`重复 CSV：该文件已于 ${duplicate.importedAt} 导入为 ${duplicate.id}`);
 	const capturedAt = normalizeCapturedAt(input.capturedAt);
-	const parsed = parseMarketCsv(decodeCsvBuffer(buffer), { source: input.source, capturedAt });
+	const decoded = decodeCsvBuffer(buffer);
+	const parsed = parseMarketCsv(decoded.text, { source: input.source, capturedAt });
+	// 解码告警排在解析告警前面：编码是根因，运营先看到它才知道要另存 UTF-8 重导
+	if (decoded.warnings.length > 0) parsed.warnings = [...decoded.warnings, ...parsed.warnings];
 	const archivedFile = await deps.repo.archiveRaw(basename(path), buffer, capturedAt);
 	try {
 		const { result, store } = await deps.mutate((data) => importMarketAndScreen(data, {

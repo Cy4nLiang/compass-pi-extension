@@ -5,13 +5,17 @@
 	<meta name="viewport" content="width=device-width, initial-scale=1">
 	<title>罗盘 Compass · Amazon US 精铺选品工作台</title>
 	<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='12' cy='12' r='9.5' fill='%230e1216' stroke='%23e2a33e' stroke-width='1.5'/%3E%3Cpath d='M15.5 8.5 L13.2 13.2 L8.5 15.5 L10.8 10.8 Z' fill='%23e2a33e'/%3E%3C/svg%3E">
-	<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&amp;family=IBM+Plex+Sans:wght@400;500;600;700&amp;display=swap">
+	<!-- 唯一的外链：IBM Plex 字体。media="print" + onload 换回 all 是标准的非阻塞写法——
+	     工作台只绑回环、离线可用是硬约束，字体主机不可达时（断网/被墙）render-blocking 的
+	     <link> 会连 app.js 都不执行，页面永久停在「正在加载罗盘工作台…」。
+	     字体拿不到时 style.css 的回退栈接管，功能不受影响。 -->
+	<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&amp;family=IBM+Plex+Sans:wght@400;500;600;700&amp;display=swap" media="print" onload="this.media='all'" referrerpolicy="no-referrer">
 	<link rel="stylesheet" href="/assets/style.css">
 </head>
 <body>
 	<div id="app">
-		<div class="boot-loading">正在加载罗盘工作台…</div>
+		<div class="boot-loading" id="boot-loading">正在加载罗盘工作台…</div>
 	</div>
-	<script src="/assets/app.js" type="module"></script>
+	<script src="/assets/app.js" type="module" onerror="document.getElementById('boot-loading').textContent = '静态资源加载失败：/assets/app.js 或它 import 的模块没能加载。请确认罗盘 Web 服务仍在运行，然后刷新页面。'"></script>
 </body>
 </html>

@@ -16,7 +16,7 @@
 		"fba"
 	],
 	"scripts": {
-		"test": "node --experimental-strip-types --test tests/*.test.ts",
+		"test": "node --experimental-strip-types --test --test-timeout=30000 tests/*.test.ts",
 		"check": "tsc --noEmit",
 		"web": "node --experimental-strip-types web/standalone.ts"
 	},

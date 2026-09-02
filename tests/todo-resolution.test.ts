@@ -15,7 +15,7 @@ import {
 } from "../service.ts";
 import { CompassRepository, createEmptyStore } from "../store.ts";
 import { divergenceWatermarks, stageEntryTimes } from "../todo.ts";
-import type { CompassStore, MetricEvidence, MetricMap, TodoResolution, TodoResolutionAttempt } from "../types.ts";
+import type { CompassStore, MetricEvidence, MetricMap, TodoResolution, TodoResolutionAttempt, TodoResolutionBasis } from "../types.ts";
 
 // 待办人工处理闭环的数据层守护：store 校验（五状态硬不变式 / 唯一性 / kind 白名单 / 证据形状）
 // 与集合迁移回填。状态机编排的用例在 Task 3 追加到本文件。
@@ -487,3 +487,118 @@ test("水位锚点无法确定时拒绝勾选，不写出违反硬不变式的�
 	assert.throws(() => completeTodoResolution(store, { todoRef: DEEP_TODO }, "compass-web", NOW), /水位/);
 	assert.equal(store.todoResolutions?.[0].status, "verified");
 });
+
+// —— 审计 M40 回归 ——
+test("跨预算月的勾选被拒，次月新告警照常浮出且能走新一轮关闭", () => {
+	const store = machineStore();
+	const AUG31 = "2026-08-31T23:00:00.000Z";
+	const SEP01 = "2026-09-01T01:00:00.000Z";
+	const SEP20 = "2026-09-20T00:00:00.000Z";
+	submitTodoResolution(store, { todoRef: BUDGET_TODO, note: "已核对 keepa 用量，本月收紧补数不提额" }, "compass-web", AUG31);
+	verifyTodoResolution(store, { todoRef: BUDGET_TODO, verdict: "pass", reason: "给出用量结论与后续动作" }, "compass-agent", AUG31);
+	assert.equal(store.todoResolutions?.[0].attempts[0].basisAtSubmit?.month, "2026-08", "提交时水位随记录落库");
+
+	// 跨月后条目自然消失：此刻勾选只会把「次月」预埋成抑制水位
+	assert.equal(listWorkbenchTodos(store, SEP01).some((todo) => todo.id === BUDGET_TODO), false);
+	assert.throws(() => completeTodoResolution(store, { todoRef: BUDGET_TODO }, "compass-web", SEP01), /已不在活跃清单/);
+	assert.equal(store.todoResolutions?.[0].status, "verified");
+	assert.equal(store.todoResolutions?.[0].basis, undefined, "被拒的勾选不得落下任何水位");
+
+	// 9 月用量再次越过 80%：告警必须重新浮出（修复前整月静默）
+	store.costEvents.push({ id: "ce2", source: "keepa", amountCny: 360, createdAt: "2026-09-05T00:00:00.000Z", actor: "ops" });
+	assert.equal(listWorkbenchTodos(store, SEP20).find((todo) => todo.id === BUDGET_TODO)?.resolution?.status, "verified");
+
+	// 出路：水位已失效 → 放行重新提交，新一轮走完才关闭 9 月这条
+	const again = submitTodoResolution(store, { todoRef: BUDGET_TODO, note: "9 月用量再次核对：申请提额至 ¥600" }, "compass-web", SEP20);
+	assert.equal(again.attempts.length, 2);
+	assert.equal(again.attempts[1].basisAtSubmit?.month, "2026-09");
+	verifyTodoResolution(store, { todoRef: BUDGET_TODO, verdict: "pass", reason: "提额结论明确" }, "compass-agent", SEP20);
+	assert.equal(completeTodoResolution(store, { todoRef: BUDGET_TODO }, "compass-web", SEP20).basis?.month, "2026-09");
+	assert.equal(listWorkbenchTodos(store, SEP20).some((todo) => todo.id === BUDGET_TODO), false);
+});
+
+
+// —— 审计 M40 回归 ——
+test("验证→勾选之间到达的新导出不被吞：勾选被拒，重新提交后才能关闭", () => {
+	const store = machineStore();
+	const LATER = "2026-08-29T00:00:00.000Z";
+	submitDivergence(store);
+	verifyTodoResolution(store, { todoRef: DIVERGENCE_TODO, verdict: "pass", reason: "口径选择与理由明确" }, "compass-agent", NOW);
+	const atSubmit = store.todoResolutions?.[0].attempts[0].basisAtSubmit?.snapshotWatermark;
+	assert.equal(atSubmit, divergenceWatermarks(store).get("m1"));
+
+	// 勾选前来了一份更新的 sorftime 导出：偏差事实已变，没有任何人核对过
+	addSnapshot(store, "s4", "m1", "sorftime", "2026-08-28T00:00:00.000Z", { cr3: metric(0.05, "sorftime") });
+	assert.notEqual(divergenceWatermarks(store).get("m1"), atSubmit);
+	assert.throws(() => completeTodoResolution(store, { todoRef: DIVERGENCE_TODO }, "compass-web", LATER), /自提交后已出现新事实/);
+	assert.equal(store.todoResolutions?.[0].status, "verified");
+	assert.equal(store.todoResolutions?.[0].basis, undefined);
+	assert.equal(listWorkbenchTodos(store, LATER).some((todo) => todo.id === DIVERGENCE_TODO), true, "条目仍在清单上等待重新处理");
+
+	const again = submitTodoResolution(
+		store,
+		{ todoRef: DIVERGENCE_TODO, note: "按 8/28 新导出复核后仍以 sellersprite 为准", evidence: [{ ref: "https://example.com/recheck" }] },
+		"compass-web",
+		LATER,
+	);
+	assert.equal(again.attempts.length, 2);
+	assert.equal(again.attempts[1].basisAtSubmit?.snapshotWatermark, divergenceWatermarks(store).get("m1"));
+	verifyTodoResolution(store, { todoRef: DIVERGENCE_TODO, verdict: "pass", reason: "已按新导出复核" }, "compass-agent", LATER);
+	assert.equal(completeTodoResolution(store, { todoRef: DIVERGENCE_TODO }, "compass-web", LATER).basis?.snapshotWatermark, divergenceWatermarks(store).get("m1"));
+	assert.equal(listWorkbenchTodos(store, LATER).some((todo) => todo.id === DIVERGENCE_TODO), false);
+});
+
+
+// —— 审计 M40 回归 ——
+test("条目已离开活跃清单时拒绝勾选；重新浮出且水位未变则直接放行", () => {
+	const store = machineStore();
+	submitDivergence(store);
+	verifyTodoResolution(store, { todoRef: DIVERGENCE_TODO, verdict: "pass", reason: "口径明确" }, "compass-agent", NOW);
+	store.candidates[0].stage = "archived";
+	assert.equal(activeTodo(store, DIVERGENCE_TODO), undefined);
+	assert.throws(() => completeTodoResolution(store, { todoRef: DIVERGENCE_TODO }, "compass-web", NOW), /已不在活跃清单/);
+	assert.equal(store.todoResolutions?.[0].status, "verified");
+	assert.equal(store.todoResolutions?.[0].basis, undefined);
+
+	store.candidates[0].stage = "screen";
+	assert.equal(activeTodo(store, DIVERGENCE_TODO)?.resolution?.status, "verified");
+	assert.equal(completeTodoResolution(store, { todoRef: DIVERGENCE_TODO }, "compass-web", NOW).status, "resolved", "水位未变时无需重走一轮");
+});
+
+
+// —— 审计 M40 回归 ——
+test("缺 basisAtSubmit 的旧记录不放行勾选，但可重新提交且照常通过 store 校验", async () => {
+	const store = machineStore();
+	submitDivergence(store);
+	verifyTodoResolution(store, { todoRef: DIVERGENCE_TODO, verdict: "pass", reason: "口径明确" }, "compass-agent", NOW);
+	const legacy = (store.todoResolutions ?? [])[0];
+	delete legacy.attempts[0].basisAtSubmit;
+	assert.throws(() => completeTodoResolution(store, { todoRef: DIVERGENCE_TODO }, "compass-web", NOW), /缺少提交时水位/);
+	await withRepo(async (repo) => {
+		await repo.save(store);
+		assert.equal((await repo.load()).todoResolutions?.[0].attempts[0].basisAtSubmit, undefined);
+	});
+
+	const again = submitDivergence(store, "重新核对后提交：以 sellersprite 为准");
+	assert.equal(again.attempts.length, 2);
+	assert.equal(again.attempts[1].basisAtSubmit?.snapshotWatermark, divergenceWatermarks(store).get("m1"));
+	verifyTodoResolution(store, { todoRef: DIVERGENCE_TODO, verdict: "pass", reason: "复核通过" }, "compass-agent", NOW);
+	assert.equal(completeTodoResolution(store, { todoRef: DIVERGENCE_TODO }, "compass-web", NOW).status, "resolved");
+});
+
+
+// —— 审计 M40 回归 ——
+test("attempt 的 basisAtSubmit 可缺省，存在时按水位形状校验", async () => {
+	await withRepo(async (repo) => {
+		const stamped = resolution({ attempts: [attempt({ basisAtSubmit: { snapshotWatermark: WATERMARK } })] });
+		await writeRawStore(repo, [stamped]);
+		assert.deepEqual((await repo.load()).todoResolutions, [stamped]);
+
+		await writeRawStore(repo, [corrupt({ attempts: [attempt({ basisAtSubmit: { snapshotWatermark: 20260730 } as unknown as TodoResolutionBasis })] })]);
+		await assert.rejects(repo.load(), /todoResolutions\[0\]\.attempts\[0\]\.basisAtSubmit\.snapshotWatermark 损坏/);
+
+		await writeRawStore(repo, [corrupt({ attempts: [attempt({ basisAtSubmit: "2026-08" as unknown as TodoResolutionBasis })] })]);
+		await assert.rejects(repo.load(), /todoResolutions\[0\]\.attempts\[0\]\.basisAtSubmit 损坏/);
+	});
+});
+

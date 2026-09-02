@@ -566,6 +566,11 @@ test("assets are reachable under both /assets/* and root, and pool write paths a
 	}
 });
 
+// ⚠️ 本用例当前**只覆盖单来源市场**：setupProject 的夹具全部以 source="sellersprite" 导入，
+// 而 metricDivergences 有 `latestBySource.size < 2` 提前退出，所以它走不到会读 sidecar 的那条路径。
+// 换句话说 hits===0 在多来源市场上并不成立——那是有意识的取舍，不是这条断言在守护的性质。
+// 详见 service.ts 的 installTargetDependentMetrics 注释与 strategy-config-integrity/tasks.md 的
+// Deviation 16。要把多来源也钉住，得先决定那条路径该不该改（本次提交只改措辞、不改行为）。
 test("read endpoints never touch lazily loaded snapshot detail files", async () => {
 	const { root, server } = await setupProject({ seed: true });
 	try {
@@ -702,5 +707,94 @@ test("todo write endpoints refuse wrong methods and cross-site posts", async () 
 		assert.deepEqual(store.todoResolutions, [], "被拒绝的跨站请求不得落盘");
 	} finally {
 		await teardown(root, server);
+	}
+});
+
+// 写端点防线由源码抽取驱动：路由表是唯一事实来源，新增 /api/ 路径必须自动进入本用例的矩阵。
+// ⚠️ 与 M104 同款脆弱点：下面两条正则贴着 web/server.ts 的写法。路由表改形状（例如 WRITE_PATHS
+// 改成 Set、或 /api/ 路径改用模板串拼接）时必须同步更新，sanity 断言会先红提醒。
+const SERVER_SOURCE_PATH = join(here, "../web/server.ts");
+const APP_SOURCE_PATH = join(here, "../web/assets/app.js");
+
+/** 抽 `const WRITE_PATHS = ["...", ...];` 里的字面量 */
+function writePathsFromSource(source: string): string[] {
+	const block = /const WRITE_PATHS = \[([\s\S]*?)\];/u.exec(source);
+	assert.ok(block, "web/server.ts 里找不到 `const WRITE_PATHS = [...];`");
+	return [...block[1].matchAll(/"(\/api\/[^"]*)"/gu)].map((match) => match[1]);
+}
+
+/** 抽源码里出现的全部 /api/ 双引号字面量（含只读端点、前缀判据与 404 兜底） */
+function apiLiteralsFromSource(source: string): string[] {
+	return [...new Set([...source.matchAll(/"(\/api\/[^"$]*)"/gu)].map((match) => match[1]))].sort();
+}
+
+
+test("WRITE_PATHS 全部写端点逐条守住三条防线（M101）", async () => {
+	const serverSource = await readFile(SERVER_SOURCE_PATH, "utf8");
+	const writePaths = writePathsFromSource(serverSource);
+	// sanity：抽取规则失效时（路由表改形状）先在这里红，而不是静默变成空矩阵假绿
+	assert.ok(writePaths.length >= 7, `只抽到 ${writePaths.length} 个写端点，抽取规则可能已失效`);
+	assert.ok(writePaths.includes("/api/import"), "抽取结果里缺 /api/import");
+
+	const { root, server } = await setupProject({ seed: true });
+	try {
+		// seed 本身带着候选与决策日志，只能比对「跑完这一轮之后有没有多出来」
+		const before = await new CompassRepository(root).load();
+		const payload = JSON.stringify({ candidateRef: "x", reason: "跨站写入", todoId: "x", note: "跨站写入" });
+		for (const path of writePaths) {
+			// ① 只允许 POST：GET 必须回 405，不能是含糊的 404
+			assert.equal((await getJson(`${server.url}${path}`)).status, 405, `${path} 只允许 POST`);
+
+			// ② 跨站 + text/plain：这是绕过 CORS 预检的经典写法，415 或 403 都算挡住
+			const simpleRequest = await getJson(`${server.url}${path}`, {
+				method: "POST",
+				headers: { "content-type": "text/plain;charset=UTF-8", origin: "https://evil.example" },
+				body: payload,
+			});
+			assert.ok([403, 415].includes(simpleRequest.status), `${path} 跨站简单请求必须被拒绝，实际 ${simpleRequest.status}`);
+
+			// ③ 跨站 + 正确 Content-Type：只剩同源校验能挡，必须是 403
+			const crossOrigin = await getJson(`${server.url}${path}`, {
+				method: "POST",
+				headers: { "content-type": "application/json", origin: "https://evil.example" },
+				body: payload,
+			});
+			assert.equal(crossOrigin.status, 403, `${path} 跨站 Origin 必须被拒绝`);
+
+			// ④ 同源 + 错误 Content-Type：必须是 415。②的 `[403, 415]` 或断言在只有 Origin
+			// 校验生效时也会通过，Content-Type 这道纵深防御其实一条断言都没盖到——把它从
+			// server.ts 删掉，②③ 依然全绿。这一条专门钉死它。
+			const wrongType = await getJson(`${server.url}${path}`, {
+				method: "POST",
+				headers: { "content-type": "text/plain;charset=UTF-8" },
+				body: payload,
+			});
+			assert.equal(wrongType.status, 415, `${path} 非 application/json 必须回 415`);
+		}
+
+		// 被拒绝的请求一条都不许落盘
+		const after = await new CompassRepository(root).load();
+		assert.deepEqual(after.todoResolutions ?? [], before.todoResolutions ?? [], "被拒绝的跨站请求不得写处置记录");
+		assert.equal(after.decisionLog.length, before.decisionLog.length, "被拒绝的跨站请求不得写决策日志");
+		assert.deepEqual(
+			after.candidates.map((c) => [c.id, c.stage]),
+			before.candidates.map((c) => [c.id, c.stage]),
+			"被拒绝的跨站请求不得改动候选阶段",
+		);
+	} finally {
+		await teardown(root, server);
+	}
+});
+
+test("前端调用的 /api/ 路径都在服务端路由表里（M101）", async () => {
+	const [serverSource, appSource] = await Promise.all([
+		readFile(SERVER_SOURCE_PATH, "utf8"),
+		readFile(APP_SOURCE_PATH, "utf8"),
+	]);
+	const served = new Set(apiLiteralsFromSource(serverSource));
+	const called = apiLiteralsFromSource(appSource);
+	assert.ok(called.length > 0, "前端一个 /api/ 路径都没抽到，抽取规则可能已失效");
+	for (const path of called) {
+		assert.ok(served.has(path), `前端调用了服务端没有的路径：${path}`);
 	}
 });

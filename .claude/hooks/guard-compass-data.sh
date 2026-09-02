@@ -62,12 +62,19 @@ case "$tool" in
 	Bash)
 		cmd=$(printf '%s' "$payload" | jq -r '.tool_input.command // ""')
 		[ -n "$cmd" ] || exit 0
+		# 规则 1/2 针对「受保护目录下的某个文件」，尾斜杠是刻意保留的：重定向与 sed -i 的目标
+		# 总是文件，放宽成不带斜杠只会把 `cat .pi/compass/store.json > /tmp/a` 这类读命令误伤。
 		guarded='(\.pi/compass/|compass-imports/)'
-		# 1) 重定向写入受保护路径   2) sed -i 就地改   3) 删除/截断类命令点名受保护路径
+		# 规则 3（删除 / 截断 / 改权限）必须连「目录本身」一起认：`rm -rf .pi/compass` 比删单个
+		# 文件更致命，却因为没有尾斜杠整个从规则 3 溜走（绝对路径、"$ROOT/.pi/compass"、
+		# rmdir、chmod -R 000 同理）。尾部 ([^A-Za-z0-9_.-]|$) 要求目录名整体结束才算命中，
+		# 于是 .pi/compass-backup / .pi/compass.bak / compass-imports-old 这些邻居不会误伤。
+		guarded_dir='(\.pi/compass|compass-imports)([^A-Za-z0-9_.-]|$)'
+		# 1) 重定向写入受保护路径   2) sed -i 就地改   3) 删除/截断类命令点名受保护目录或其下路径
 		if printf '%s' "$cmd" | grep -qE ">>?[[:space:]]*[^[:space:]|;&]*${guarded}" \
 			|| printf '%s' "$cmd" | grep -qE "sed[[:space:]][^;&|]*-i[^;&|]*${guarded}" \
-			|| printf '%s' "$cmd" | grep -qE "(^|[;&|[:space:]])(rm|rmdir|truncate|shred|chmod|chown)([[:space:]]+-[^[:space:]]+)*[[:space:]][^;&|]*${guarded}"; then
-			deny "这条命令会写入或删除罗盘的经营数据（.pi/compass/ 或 compass-imports/），已拦下：
+			|| printf '%s' "$cmd" | grep -qE "(^|[;&|[:space:]])(rm|rmdir|truncate|shred|chmod|chown)([[:space:]]+-[^[:space:]]+)*[[:space:]][^;&|]*${guarded_dir}"; then
+			deny "这条命令会写入或删除罗盘的经营数据（.pi/compass/ 或 compass-imports/，含整个目录本身），已拦下：
 $cmd
 $HOWTO"
 		fi

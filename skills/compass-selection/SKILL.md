@@ -36,7 +36,7 @@ description: Amazon US 中小卖家精铺选品工作流。用于市场 CSV 导�
    - 计算 QRD、CR3/5/10、HHI、AMZ 占比、新品占比、腰部指标；
    - 创建候选卡并运行默认 `screen` Gate。
 4. 批量市场用 `compass_market_scan` 筛选和排序；尚无快照的线索不会参与 Gate 排名。
-5. 同市场新快照与决策基线相隔至少 7 天时，导入会自动生成 OutcomeCheck：`validated`=原判断得到支持，`challenged`=建议人工复看，`inconclusive`=证据不足。challenged 不会自动翻转决策。
+5. 该市场**已有人工决策留痕**、且新快照与决策基线相隔至少 7 天时，导入会自动生成 OutcomeCheck：`validated`=原判断得到支持，`challenged`=建议人工复看，`inconclusive`=证据不足。challenged 不会自动翻转决策，也不会被例行导入清除——只有人工重跑策略 / 移动阶段 / 更新决策才算处置。从未决策过的市场不自动生成对照，需要时用 `compass_retro action=check` 显式发起。汇报比率时只用 `rated_markets` 做分母（按市场去重、每市场一票），不要把 `checks` 对照次数说成成功案例数。
 
 默认粗筛口径：
 
@@ -90,13 +90,13 @@ description: Amazon US 中小卖家精铺选品工作流。用于市场 CSV 导�
 3. 调用 `compass_market_report` 生成报告并保存到 `.pi/compass/reports/`。
 4. 经用户确认后再移动候选阶段，并记录最终 `go`、`waitlist` 或 `no_go` 决策及原因。
 
-策略可用 `/compass-strategy` 或 `compass_strategy_manage` 编辑。每次保存产生新版本，禁止覆盖历史版本。表达式支持比较、`&&`、`||`、`!`、括号和 `qualify_rank_depth(q)`；不支持任意代码执行。`screen` 模式只执行保留阶段名 `market_screen`；自定义策略若没有该阶段或规则为空，会转人工复核。
+策略可用 `/compass-strategy` 或 `compass_strategy_manage` 编辑。每次保存产生新版本，禁止覆盖历史版本。表达式支持比较、`&&`、`||`、`!`、括号和 `qualify_rank_depth(q)`；不支持任意代码执行。`screen` 模式只执行保留阶段名 `market_screen`；自定义策略若没有该阶段或规则为空，会转人工复核。所有接受策略的参数（`compass_market_scan` / `compass_market_report` / `compass_strategy_run` 的 `strategy_id`、`compass_strategy_manage` 的 `get`/`clone`、`compass_retro backtest` 的 `strategy_id` 与 `baseline_strategy_id`）写法一致：策略 id、策略名称或 `id@vN`；不写 `@vN` 用最新版。
 
 ## 待办清单
 
 - 会话开始或用户问「有什么要做的」时，先调用 `compass_todo`（P1 最高–P5 最低，逾期 >30 天升 1 级）；事项由 store 状态自动推导，不要另建手工清单。
 - 每条待办自带 suggestedAction（指向具体工具/命令），可代办的（重跑策略、生成补数计划）直接执行；需要运营外部动作的（导出 CSV、补官方证据、录实绩）明确转告用户。
-- 四类（`metric_divergence`、`budget_warning`、`budget_fused`、`deep_missing_data`）的**人工处理系统感知不到**，走人工闭环；但双路径并存——条件本身被系统内动作消除时（提额 / 次月重置 / 用量回落 / 来源重新对齐 / 候选移出深研）条目照样自动消失，无需任何提交。唯一例外是 `deep_missing_data`：指标补齐也不消失，只会从「深研缺硬指标」转成「深研数据待人工确认」，必须走完闭环才关闭。
+- 四类（`metric_divergence`、`budget_warning`、`budget_fused`、`deep_missing_data`）的**人工处理系统感知不到**，走人工闭环；但双路径并存——条件本身被系统内动作消除时（提额 / 次月重置（UTC 月界，北京时间 1 日 08:00）/ 用量回落 / 来源重新对齐 / 候选移出深研）条目照样自动消失，无需任何提交。唯一例外是 `deep_missing_data`：指标补齐也不消失，只会从「深研缺硬指标」转成「深研数据待人工确认」，必须走完闭环才关闭。
 - list 输出第三列是 todo_id、倒数第二列是处理状态徽标（未处理 / 待验证 / 已驳回 / 验证通过·待勾选 / 已重开·待重新提交 / 已处理·失效浮出），已驳回的徽标后直接带驳回理由。
 
 ## 待办验证（这是你的活）
@@ -117,6 +117,7 @@ description: Amazon US 中小卖家精铺选品工作流。用于市场 CSV 导�
 | `budget_fused` | 无 | 是否给出明确决定（提额 or 本月接受停摆）与理由——选提额时实际配置动作本身就会让待办消失，无需闭环 |
 
 - 验证通过后由运营在 Web 勾选，或你代办 `compass_todo action=complete todo_id=…`；勾选时会按类型落抑制水位（预算=月份、偏差=参与比较的快照集合、深研=本次进入深研的周期）。
+- 勾选会在那一刻重新核对两件事：条目是否仍在活跃清单、水位是否与提交时一致。跨了预算月、期间进了新导出、候选重入深研，或条目已自然消失，都会被拒——出路是 `action=submit` 重新提交、重新验证，不要试图绕过。
 - 出现新事实（新预算月、新快照替换了比较组、候选重新进入深研、深研指标回退）时条目会自动以「已处理·失效浮出」重回清单——这是设计好的防漏提醒，处理方式是 `action=reopen`（必填理由）后重新提交。
 - 代运营提交用 `compass_todo action=submit todo_id=… note=… evidence=[{ref,note}]`；说明要写清做了什么、结论与关键数值，证据填 URL 或项目内文件路径。
 
@@ -125,7 +126,7 @@ description: Amazon US 中小卖家精铺选品工作流。用于市场 CSV 导�
 - 先用 `compass_retro(action="due")` 看逾期对象，或运行 `/compass-retro` 进入交互式复盘会。
 - go/testing 品用 `record_actuals` 录入日销、TACOS、退货率、净利率；日销达到策略目标 70% 且净利为正才记为 validated，低于 40% 或净利为负记为 challenged，字段不足则 inconclusive。
 - no_go/waitlist 在新快照到场后用 `check` 回看；疑似错杀仍须人工确认后再 `compass_pool move`。
-- 调策略前先用 `backtest` 比较 `strategy_id` 与 `baseline_strategy_id`（支持 `id@vN`），验证翻转矩阵和后验一致率，再保存新版本。
+- 调策略前先用 `backtest` 比较 `strategy_id` 与 `baseline_strategy_id`（支持 `id@vN`），验证翻转矩阵和后验对齐率，再保存新版本。对齐率的分母只算给出 `pass`/`reject` 的样本，`review` 记为弃权单列；同时看「覆盖」，覆盖不足一半时结论不可用。
 - 经验只通过 `save_lesson` 保存，evidence 必须非空；过时经验用 `retire_lesson` 并填写 reason，不删除。
 
 默认到期周期：go 30 天、testing 停留 60 天、waitlist 45 天、no_go 90 天抽样、review 30 天。可在策略 `meta` 的 `retro_*_days` 字段调整。
@@ -133,7 +134,7 @@ description: Amazon US 中小卖家精铺选品工作流。用于市场 CSV 导�
 ## 数据成本与合规红线
 
 - 用 `compass_budget` 记录每次付费数据成本，并尽量关联 `market_ref`；80% 告警、100% 熔断。
-- Sorftime 等 MCP 在线调用由罗盘自动计量（无需手工 record）；可用 `compass_budget configure source=sorftime cost_per_call_cny=… monthly_call_limit=…` 配置单价与次数上限（0=清除），金额或次数任一达限即熔断并拦截后续调用，解除方式以拦截提示为准。`mcpScript` 内部调用不计量。
+- Sorftime 等 MCP 在线调用由罗盘自动计量（无需手工 record）；可用 `compass_budget configure source=sorftime cost_per_call_cny=… monthly_call_limit=…` 配置单价与次数上限（0=清除），金额或次数任一达限即熔断并拦截后续调用，池 `enabled=false` 时同样拦截，解除方式以拦截提示为准。计次口径是「请求是否已发到服务端」：成功、服务端业务错误、超时、发出后中断都算一次，认证/连接/退避/审批等未发出的失败不算。预算结算月按 **UTC 月**计（北京时间每月 1 日 08:00 整清零，1 日凌晨 0–8 点的调用仍记上月），向运营解释「次月自动恢复」时必须带上这个时刻。`mcpScript` 内部调用不计量。
 - 不做刷单、测评、跟卖等违规操作；不对外转售采集数据。
 - 优先官方 API、官方导出和用户主动触发采集。
 - **采集环境与卖家主账号登录环境必须物理隔离，不共用机器/IP/浏览器指纹。**
@@ -143,7 +144,7 @@ description: Amazon US 中小卖家精铺选品工作流。用于市场 CSV 导�
 
 - `/compass`：六页 TUI（总览/待办/市场/候选池/预算/复盘）；待办页只读展示处理状态徽标与驳回理由，不提供操作入口；
 - `compass_todo action=list resolution_status=submitted`：待验证队列（验证入口，见上节）；
-- `/compass-web [端口|stop]`：浏览器版工作台（多市场档案、导入向导、候选卡全屏决策页、五维报告弹窗），仅本机可访问，不要转发到局域网/公网；也可脱离 pi 用 `npm run web` 独立启动；
+- `/compass-web [端口|stop]`：浏览器版工作台（多市场档案、导入向导、候选卡全屏决策页、五维报告弹窗），仅本机可访问，不要转发到局域网/公网；也可脱离 pi、在**宿主项目根**执行 `node --experimental-strip-types .pi/extensions/compass/web/standalone.ts` 独立启动（必须在宿主项目根，否则读到的是空 store）；
 - `/compass-import <csv>`：交互导入；
 - `/compass-report [market]`：生成并在会话中展示报告；
 - `/compass-strategy`：版本化编辑 YAML；

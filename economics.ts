@@ -71,7 +71,10 @@ export function estimateProfit(input: ProfitInput): ProfitResult {
 	const grossProfit = input.salePrice - referralFee - input.fbaFee - landedCost;
 	const grossMargin = grossProfit / input.salePrice;
 	const breakEvenCpc = input.salePrice * grossMargin * input.cvr;
-	const cpcRatio = input.cpc !== undefined && breakEvenCpc > 0 ? input.cpc / breakEvenCpc : undefined;
+	// cpc 为 0 一律按缺失处理（Amazon 最低竞价约 $0.02，0 是数据源表达「无竞价数据」的写法）：
+	// 否则 cpcRatio=0 会让两条 CPC Gate 无警告通过，并让 D3 的 CPC 分项直接拿满分。
+	const knownCpc = input.cpc !== undefined && input.cpc > 0 ? input.cpc : undefined;
+	const cpcRatio = knownCpc !== undefined && breakEvenCpc > 0 ? knownCpc / breakEvenCpc : undefined;
 	const returnLossPerReturn = Math.max(0, landedCost + input.returnProcessingFee - input.residualValue);
 	const returnLossRate = (input.returnRate * returnLossPerReturn) / input.salePrice;
 	const monthlyUnits = input.dailyUnits * 30;
@@ -95,7 +98,13 @@ export function estimateProfit(input: ProfitInput): ProfitResult {
 	const warnings: string[] = [];
 	if (grossMargin < 0.4) warnings.push("毛利率低于默认 Gate 40%");
 	if (cpcRatio === undefined) {
-		warnings.push(input.cpc === undefined ? "未提供主词 CPC，CPC 承受度 Gate 保持待复核" : "毛利不足以形成正向盈亏平衡 CPC，CPC 承受度 Gate 保持待复核");
+		warnings.push(
+			input.cpc === undefined
+				? "未提供主词 CPC，CPC 承受度 Gate 保持待复核"
+				: input.cpc <= 0
+					? "主词 CPC 为 0，按缺数据处理（Amazon 最低竞价约 $0.02），CPC 承受度 Gate 保持待复核"
+					: "毛利不足以形成正向盈亏平衡 CPC，CPC 承受度 Gate 保持待复核",
+		);
 	}
 	if (cpcRatio !== undefined && cpcRatio > 0.8) warnings.push("CPC 承受度高于 0.80，超过默认硬上限");
 	else if (cpcRatio !== undefined && cpcRatio > 0.6) warnings.push("CPC 承受度位于 0.60–0.80，需人工复核");

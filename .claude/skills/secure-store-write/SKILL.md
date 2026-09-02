@@ -11,7 +11,7 @@ description: 罗盘 Compass 写路径的并发与持久化硬约束。当改动�
 
 | 改动 | 看第几条 | 提交前必须验证 |
 | --- | --- | --- |
-| 新增/修改写事务、在 mutator 里再写一次 | §1 | `npm test`（锁相关用例必须真跑完，不能靠加超时让它过） |
+| 新增/修改写事务、在 mutator 里再写一次 | §1 | `npm test`（锁相关用例必须真跑完，不能靠调大超时让它过；脚本里固定的 `--test-timeout=30000` 是给挂死封的上限、不是可调旋钮） |
 | 动 `store.json.lock` 抢锁自旋、加 `unref()` | §2 | `npm test` |
 | 新增 Web 写端点 / 改 `server.ts` 路由 | §3 | `npm test`，并人工确认新路径进了 `WRITE_PATHS` |
 | 在 pi hook 里落盘、加计量 | §4 | `npm test`，人工确认没在热路径开事务 |
@@ -33,7 +33,7 @@ description: 罗盘 Compass 写路径的并发与持久化硬约束。当改动�
 
 ## 2. 抢锁自旋的 `await delay(50)` 必须保持默认 ref
 
-`store.ts` 的 `withStoreLock` 里那个 `delay(50)` **绝不能 unref**。调用方正在 await 这次写入，unref 会让 event loop 一空就退出、pending 的写**静默丢失**。node:test 报 `Promise resolution is still pending but the event loop has already resolved` 就是此病——不要加大超时、不要重跑 CI、不要改测试。
+`store.ts` 的 `withStoreLock` 里那个 `delay(50)` **绝不能 unref**。调用方正在 await 这次写入，unref 会让 event loop 一空就退出、pending 的写**静默丢失**。node:test 报 `Promise resolution is still pending but the event loop has already resolved` 就是此病——不要加大超时、不要重跑 CI、不要改测试（这条报错是 event loop 空转时即刻抛出的，与 `npm test` 固定带的 `--test-timeout=30000` 无关：那 30 秒只给「永久挂死」封一个失败上限，调大它反而会把挂死重新变回 CI 空转）。
 
 代价是进程退出最多被在途写拖 10 秒（抢锁 deadline 兜底），这是刻意接受的正确语义。要缩短宿主关停等待只能在**关停侧**做：`web/server.ts` 的 `close()` 用 unref 的 3 秒定时器 race 写队列，**放弃等待但不打断写**。
 

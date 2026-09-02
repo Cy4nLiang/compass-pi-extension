@@ -1,5 +1,8 @@
+import { FRESHNESS_LABELS, snapshotFreshness, snapshotNeedsRefresh, type SnapshotFreshness } from "../defaults.ts";
+import { outcomeStatistics } from "../history.ts";
 import { confidenceLabel, DIMENSIONS, formatMetric, METRIC_LABELS, outcomeLabel } from "../report.ts";
 import {
+	budgetMonth,
 	budgetStatus,
 	buildStrategyContext,
 	candidateDetail,
@@ -46,14 +49,8 @@ const DIMENSION_SCORE_LABELS: Array<{ key: string; label: string }> = [
 	{ key: "risk", label: "风险" },
 ];
 
-export type SnapshotFreshness = "deep_fresh" | "screen_only" | "stale" | "missing";
-
-const FRESHNESS_LABELS: Record<SnapshotFreshness, string> = {
-	deep_fresh: "深研新鲜（≤7天）",
-	screen_only: "仅适合粗筛（≤30天）",
-	stale: "已过期（>30天）",
-	missing: "无快照",
-};
+// 档位枚举与文案的所有权在 defaults.ts；此处仅为既有引用方保留出口
+export type { SnapshotFreshness };
 
 // 与 service.ts 待办派生同口径：非法 now 回退真实时钟，避免同一响应内时间派生数据分裂
 function resolveNow(value: string): string {
@@ -63,13 +60,6 @@ function resolveNow(value: string): string {
 
 function ageDaysFrom(capturedAt: string, now: string): number {
 	return Math.max(0, Math.floor((Date.parse(now) - Date.parse(capturedAt)) / 86_400_000));
-}
-
-function freshnessTier(age: number | null): SnapshotFreshness {
-	if (age === null) return "missing";
-	if (age <= 7) return "deep_fresh";
-	if (age <= 30) return "screen_only";
-	return "stale";
 }
 
 function numberMetric(metric: MetricEvidence | undefined): number | null {
@@ -116,6 +106,9 @@ export interface MarketRowDto {
 	decisionStatus: DecisionStatus | null;
 	score: number | null;
 	qrd: number | null;
+	// 这一行的 QRD 是按哪个目标月销算的：导入时按当时策略的 q 冻结，各行可以不同，
+	// 所以列头不能写死一个数（app.js 用它逐行渲染 title）。冻结值缺失时为 null。
+	qrdTargetUnits: number | null;
 	newListingShare: number | null;
 	mainCpc: number | null;
 	snapshotAgeDays: number | null;
@@ -133,7 +126,7 @@ function marketRows(store: CompassStore, now: string): MarketRowDto[] {
 			const snapshot = latestSnapshotIfPresent(store, market.id);
 			const metrics = snapshot?.metrics ?? {};
 			const age = snapshot ? ageDaysFrom(snapshot.capturedAt, now) : null;
-			const freshness = freshnessTier(age);
+			const freshness = snapshotFreshness(age);
 			return {
 				marketId: market.id,
 				name: market.name,
@@ -144,6 +137,11 @@ function marketRows(store: CompassStore, now: string): MarketRowDto[] {
 				decisionStatus: candidate?.decisionStatus ?? null,
 				score: candidate?.score ?? null,
 				qrd: numberMetric(metrics.qualify_rank_depth),
+				// 市场列表读的是快照冻结值（读端点不为此多读 24 次明细），所以必须把「这个数按哪个 q 算的」
+				// 一并带出：不同市场可能在不同 q 下导入，列头写死一个数就是谎报口径（审计 M15）。
+				qrdTargetUnits: typeof metrics.qualify_rank_depth?.targetMonthlyUnits === "number"
+					? metrics.qualify_rank_depth.targetMonthlyUnits
+					: null,
 				newListingShare: numberMetric(metrics.new_listing_share_12m),
 				mainCpc: numberMetric(metrics.main_cpc),
 				snapshotAgeDays: age,
@@ -228,25 +226,27 @@ function latestRunForMarket(store: CompassStore, marketId: string): StrategyRun 
 }
 
 function verdictStats(store: CompassStore) {
-	const validated = store.outcomeChecks.filter((check) => check.verdict === "validated").length;
-	const challenged = store.outcomeChecks.filter((check) => check.verdict === "challenged").length;
-	const inconclusive = store.outcomeChecks.filter((check) => check.verdict === "inconclusive").length;
-	const conclusive = validated + challenged;
+	// 口径唯一所有者是 history.outcomeStatistics：按市场去重（每市场最新一条可判对照算一票）、
+	// 排除 inconclusive 与无人工决策锚点的 check。曾在这里各抄一份，与 TUI 状态栏、复盘报告三处不同步。
+	const stats = outcomeStatistics(store);
 	return {
-		checks: store.outcomeChecks.length,
-		validated,
-		challenged,
-		inconclusive,
+		checks: stats.total,
+		validated: stats.validated,
+		challenged: stats.challenged,
+		inconclusive: stats.inconclusive,
 		activeLessons: store.lessons.filter((lesson) => lesson.status === "active").length,
-		// 验证率排除 inconclusive；无可判样本时为 null（前端显示 —）
-		validationRate: conclusive ? validated / conclusive : null,
+		// 比率样本（市场数）与无决策锚点条数一并带出，前端要能说清「对照次数 ≠ 比率分母」
+		ratedMarkets: stats.ratedMarkets,
+		strategyOnly: stats.strategyOnly,
+		// 无可判样本时为 null（前端显示 —）
+		validationRate: stats.validationRate,
 	};
 }
 
 export function overviewData(store: CompassStore, now = new Date().toISOString()) {
 	now = resolveNow(now);
 	// 预算月份必须由同一个 now 派生：listWorkbenchTodos 内部按 now 算预算待办，两者共用月界
-	const pools = budgetStatus(store, now.slice(0, 7));
+	const pools = budgetStatus(store, budgetMonth(new Date(now)));
 	const todos = listWorkbenchTodos(store, now);
 	const rows = marketRows(store, now);
 	const activeCandidates = store.candidates.filter((candidate) => !["archived", "review"].includes(candidate.stage)).length;
@@ -273,7 +273,7 @@ export function overviewData(store: CompassStore, now = new Date().toISOString()
 			storeUpdatedAt: store.updatedAt,
 		},
 		kpi: {
-			staleMarkets30d: rows.filter((row) => row.freshness === "stale" || row.freshness === "missing").length,
+			staleMarkets30d: rows.filter((row) => snapshotNeedsRefresh(row.snapshotAgeDays)).length,
 			gate,
 			fusedPools: pools.filter((pool) => pool.state === "fused").length,
 			totalCostCny,
@@ -292,6 +292,8 @@ export function overviewData(store: CompassStore, now = new Date().toISOString()
 		})),
 		radar: rows.slice(0, 8),
 		budget: pools,
+		// 预算面板标题要回显结算月并标注 UTC：与 budgetData().month 同源，别让前端自己算
+		budgetMonth: budgetMonth(new Date(now)),
 		retro,
 		gateDefaultsLine: gateDefaultsLine(store),
 	};
@@ -388,7 +390,7 @@ export function marketDossierData(store: CompassStore, reference: string, now = 
 	const snapshot = latestSnapshotIfPresent(store, market.id);
 	const units = targetMonthlyUnits(store);
 	const age = snapshot ? ageDaysFrom(snapshot.capturedAt, now) : null;
-	const freshness = freshnessTier(age);
+	const freshness = snapshotFreshness(age);
 
 	const run = latestRunForMarket(store, market.id);
 	let evaluation: (ReturnType<typeof mapEvaluation> & { source: "run" | "preview"; mode: string; evaluatedAt: string | null; strategyRef: string | null }) | null = null;
@@ -552,7 +554,7 @@ export function poolCandidateData(store: CompassStore, reference: string) {
 	};
 }
 
-export function budgetData(store: CompassStore, month = new Date().toISOString().slice(0, 7)) {
+export function budgetData(store: CompassStore, month = budgetMonth()) {
 	const pools = budgetStatus(store, month);
 	const totalCostCny = store.costEvents.reduce((sum, event) => sum + event.amountCny, 0);
 	const attributedCny = store.costEvents.filter((event) => event.marketId).reduce((sum, event) => sum + event.amountCny, 0);

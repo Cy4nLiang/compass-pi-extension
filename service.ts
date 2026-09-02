@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { DEFAULT_BUDGET_POOLS, DEFAULT_STRATEGY_YAML } from "./defaults.ts";
+import { compareSnapshotRecency, compareSnapshotRecencyDesc, DEFAULT_BUDGET_POOLS, DEFAULT_STRATEGY_ID, DEFAULT_STRATEGY_YAML, isNewerSnapshot } from "./defaults.ts";
 import { profitMetrics } from "./economics.ts";
 import {
 	calculateMetricDeltas,
@@ -7,6 +7,8 @@ import {
 	filterLessons,
 	formatDelta,
 	matchingLessonsForMarket,
+	isComparableCheck,
+	latestComparableChecks,
 	outcomeStatistics,
 	replayOutcomeVerdict,
 	renderHistoryNote,
@@ -19,12 +21,14 @@ import {
 	searchDecisionHistory,
 	type HistoryTimelineItem,
 	type OutcomeStats,
+	type RetroDueConfig,
 	type RetroDueItem,
+	type RetroReportOptions,
 	type SimilarMarketResult,
 } from "./history.ts";
-import { calculateMarketMetrics } from "./metrics.ts";
+import { calculateMarketMetrics, targetDependentMetrics, TARGET_DEPENDENT_METRIC_NAMES } from "./metrics.ts";
 import { renderMarketReport, type GeneratedReport, type MarketReportData } from "./report.ts";
-import { evaluateStrategy, parseStrategyYaml, slugify, strategyToYaml, type StrategyContext } from "./strategy.ts";
+import { evaluateStrategy, parseStrategyYaml, slugify, strategyTargetDailyUnits, strategyTargetMonthlyUnits, strategyToYaml, type StrategyContext } from "./strategy.ts";
 import { deriveTodos, divergenceWatermarks, isResolvableTodoKind, missingDeepResearchFields, stageEntryTimes } from "./todo.ts";
 import { TODO_RESOLUTION_STATUS_LABELS } from "./types.ts";
 import type {
@@ -35,6 +39,7 @@ import type {
 	CostEvent,
 	DecisionLog,
 	DecisionStatus,
+	DecisionTrigger,
 	GateOutcome,
 	Lesson,
 	Market,
@@ -44,6 +49,7 @@ import type {
 	OutcomeActuals,
 	OutcomeCheck,
 	ParsedMarketCsv,
+	PolicyFlag,
 	ProfitEstimate,
 	ProfitInput,
 	ProfitResult,
@@ -53,7 +59,9 @@ import type {
 	RiskEvidenceItem,
 	RiskRecord,
 	RiskStatus,
+	SeasonFlag,
 	StrategyEvaluation,
+	StrategyMode,
 	StrategyRun,
 	StrategyVersion,
 	TodoEvidenceRef,
@@ -69,9 +77,9 @@ function nowIso(): string {
 	return new Date().toISOString();
 }
 
-// 模块加载时解析一次默认策略 id；完整 definition 只在缺省注入时 fresh parse，
-// 避免共享可变对象进入多个 store 实例（ensureDefaults 会被每次读库与 MCP gate 调用）
-const DEFAULT_STRATEGY_ID = slugify(parseStrategyYaml(DEFAULT_STRATEGY_YAML).meta.name);
+// 默认策略 id 唯一定义在 defaults.ts（DEFAULT_STRATEGY_ID）；本文件不再复制字面量。
+// 完整 definition 只在缺省注入时 fresh parse，避免共享可变对象进入多个 store 实例
+// （ensureDefaults 会被每次读库与 MCP gate 调用）
 
 function shortId(prefix: string): string {
 	return `${prefix}_${randomUUID().replaceAll("-", "").slice(0, 12)}`;
@@ -213,7 +221,7 @@ export function latestSnapshotIfPresent(store: CompassStore, marketId: string): 
 	let latest: MarketSnapshot | undefined;
 	for (const snapshot of store.snapshots) {
 		if (snapshot.marketId !== marketId) continue;
-		if (!latest || snapshot.capturedAt.localeCompare(latest.capturedAt) > 0) latest = snapshot;
+		if (isNewerSnapshot(snapshot, latest)) latest = snapshot;
 	}
 	return latest;
 }
@@ -224,24 +232,50 @@ export function latestSnapshot(store: CompassStore, marketId: string): MarketSna
 	return snapshot;
 }
 
-export function latestStrategy(store: CompassStore, strategyId = "jingpu-daily10"): StrategyVersion {
-	const normalized = normalizeLookup(strategyId);
-	const versions = store.strategies
-		.filter((strategy) => strategy.id === strategyId || normalizeLookup(strategy.name) === normalized || normalizeLookup(strategy.definition?.meta?.name) === normalized)
-		.sort((a, b) => b.version - a.version);
-	if (!versions.length) throw new Error(`未找到策略：${strategyId}`);
-	return versions[0];
+// 策略引用先按 id 精确解析：id 才是策略链的唯一身份。
+// 一旦退回显示名 / meta.name 匹配，必须按 id 分组后只在唯一一条链内取版本——
+// 跨链拉平取 max(version) 会让别人把 display_name 改成同名就劫持默认引用。
+function resolveStrategyChain(store: CompassStore, reference: string): StrategyVersion[] {
+	const byId = store.strategies.filter((strategy) => strategy.id === reference);
+	if (byId.length) return byId;
+	const normalized = normalizeLookup(reference);
+	const chains = new Map<string, StrategyVersion[]>();
+	for (const strategy of store.strategies) {
+		if (normalizeLookup(strategy.name) !== normalized && normalizeLookup(strategy.definition?.meta?.name) !== normalized) continue;
+		const bucket = chains.get(strategy.id);
+		if (bucket) bucket.push(strategy);
+		else chains.set(strategy.id, [strategy]);
+	}
+	if (chains.size > 1) throw new Error(`策略引用“${reference}”不唯一：${[...chains.keys()].join("、")}；请改用 strategy_id 精确指定`);
+	return [...chains.values()][0] ?? [];
 }
 
-export function findStrategyVersion(store: CompassStore, reference = "jingpu-daily10"): StrategyVersion {
+// 「取某策略的最高版本」的唯一实现。读侧总览类调用（Gate 文案、复盘到期）用它，
+// 缺策略时回退默认口径而不是崩掉整块界面；需要硬失败的调用点用下面的 latestStrategy。
+export function latestStrategyIfPresent(store: CompassStore, strategyId = DEFAULT_STRATEGY_ID): StrategyVersion | undefined {
+	const chain = resolveStrategyChain(store, strategyId);
+	return chain.length ? chain.reduce((latest, item) => (item.version > latest.version ? item : latest)) : undefined;
+}
+
+export function latestStrategy(store: CompassStore, strategyId = DEFAULT_STRATEGY_ID): StrategyVersion {
+	const strategy = latestStrategyIfPresent(store, strategyId);
+	if (!strategy) throw new Error(`未找到策略：${strategyId}`);
+	return strategy;
+}
+
+export function findStrategyVersion(store: CompassStore, reference = DEFAULT_STRATEGY_ID): StrategyVersion {
 	const versionMatch = reference.match(/^(.*?)(?:@v|:v?)(\d+)$/u);
 	if (!versionMatch) return latestStrategy(store, reference);
 	const [, rawId, rawVersion] = versionMatch;
-	const normalized = normalizeLookup(rawId);
 	const version = Number(rawVersion);
-	const strategy = store.strategies.find((item) => item.version === version && (item.id === rawId || normalizeLookup(item.name) === normalized || normalizeLookup(item.definition.meta.name) === normalized));
-	if (!strategy) throw new Error(`未找到策略版本：${reference}`);
-	return strategy;
+	const strategy = resolveStrategyChain(store, rawId).find((item) => item.version === version);
+	if (strategy) return strategy;
+	// 策略名字本身就以 :N / @vN 收尾时（clone 出来的「价格战:2」就是这样），后缀不是版本号：
+	// 回退到整串按名字取最新版，保证 findStrategyVersion 是 latestStrategy 的严格超集，
+	// 各入口从 latestStrategy 换过来才不会丢原有的可查性。
+	const byWholeName = latestStrategyIfPresent(store, reference);
+	if (byWholeName) return byWholeName;
+	throw new Error(`未找到策略版本：${reference}`);
 }
 
 function appendDecision(store: CompassStore, input: Omit<DecisionLog, "id" | "createdAt">): DecisionLog {
@@ -349,12 +383,15 @@ export function importParsedMarket(
 		};
 		store.markets.push(market);
 	}
+	// 早于现有最新的补录快照不会成为「最新」：所有读面（看板/档案/报告/粗筛）继续用那份更新的，
+	// 而导入成功页只展示本次快照 —— 不显式告警运营会以为补录已生效
+	const previousLatest = latestSnapshotIfPresent(store, market.id);
 	market.keywords = [...new Set([...market.keywords, ...(input.keywords ?? []), ...input.parsed.keywords.map((item) => item.keyword)])];
 	market.category ??= dominantCategory(input.parsed);
 	market.updatedAt = timestamp;
 
 	const defaultStrategy = latestStrategy(store);
-	const targetMonthlyUnits = Number(defaultStrategy.definition.meta.monthly_units_q ?? 300);
+	const targetMonthlyUnits = strategyTargetMonthlyUnits(defaultStrategy.definition);
 	const metrics = calculateMarketMetrics({
 		listings: input.parsed.listings,
 		keywords: input.parsed.keywords,
@@ -362,6 +399,10 @@ export function importParsedMarket(
 		capturedAt: input.capturedAt,
 		targetMonthlyUnits,
 	});
+	const warnings = [...input.parsed.warnings];
+	if (previousLatest && compareSnapshotRecency({ capturedAt: input.capturedAt, importedAt: timestamp }, previousLatest) < 0) {
+		warnings.push(`本次快照采集于 ${input.capturedAt.slice(0, 10)}，早于该市场现有最新快照 ${previousLatest.id}（${previousLatest.capturedAt.slice(0, 10)}）：看板、市场档案、五维报告与粗筛仍以那份更新的快照为准`);
+	}
 	const snapshot: MarketSnapshot = {
 		id: shortId("snap"),
 		marketId: market.id,
@@ -375,10 +416,9 @@ export function importParsedMarket(
 		listings: input.parsed.listings,
 		keywords: input.parsed.keywords,
 		metrics,
-		warnings: input.parsed.warnings,
+		warnings,
 	};
 	store.snapshots.push(snapshot);
-	market.latestSnapshotId = snapshot.id;
 
 	let candidate = store.candidates.find((item) => item.marketId === market.id);
 	if (!candidate) {
@@ -424,6 +464,8 @@ export function importMarketAndScreen(
 		marketRef: imported.market.id,
 		mode: "screen",
 		actor: input.actor,
+		// 例行导入的默认粗筛不是人工处置：标记后 todo.ts 才不会把它当成 challenged 的处置留痕
+		trigger: "auto_import",
 	});
 	const outcomeCheck = autoCheckImportedOutcome(store, imported.market.id, imported.snapshot.id);
 	return { ...imported, screenRun, outcomeCheck };
@@ -473,8 +515,8 @@ export function recordProfitEstimate(
 function overallRisk(input: {
 	certStatus: RiskStatus;
 	ipRiskLevel: RiskStatus;
-	seasonFlag: "clear" | "strong" | "review" | "unknown";
-	policyFlag: "clear" | "review" | "red" | "unknown";
+	seasonFlag: SeasonFlag;
+	policyFlag: PolicyFlag;
 	logisticsRisk: RiskStatus;
 }): RiskStatus {
 	if ([input.certStatus, input.ipRiskLevel, input.logisticsRisk].includes("red") || input.policyFlag === "red") return "red";
@@ -491,8 +533,8 @@ export function recordRisk(
 		marketRef: string;
 		certStatus: RiskStatus;
 		ipRiskLevel: RiskStatus;
-		seasonFlag: "clear" | "strong" | "review" | "unknown";
-		policyFlag: "clear" | "review" | "red" | "unknown";
+		seasonFlag: SeasonFlag;
+		policyFlag: PolicyFlag;
 		logisticsRisk: RiskStatus;
 		evidence: Omit<RiskEvidenceItem, "checkedAt">[];
 		notes?: string;
@@ -580,7 +622,7 @@ export function recordReviewAnalysis(
 }
 
 function latestForMarket<T extends { marketId?: string; createdAt: string }>(items: T[], marketId: string): T | undefined {
-	return items.filter((item) => item.marketId === marketId).sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+	return latestBy(items.filter((item) => item.marketId === marketId), (item) => item.createdAt);
 }
 
 function riskMetrics(record: RiskRecord | undefined): MetricMap {
@@ -623,7 +665,67 @@ function reviewMetrics(analysis: ReviewAnalysis | undefined): MetricMap {
 	};
 }
 
-export function buildStrategyContextForSnapshot(store: CompassStore, marketId: string, snapshotId?: string): { snapshot: MarketSnapshot; context: StrategyContext } {
+// 明细缺失时的退化：只有确认冻结值就是按当前 q 算的才敢沿用，否则一律判缺失。
+// 领域不变式「缺失硬指标 → 结论为 review，绝不把缺数据伪装成 pass」：口径不明的旧值
+// 不是「数据」，是「另一个口径的数据」，拿来充当当前口径的结论比缺数据更危险。
+function recomputeTargetDependentMetric(
+	snapshot: MarketSnapshot,
+	name: (typeof TARGET_DEPENDENT_METRIC_NAMES)[number],
+	units: number,
+): MetricEvidence {
+	const frozen = snapshot.metrics[name];
+	const listings = snapshot.listings;
+	if (listings.length === 0) {
+		if (frozen && frozen.targetMonthlyUnits === units) return frozen;
+		return {
+			value: null,
+			source: snapshot.source,
+			capturedAt: snapshot.capturedAt,
+			confidence: 0,
+			note: `快照明细缺失，无法按目标月销 ${units} 重算；导入时冻结口径${frozen?.targetMonthlyUnits === undefined ? "未知" : `为 ${frozen.targetMonthlyUnits}`}，按缺数据处理`,
+		};
+	}
+	const fresh = targetDependentMetrics({
+		listings,
+		source: snapshot.source,
+		capturedAt: snapshot.capturedAt,
+		targetMonthlyUnits: units,
+	})[name];
+	// 口径变过时在 note 里留一行对照，报告与工作台能看出「历史是按哪个 q 冻结的」
+	if (frozen && frozen.targetMonthlyUnits !== units && typeof frozen.value === "number") {
+		return { ...fresh, note: `${fresh.note}（导入时按 q=${frozen.targetMonthlyUnits ?? "未知"} 冻结为 ${frozen.value}）` };
+	}
+	return fresh;
+}
+
+// q 相关指标不能沿用导入时冻结的值：调过目标月销之后冻结值的口径就过期了，会同时造出
+// 「标签写 QRD(800) 却显示 q=300 的 22」「规则 evidence 与自己的表达式求值不一致」
+// 「同一份数据被判成 81.8% 多源偏差并派生待办」三种假象（M15）。
+// 懒 getter：只消费其它指标的路径（待办派生的深研四项、预算面）仍然一次盘都不读。
+// **但 q 相关指标本身一读就会触发 sidecar**：`metricDivergences` 为了同口径比较会对多来源市场
+// 逐快照取这些值，那条路径经 listWorkbenchTodos 一直通到 /api/overview 与 /api/todos。
+// 单来源市场被 `latestBySource.size < 2` 提前退出挡住，所以「读端点零明细读」只对单来源成立。
+function installTargetDependentMetrics(snapshot: MarketSnapshot, metrics: MetricMap, units: number): void {
+	for (const name of TARGET_DEPENDENT_METRIC_NAMES) {
+		let cached: MetricEvidence | undefined;
+		Object.defineProperty(metrics, name, {
+			enumerable: true,
+			configurable: true,
+			get: () => (cached ??= recomputeTargetDependentMetric(snapshot, name, units)),
+			// 与 store.ts 的懒 listings/keywords 同形：留 setter，调用方覆盖指标时不至于在严格模式抛错
+			set: (value: MetricEvidence) => { cached = value; },
+		});
+	}
+}
+
+export function buildStrategyContextForSnapshot(
+	store: CompassStore,
+	marketId: string,
+	snapshotId?: string,
+	// 默认取默认策略的 q：与 web/data.ts 的 QRD(units) 标签同源，标签与值天然一致。
+	// 用别的策略评估时由调用方显式传入该策略的 q。
+	units: number = targetMonthlyUnits(store),
+): { snapshot: MarketSnapshot; context: StrategyContext } {
 	const snapshot = snapshotId
 		? store.snapshots.find((item) => item.id === snapshotId && item.marketId === marketId)
 		: latestSnapshot(store, marketId);
@@ -635,10 +737,17 @@ export function buildStrategyContextForSnapshot(store: CompassStore, marketId: s
 	Object.assign(metrics, riskMetrics(risk));
 	const review = latestForMarket(store.reviewAnalyses, marketId);
 	Object.assign(metrics, reviewMetrics(review));
+	// 必须在全部 Object.assign 之后装：往只读属性上 assign 会在严格模式抛错
+	installTargetDependentMetrics(snapshot, metrics, units);
 	// listings 用惰性 getter 委托：只有策略表达式真正引用榜单数据时才触发快照明细的磁盘读；
-	// 只消费 metrics 的路径（市场档案、待办推导）不再产生无谓 I/O。
+	// 只消费**非 q 相关** metrics 的路径（市场档案、待办推导）不再产生无谓 I/O；
+	// q 相关指标走上面的懒重算，多来源市场的待办推导仍会读到 sidecar（见该函数注释）。
 	// enumerable:false 与 store.ts 的快照懒属性对齐：spread / JSON.stringify 不会静默触发读盘
-	const context = Object.defineProperty({ metrics } as StrategyContext, "listings", {
+	// q 必须同时落到两处：installTargetDependentMetrics 管 QRD 一类「按目标月销重算」的指标，
+	// 而 calculateDimensionScores 的 demand 维度（waistSales / (q*2)）读的是 context 上这个字段。
+	// 改动前是三个调用点各自 `context.targetMonthlyUnits = Number(meta.monthly_units_q ?? 300)`，
+	// 收敛进构造点时漏掉了赋值，于是所有 q ≠ 300 的策略都按 300 归一、Score 全错。
+	const context = Object.defineProperty({ metrics, targetMonthlyUnits: units } as StrategyContext, "listings", {
 		enumerable: false,
 		configurable: true,
 		get: () => snapshot.listings,
@@ -646,24 +755,34 @@ export function buildStrategyContextForSnapshot(store: CompassStore, marketId: s
 	return { snapshot, context };
 }
 
-export function buildStrategyContext(store: CompassStore, marketId: string): { snapshot: MarketSnapshot; context: StrategyContext } {
-	return buildStrategyContextForSnapshot(store, marketId);
+export function buildStrategyContext(store: CompassStore, marketId: string, units?: number): { snapshot: MarketSnapshot; context: StrategyContext } {
+	return buildStrategyContextForSnapshot(store, marketId, undefined, units);
 }
 
 export function mainCpcForMarket(store: CompassStore, marketId: string): number | undefined {
 	const snapshot = latestSnapshotIfPresent(store, marketId);
 	const value = snapshot?.metrics.main_cpc?.value;
-	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+	// 0 同样按缺失处理：快照 metrics 是导入时算好落库的，metrics.ts 的过滤追溯不到存量快照，
+	// 这里兜住老数据，避免 0 被当默认 cpc 灌进利润测算。
+	return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+// 运营填 0 与不填是同一个意思（「我没有主词 CPC」），两者都回落到市场最新快照的主词 CPC。
+// 回落不到时保留原样：0 会让 estimateProfit 给出「主词 CPC 为 0，按缺数据处理」这条更具体的
+// 警告，比统一折成 undefined 后只说「未提供主词 CPC」更能指向运营实际做过的操作。
+export function resolveProfitCpc(store: CompassStore, marketId: string, providedCpc?: number): number | undefined {
+	if (providedCpc !== undefined && providedCpc > 0) return providedCpc;
+	return mainCpcForMarket(store, marketId) ?? providedCpc;
 }
 
 export function runStrategy(
 	store: CompassStore,
-	input: { marketRef: string; strategyRef?: string; mode: "screen" | "full"; actor: string },
+	input: { marketRef: string; strategyRef?: string; mode: StrategyMode; actor: string; trigger?: DecisionTrigger },
 ): StrategyRun {
 	const market = findMarket(store, input.marketRef);
-	const strategy = latestStrategy(store, input.strategyRef);
-	const { snapshot, context } = buildStrategyContext(store, market.id);
-	context.targetMonthlyUnits = Number(strategy.definition.meta.monthly_units_q ?? 300);
+	const strategy = findStrategyVersion(store, input.strategyRef);
+	// q 在建 context 时就要给：q 相关指标按它在读侧重算，事后赋值来不及
+	const { snapshot, context } = buildStrategyContext(store, market.id, strategyTargetMonthlyUnits(strategy.definition));
 	const result = evaluateStrategy(strategy.definition, context, input.mode);
 	const gateReason = result.rules.filter((rule) => rule.status !== "pass").map((rule) => rule.message).join("；") || "全部规则通过";
 	const runAt = nowIso();
@@ -693,6 +812,8 @@ export function runStrategy(
 		candidateId: candidate?.id,
 		marketId: market.id,
 		type: "strategy",
+		// 触发来源随日志落库：todo.ts 靠它区分「例行导入自动粗筛」与「人工重跑」
+		trigger: input.trigger,
 		conclusion: `${input.mode} Gate=${result.outcome}，Score=${result.score}`,
 		reason: gateReason,
 		snapshotId: snapshot.id,
@@ -707,30 +828,38 @@ export function evaluateStrategyVersionOnSnapshot(
 	store: CompassStore,
 	marketId: string,
 	strategy: StrategyVersion,
-	mode: "screen" | "full" = "screen",
+	mode: StrategyMode = "screen",
 	snapshotId?: string,
 ): StrategyEvaluation {
-	const { context } = buildStrategyContextForSnapshot(store, marketId, snapshotId);
-	context.targetMonthlyUnits = Number(strategy.definition.meta.monthly_units_q ?? 300);
+	const { context } = buildStrategyContextForSnapshot(store, marketId, snapshotId, strategyTargetMonthlyUnits(strategy.definition));
 	return evaluateStrategy(strategy.definition, context, mode);
 }
 
 export function evaluateMarketWithoutPersisting(
 	store: CompassStore,
 	marketId: string,
-	strategyRef = "jingpu-daily10",
-	mode: "screen" | "full" = "screen",
+	strategyRef = DEFAULT_STRATEGY_ID,
+	mode: StrategyMode = "screen",
 ): StrategyEvaluation {
 	return evaluateStrategyVersionOnSnapshot(store, marketId, findStrategyVersion(store, strategyRef), mode);
 }
 
 export function saveStrategyVersion(
 	store: CompassStore,
-	input: { yaml: string; actor: string; changeNote?: string; forceId?: string },
+	input: { yaml: string; actor: string; changeNote?: string; expectedId?: string },
 ): StrategyVersion {
 	const definition = parseStrategyYaml(input.yaml);
-	const id = input.forceId ?? slugify(definition.meta.name);
+	// 策略归属只由 meta.name 决定。slugify 有损（大小写、空格、标点都会被抹平），
+	// 不同的 meta.name 可能落到同一个 id；直接按 id 续版本会把别人的策略悄悄改掉，
+	// 默认引用、QRD 口径、复盘周期随之全部切换，而历史 run 的 strategyId 不变、极难察觉。
+	const id = slugify(definition.meta.name);
+	if (input.expectedId !== undefined && input.expectedId !== id) {
+		throw new Error(`策略归属冲突：strategy_id“${input.expectedId}”与 meta.name“${definition.meta.name}”推导出的 id“${id}”不一致；策略归属由 meta.name 决定，只改显示名请改 meta.display_name，要新建策略请换 meta.name`);
+	}
 	const latest = store.strategies.filter((strategy) => strategy.id === id).sort((a, b) => b.version - a.version)[0];
+	if (latest && normalizeLookup(latest.definition?.meta?.name) !== normalizeLookup(definition.meta.name)) {
+		throw new Error(`策略 id 冲突：meta.name“${definition.meta.name}”与已存在的“${latest.definition?.meta?.name}”生成同一个 id“${id}”，保存会被当成同一条策略的新版本；请换一个 meta.name（显示名请用 meta.display_name 单独设置）`);
+	}
 	const version: StrategyVersion = {
 		id,
 		version: (latest?.version ?? 0) + 1,
@@ -749,10 +878,15 @@ export function cloneStrategy(
 	store: CompassStore,
 	input: { sourceRef: string; newName: string; actor: string; changeNote?: string },
 ): StrategyVersion {
-	const source = latestStrategy(store, input.sourceRef);
+	const source = findStrategyVersion(store, input.sourceRef);
 	const definition = structuredClone(source.definition);
 	definition.meta.name = slugify(input.newName);
 	definition.meta.display_name = input.newName;
+	// 复制只允许开新链：撞上已有 id 就变成往别人的策略上追加版本，直接拒绝而不是静默并链
+	const id = slugify(definition.meta.name);
+	if (store.strategies.some((strategy) => strategy.id === id)) {
+		throw new Error(`策略名“${input.newName}”与已存在的策略 id“${id}”冲突：复制只会新建策略，不会往旧链追加版本；请换一个名字`);
+	}
 	return saveStrategyVersion(store, {
 		yaml: strategyToYaml(definition),
 		actor: input.actor,
@@ -761,9 +895,7 @@ export function cloneStrategy(
 }
 
 export function targetMonthlyUnits(store: CompassStore): number {
-	const versions = store.strategies.filter((strategy) => strategy.id === "jingpu-daily10").sort((a, b) => b.version - a.version);
-	const value = versions[0]?.definition?.meta?.monthly_units_q;
-	return typeof value === "number" && Number.isFinite(value) ? value : 300;
+	return strategyTargetMonthlyUnits(latestStrategyIfPresent(store)?.definition);
 }
 
 // TUI 总览与 Web 总览共用同一行默认 Gate 文案，避免阈值调整时两处静默漂移
@@ -795,9 +927,7 @@ export function moveCandidate(
 		type: "stage_move",
 		conclusion: `${previous} → ${input.stage}`,
 		reason,
-		snapshotId: store.snapshots
-			.filter((snapshot) => snapshot.marketId === candidate.marketId)
-			.sort((a, b) => b.capturedAt.localeCompare(a.capturedAt))[0]?.id,
+		snapshotId: latestSnapshotIfPresent(store, candidate.marketId)?.id,
 		strategyId: latestRun?.strategyId,
 		strategyVersion: latestRun?.strategyVersion,
 		actor: input.actor,
@@ -831,6 +961,9 @@ export function decideCandidate(
 		snapshotId: latestSnapshotIfPresent(store, candidate.marketId)?.id,
 		strategyId: latestRun?.strategyId,
 		strategyVersion: latestRun?.strategyVersion,
+		// snapshotId 与 strategyRunId 可以指向不同快照（中途 run_screen=false 导入过），
+		// 复盘要重放的是这条 run，所以把它本身记下来，不再靠「同快照」反查
+		strategyRunId: latestRun?.id,
 		actor: input.actor,
 	});
 	return candidate;
@@ -946,13 +1079,17 @@ export function marketAmazonLinks(
 	return { searches, topListings };
 }
 
-function monthPrefix(date = new Date()): string {
+// 预算结算月 = **UTC 月**（`YYYY-MM`）。budgetStatus / 熔断拦截 / 待办抑制水位 / Web 总览 /
+// Web 预算页五个面共用这一个口径，绝不能改用本地时间：CostEvent.createdAt 存的是 UTC ISO，
+// 拿本地月去 startsWith 匹配，会在 UTC+8 的 00:00–08:00 之间把上月事件算进本月（反之亦然）。
+// 运营口径：UTC+8 下每月 1 日 08:00 整清零，凌晨 0–8 点的调用仍记上月。
+export function budgetMonth(date = new Date()): string {
 	return date.toISOString().slice(0, 7);
 }
 
 export function budgetStatus(
 	store: CompassStore,
-	month = monthPrefix(),
+	month = budgetMonth(),
 	pendingCalls?: Record<string, number>,
 ): Array<BudgetPool & { spentCny: number; remainingCny: number; utilization: number | null; callCount: number; callUtilization: number | null; state: "ok" | "warning" | "fused" | "free" }> {
 	return store.budgetPools.map((pool) => {
@@ -990,7 +1127,7 @@ export function recordCost(
 		throw new Error(`数据源 ${input.source} 配置为零成本；若确需记账，请先配置预算或 force=true`);
 	}
 	if (pool.monthlyLimitCny > 0 && spent + input.amountCny > pool.monthlyLimitCny && !input.force) {
-		throw new Error(`预算熔断：${input.source} 本月已用 ¥${spent}，本次 ¥${input.amountCny} 将超过 ¥${pool.monthlyLimitCny}`);
+		throw new Error(`预算熔断：${input.source} 本月（${budgetMonth()} UTC）已用 ¥${spent}，本次 ¥${input.amountCny} 将超过 ¥${pool.monthlyLimitCny}`);
 	}
 	const marketId = input.marketRef ? findMarket(store, input.marketRef).id : undefined;
 	const event: CostEvent = {
@@ -1054,9 +1191,42 @@ export interface McpCallSample {
 	billable: boolean;
 }
 
+// 未到达服务端的 adapter 错误码（pi-mcp-adapter 2.27.0 穷举 details.error 取值得出）：
+// 这些分支都在 client.callTool 发出请求之前就返回，Sorftime 不会扣点。名单之外的一切
+// （含 call_failed / aborted / url_elicitation_required）一律计费——
+// call_failed 覆盖 30 秒超时（SDK 先 send，再发 notifications/cancelled 并 reject）、
+// 服务端 JSON-RPC 错误应答、发出后传输中断。
+// aborted **不是**「一定发生在 callTool 之后」——adapter 的连接期分支也会以 aborted 收场，
+// 那种情况请求根本没发出去、不该计费。这里仍把它留在计费面是**刻意的取舍**：details 里没有
+// 任何字段能把两种 aborted 区分开，而方向上宁多勿漏（见下一句）。
+// 所以看到连接期 aborted 的反例时，不要据此把 aborted 挪进拒绝名单——那是漏计方向。
+// 方向：多计一次让 monthly_call_limit 熔断提前触发（保守），少计让熔断滞后（危险），
+// 故按「花钱保护宁多勿漏」取拒绝名单而非白名单。
+const NON_BILLABLE_MCP_ERRORS = new Set([
+	"auth_required",
+	"not_authenticated",
+	"server_unavailable",
+	"server_not_connected",
+	"not_connected",
+	"server_backoff",
+	"server_disabled",
+	"server_not_found",
+	"connect_failed",
+	"tool_not_found",
+	"tool_not_found_after_reconnect",
+	"ambiguous_tool",
+	"native_tool",
+	"approval_denied",
+	"approval_required",
+	"not_initialized",
+	"init_failed",
+	"init_timeout",
+]);
+
 // tool_result 计量分类器：识别 MCP 调用结果并判定是否计费。
-// 计费口径（spec 4.2.5）：已到达服务端的调用消耗点数——成功（无 error）与服务端业务错误
-// （error === "tool_error"）计；认证/连接/退避/中止等未到达服务端的失败不计。
+// 计费口径（spec 4.2.5）：已到达服务端的调用消耗点数——成功、服务端业务错误
+// （tool_error）、以及请求发出后才失败的 call_failed / aborted 都计；只有
+// NON_BILLABLE_MCP_ERRORS 里「请求根本没发出去」的失败不计。
 // direct 工具的 details 无 mode 字段；mcp 代理为 mode==="call"，其余 mode（search/describe/
 // status/script…）不是对服务端工具的调用。返回 undefined 表示与 MCP 计量无关。
 export function classifyMcpToolResult(toolName: string, details: unknown): McpCallSample | undefined {
@@ -1068,7 +1238,7 @@ export function classifyMcpToolResult(toolName: string, details: unknown): McpCa
 	if (!server) return undefined;
 	if (record.mode !== undefined && record.mode !== "call") return undefined;
 	if (record.error !== undefined && typeof record.error !== "string") return undefined;
-	const billable = record.error === undefined || record.error === "tool_error";
+	const billable = record.error === undefined || !NON_BILLABLE_MCP_ERRORS.has(record.error);
 	const tool = typeof record.tool === "string" && record.tool
 		? record.tool
 		: typeof record.resourceUri === "string" && record.resourceUri ? record.resourceUri : "unknown";
@@ -1142,8 +1312,9 @@ function mcpCallTargetServers(store: CompassStore, call: { toolName: string; inp
 	return [];
 }
 
-// tool_call 熔断拦截判定：只读，不写 store。仅对「配置了上限」（monthlyCallLimit 或
-// monthlyLimitCny>0）且当月已熔断的池返回拦截理由；默认 sorftime 池（¥0、无次数上限）
+// tool_call 拦截判定：只读，不写 store。两类拦截——① 预算池被禁用（enabled=false，
+// 手册定义「当前不允许使用」，不看上限也不看熔断）；② 「配置了上限」（monthlyCallLimit 或
+// monthlyLimitCny>0）且当月已熔断。默认 sorftime 池（enabled、¥0、无次数上限）
 // 永不拦截——无惊吓原则。返回 undefined 表示放行。
 export function evaluateMcpGate(
 	store: CompassStore,
@@ -1156,6 +1327,14 @@ export function evaluateMcpGate(
 	for (const server of servers) {
 		const pool = budgets.find((item) => item.source === server);
 		if (!pool) continue;
+		// 禁用 = 当前不允许使用（手册预算状态表、recordCost 同口径）：先于「配了上限才拦」
+		// 的前提判定，否则默认零成本池（sorftime ¥0、无次数上限）被禁用后依然放行
+		if (!pool.enabled) {
+			return {
+				server,
+				reason: `${server} 预算池已禁用：当前不允许调用该数据源。恢复：compass_budget configure source=${server} enabled=true。`,
+			};
+		}
 		if (pool.monthlyCallLimit === undefined && pool.monthlyLimitCny <= 0) continue;
 		if (pool.state !== "fused") continue;
 		const callsText = pool.monthlyCallLimit !== undefined
@@ -1166,7 +1345,7 @@ export function evaluateMcpGate(
 			: `¥${pool.spentCny.toFixed(2)}`;
 		return {
 			server,
-			reason: `${server} 预算已熔断：${callsText}（${amountText}）。解除：compass_budget configure source=${server} 提高 monthly_call_limit（0=清除）或 monthly_limit_cny，次月自动恢复。`,
+			reason: `${server} 预算已熔断：${callsText}（${amountText}）。解除：compass_budget configure source=${server} 提高 monthly_call_limit（0=清除）或 monthly_limit_cny；否则 UTC 次月自动恢复（北京时间次月 1 日 08:00 清零）。`,
 		};
 	}
 	return undefined;
@@ -1177,6 +1356,8 @@ export interface MarketScanResult {
 	snapshot: MarketSnapshot;
 	candidate?: Candidate;
 	evaluation: StrategyEvaluation;
+	// 按本次扫描所用策略的 q 重算的 QRD：调用方不要再去读 snapshot.metrics 里的冻结值
+	qrd: number | null;
 	ageDays: number;
 }
 
@@ -1185,7 +1366,7 @@ export function scanMarkets(
 	input: {
 		query?: string;
 		strategyRef?: string;
-		outcome?: "pass" | "review" | "reject";
+		outcome?: GateOutcome;
 		minQrd?: number;
 		minNewListingShare?: number;
 		maxCpcRatio?: number;
@@ -1193,21 +1374,21 @@ export function scanMarkets(
 	},
 ): MarketScanResult[] {
 	const query = input.query ? normalizeLookup(input.query) : undefined;
-	const strategy = latestStrategy(store, input.strategyRef);
+	const strategy = findStrategyVersion(store, input.strategyRef);
 	const rows: Array<MarketScanResult & { metrics: MetricMap }> = [];
 	for (const market of store.markets) {
 		if (query && !normalizeLookup(`${market.name} ${market.keywords.join(" ")} ${market.category ?? ""}`).includes(query)) continue;
-		const snapshot = store.snapshots
-			.filter((item) => item.marketId === market.id)
-			.sort((a, b) => b.capturedAt.localeCompare(a.capturedAt))[0];
+		const snapshot = latestSnapshotIfPresent(store, market.id);
 		if (!snapshot) continue;
-		const metrics = buildStrategyContext(store, market.id).context.metrics;
+		const metrics = buildStrategyContext(store, market.id, strategyTargetMonthlyUnits(strategy.definition)).context.metrics;
+		const qrd = metrics.qualify_rank_depth?.value;
 		rows.push({
 			market,
 			snapshot,
 			candidate: store.candidates.find((candidate) => candidate.marketId === market.id),
-			evaluation: evaluateMarketWithoutPersisting(store, market.id, strategy.id, "screen"),
+			evaluation: evaluateStrategyVersionOnSnapshot(store, market.id, strategy, "screen"),
 			ageDays: Math.max(0, Math.floor((Date.now() - Date.parse(snapshot.capturedAt)) / 86_400_000)),
+			qrd: typeof qrd === "number" ? qrd : null,
 			metrics,
 		});
 	}
@@ -1217,7 +1398,7 @@ export function scanMarkets(
 	if (strategy.definition.scoring.normalize === "percentile" && rows.length > 1) {
 		const dimensions = Object.keys(strategy.definition.scoring.weights);
 		for (const dimension of dimensions) {
-			const values = rows.map((row) => row.evaluation.dimensionScores[dimension] ?? 50);
+			const values = rows.map((row) => Object.hasOwn(row.evaluation.dimensionScores, dimension) ? row.evaluation.dimensionScores[dimension] : 50);
 			for (let index = 0; index < rows.length; index++) {
 				const value = values[index];
 				const lower = values.filter((candidate) => candidate < value).length;
@@ -1229,7 +1410,7 @@ export function scanMarkets(
 		const weights = Object.entries(strategy.definition.scoring.weights);
 		const totalWeight = weights.reduce((sum, [, weight]) => sum + weight, 0);
 		for (const row of rows) {
-			const score = weights.reduce((sum, [dimension, weight]) => sum + (row.evaluation.dimensionScores[dimension] ?? 50) * weight, 0) / totalWeight;
+			const score = weights.reduce((sum, [dimension, weight]) => sum + (Object.hasOwn(row.evaluation.dimensionScores, dimension) ? row.evaluation.dimensionScores[dimension] : 50) * weight, 0) / totalWeight;
 			row.evaluation.score = Math.round(score * 10) / 10;
 		}
 	}
@@ -1251,14 +1432,31 @@ export function scanMarkets(
 export function metricDivergences(store: CompassStore, marketId: string): Array<{ metric: string; values: Array<{ source: string; value: number; capturedAt: string }>; divergence: number }> {
 	const snapshots = store.snapshots
 		.filter((snapshot) => snapshot.marketId === marketId)
-		.sort((a, b) => b.capturedAt.localeCompare(a.capturedAt));
+		.sort(compareSnapshotRecencyDesc);
 	const latestBySource = new Map<string, MarketSnapshot>();
 	for (const snapshot of snapshots) if (!latestBySource.has(snapshot.source)) latestBySource.set(snapshot.source, snapshot);
+	// 单来源不构成多源偏差：提前退出，顺带保证单来源市场不会为下面的重算白读快照明细
+	if (latestBySource.size < 2) return [];
+	// q 相关指标的冻结值各自带着导入当时的 q，直接比会把「调过目标月销」误报成来源打架
+	// （M15：同一份数据被判成 81.8% 偏差并派生 metric_divergence 待办）。快照本身不记录 q，
+	// 无法靠元数据配对「同 q 的两份」，因此统一换算到当前 q ——同口径由构造保证。
+	// 重算不出来的快照（明细缺失 → null）会被下面的 typeof 过滤掉，不会伪造数值参与比较。
+	const units = targetMonthlyUnits(store);
+	const recomputed = new Map<string, MetricMap>();
+	const metricValue = (snapshot: MarketSnapshot, metric: string): MetricEvidence["value"] | undefined => {
+		if (!(TARGET_DEPENDENT_METRIC_NAMES as readonly string[]).includes(metric)) return snapshot.metrics[metric]?.value;
+		let metrics = recomputed.get(snapshot.id);
+		if (!metrics) {
+			metrics = buildStrategyContextForSnapshot(store, marketId, snapshot.id, units).context.metrics;
+			recomputed.set(snapshot.id, metrics);
+		}
+		return metrics[metric]?.value;
+	};
 	const names = ["category_monthly_sales", "qualify_rank_depth", "cr3", "amz_share", "new_listing_share_12m"];
 	const divergences: Array<{ metric: string; values: Array<{ source: string; value: number; capturedAt: string }>; divergence: number }> = [];
 	for (const metric of names) {
 		const values = [...latestBySource.values()]
-			.map((snapshot) => ({ source: snapshot.source, value: snapshot.metrics[metric]?.value, capturedAt: snapshot.capturedAt }))
+			.map((snapshot) => ({ source: snapshot.source, value: metricValue(snapshot, metric), capturedAt: snapshot.capturedAt }))
 			.filter((item): item is { source: string; value: number; capturedAt: string } => typeof item.value === "number");
 		if (values.length < 2) continue;
 		const numbers = values.map((item) => item.value);
@@ -1291,28 +1489,69 @@ function snapshotCapturedTime(snapshot: MarketSnapshot): number {
 	return Number.isFinite(parsed) ? parsed : 0;
 }
 
+// 决策锚定「决策当下的最新快照」，而 strategyId/Version 抄自 candidate.latestStrategyRunId：
+// 中间只要有一次 run_screen=false 的导入，两者就落在不同快照上，「同快照 run」永远找不到，
+// 该市场从此复盘恒为 inconclusive（归入「无策略锚点」，noGoAccuracyRate/falseKillRate 恒 null）。
+// 三级解析：① 同快照 run（原语义）② 决策自己记下的 strategyRunId ③ 同策略版本、不晚于决策的最新 run。
+// ②③ 都不是启发式：decision.strategyId/Version 本来就是从那条 run 上抄下来的，这里只是把它找回来。
+// decision.strategyId 为空 ⇒ 决策落定时该候选从未跑过策略，没有可重放的否决前提，
+// 宁可保持 inconclusive 也不去捡一条无关的 run（领域不变式：缺证据只能 inconclusive）。
+// 「最新一条」的并列规则：时间字符串相等时取**后插入**的那条。
+// 全部调用点传进来的数组都必须是 store 数组的 filter/map 结果——那样才保持追加顺序、索引即时间序。
+// 新增调用点前先确认这一条：先 sort 过的、或来自 Map/Set 迭代的数组会让这个前提失效。
+// 不用 sort(...)[0]：sort 稳定，比较返回 0 时保持原序，[0] 反而会取到并列里最早的那条；
+// 也不用 id 破并列——shortId 是随机 UUID，给出的顺序稳定但与时间无关。
+function latestBy<T>(items: readonly T[], timeOf: (item: T) => string): T | undefined {
+	let best: T | undefined;
+	let bestTime = "";
+	for (const item of items) {
+		const time = timeOf(item);
+		if (best === undefined || time >= bestTime) {
+			best = item;
+			bestTime = time;
+		}
+	}
+	return best;
+}
+
+function decisionBaselineRun(store: CompassStore, decision: DecisionLog, anchorSnapshot: MarketSnapshot, cutoff: number): StrategyRun | undefined {
+	const sameStrategy = (run: StrategyRun): boolean =>
+		(!decision.strategyId || run.strategyId === decision.strategyId) &&
+		(decision.strategyVersion === undefined || run.strategyVersion === decision.strategyVersion);
+	const marketRuns = store.strategyRuns.filter((run) => run.marketId === decision.marketId && sameStrategy(run));
+	const exact = latestBy(marketRuns.filter((run) => run.snapshotId === anchorSnapshot.id), (run) => run.runAt);
+	if (exact) return exact;
+	if (!decision.strategyId) return undefined;
+	const replayable = marketRuns
+		.filter((run) => run.runAt <= decision.createdAt)
+		.map((run) => ({ run, snapshot: store.snapshots.find((item) => item.id === run.snapshotId) }))
+		.filter((item): item is { run: StrategyRun; snapshot: MarketSnapshot } => Boolean(item.snapshot && snapshotCapturedTime(item.snapshot) < cutoff));
+	const pinned = decision.strategyRunId ? replayable.find((item) => item.run.id === decision.strategyRunId) : undefined;
+	return (pinned ?? latestBy(replayable, (item) => item.run.runAt))?.run;
+}
+
 function findRetroBaseline(store: CompassStore, marketId: string, beforeSnapshot?: MarketSnapshot, requiredStatus?: DecisionStatus): RetroBaseline | undefined {
 	const cutoff = beforeSnapshot ? snapshotCapturedTime(beforeSnapshot) : Number.POSITIVE_INFINITY;
 	const candidate = store.candidates.find((item) => item.marketId === marketId);
 	const decisions = store.decisionLog
 		.filter((item) => item.marketId === marketId && item.type === "decision" && (!requiredStatus || item.decisionStatus === requiredStatus))
 		.map((decision) => ({ decision, snapshot: decision.snapshotId ? store.snapshots.find((item) => item.id === decision.snapshotId) : undefined }))
-		.filter((item): item is { decision: DecisionLog; snapshot: MarketSnapshot } => Boolean(item.snapshot && snapshotCapturedTime(item.snapshot) < cutoff))
-		.sort((a, b) => b.decision.createdAt.localeCompare(a.decision.createdAt));
-	const decisionAnchor = decisions[0];
+		.filter((item): item is { decision: DecisionLog; snapshot: MarketSnapshot } => Boolean(item.snapshot && snapshotCapturedTime(item.snapshot) < cutoff));
+	const decisionAnchor = latestBy(decisions, (item) => item.decision.createdAt);
 	if (decisionAnchor) {
-		const run = store.strategyRuns
-			.filter((item) => item.marketId === marketId && item.snapshotId === decisionAnchor.snapshot.id)
-			.filter((item) => !decisionAnchor.decision.strategyId || item.strategyId === decisionAnchor.decision.strategyId)
-			.filter((item) => decisionAnchor.decision.strategyVersion === undefined || item.strategyVersion === decisionAnchor.decision.strategyVersion)
-			.sort((a, b) => b.runAt.localeCompare(a.runAt))[0];
-		return { candidate, decision: decisionAnchor.decision, decisionStatus: decisionAnchor.decision.decisionStatus ?? candidate?.decisionStatus, snapshot: decisionAnchor.snapshot, run };
+		const run = decisionBaselineRun(store, decisionAnchor.decision, decisionAnchor.snapshot, cutoff);
+		// 回退命中时基线快照跟着 run 走：baselineRunId 与 baselineSnapshotId 必须描述同一份证据，
+		// 否则 deltas 的基线列会把两个采集时点混在一起，elapsedDays 也会与重放的规则错位
+		const snapshot = run && run.snapshotId !== decisionAnchor.snapshot.id
+			? store.snapshots.find((item) => item.id === run.snapshotId) ?? decisionAnchor.snapshot
+			: decisionAnchor.snapshot;
+		return { candidate, decision: decisionAnchor.decision, decisionStatus: decisionAnchor.decision.decisionStatus ?? candidate?.decisionStatus, snapshot, run };
 	}
 	if (requiredStatus) return undefined;
-	const run = store.strategyRuns
+	const runsWithSnapshot = store.strategyRuns
 		.map((item) => ({ run: item, snapshot: store.snapshots.find((snapshot) => snapshot.id === item.snapshotId) }))
-		.filter((item): item is { run: StrategyRun; snapshot: MarketSnapshot } => Boolean(item.snapshot && item.run.marketId === marketId && snapshotCapturedTime(item.snapshot) < cutoff))
-		.sort((a, b) => b.run.runAt.localeCompare(a.run.runAt))[0];
+		.filter((item): item is { run: StrategyRun; snapshot: MarketSnapshot } => Boolean(item.snapshot && item.run.marketId === marketId && snapshotCapturedTime(item.snapshot) < cutoff));
+	const run = latestBy(runsWithSnapshot, (item) => item.run.runAt);
 	return run ? { candidate, decisionStatus: candidate?.decisionStatus, snapshot: run.snapshot, run: run.run } : undefined;
 }
 
@@ -1366,11 +1605,31 @@ function createSnapshotOutcomeCheck(
 			const currentCaptured = item.currentEvidence ? Date.parse(item.currentEvidence.capturedAt) : Number.NaN;
 			return !Number.isFinite(baselineCaptured) || !Number.isFinite(currentCaptured) || currentCaptured <= baselineCaptured;
 		}) ?? [];
-	const replay = replayableReject
-		? staleReplayEvidence.length
-			? { verdict: "inconclusive" as const, reason: `重放证据没有晚于 T0：${staleReplayEvidence.slice(0, 5).map((item) => `${item.rule}/${item.reference}`).join("、")}` }
-			: replayOutcomeVerdict(baseline.run, currentEvaluation, deltas)
-		: { verdict: "inconclusive" as const, reason: baseline.decisionStatus === "go" ? "市场快照变化不能替代 go 品经营实绩，需录入 actuals" : "waitlist/未决策对象仅记录市场变化，需人工判断" };
+	// 回退基线（run 的快照 ≠ 决策锚定的快照）多了一层不确定：run 的规则状态是 T_run 的，
+	// 未必还是决策当下的前提。把同一策略版本在决策锚定快照上重算一遍——基线的 veto/fail
+	// 规则若在那时就已经 pass，说明这次 no_go 根本不是这条 run 否决的（运营是为别的理由
+	// 否决的），再拿它重放会把「无法判定」讲成「错杀」，直接污染 falseKillRate 与规则归因。
+	// 只有「明确转 pass」才推翻回退；missing/review/error 判不出来时仍以决策记录的策略为准，
+	// 免得评估噪声反过来批量制造 inconclusive。
+	const decisionSnapshotId = baseline.decision?.snapshotId;
+	const fellBack = Boolean(baseline.run && decisionSnapshotId && decisionSnapshotId !== baseline.snapshot.id);
+	const premiseAtDecision = fellBack && strategy
+		? evaluateStrategyVersionOnSnapshot(store, evidence.marketId, strategy, baseline.run?.mode ?? "screen", decisionSnapshotId)
+		: undefined;
+	const lapsedPremise = (premiseAtDecision ? baseline.run?.result.rules ?? [] : [])
+		.filter((rule) => rule.status === "veto" || rule.status === "fail")
+		.filter((rule) => premiseAtDecision?.rules.find((item) => item.id === rule.id)?.status === "pass");
+	const replay = !replayableReject
+		? { verdict: "inconclusive" as const, reason: baseline.decisionStatus === "go" ? "市场快照变化不能替代 go 品经营实绩，需录入 actuals" : "waitlist/未决策对象仅记录市场变化，需人工判断" }
+		: lapsedPremise.length
+			? { verdict: "inconclusive" as const, reason: `基线否决前提在决策当下已经转 pass：${lapsedPremise.map((rule) => rule.id).join("、")}；这次 ${baseline.decisionStatus} 不是该策略运行否决的，无法据此判定` }
+			: staleReplayEvidence.length
+				? { verdict: "inconclusive" as const, reason: `重放证据没有晚于 T0：${staleReplayEvidence.slice(0, 5).map((item) => `${item.rule}/${item.reference}`).join("、")}` }
+				: replayOutcomeVerdict(baseline.run, currentEvaluation, deltas);
+	// 基线快照与决策锚定快照不一致 = 走了回退，读复盘的人必须看得见这件事
+	const fallbackNote = fellBack && baseline.run
+		? `（基线取决策前最近一次 ${baseline.run.strategyId}@v${baseline.run.strategyVersion} 运行 ${baseline.run.id} 及其快照 ${baseline.snapshot.id}，决策锚定的是 ${decisionSnapshotId}）`
+		: "";
 	const check: OutcomeCheck = {
 		id: shortId("chk"),
 		marketId: evidence.marketId,
@@ -1382,7 +1641,7 @@ function createSnapshotOutcomeCheck(
 		evidenceSnapshotId: evidence.id,
 		deltas,
 		verdict: replay.verdict,
-		verdictReason: replay.reason,
+		verdictReason: `${replay.reason}${fallbackNote}`,
 		elapsedDays: Math.max(0, Math.floor((snapshotCapturedTime(evidence) - snapshotCapturedTime(baseline.snapshot)) / 86_400_000)),
 		createdAt: nowIso(),
 		actor,
@@ -1398,6 +1657,10 @@ export function autoCheckImportedOutcome(store: CompassStore, marketId: string, 
 	if (store.outcomeChecks.some((check) => check.marketId === marketId && check.evidenceSnapshotId === evidence.id)) return undefined;
 	const baseline = findRetroBaseline(store, marketId, evidence);
 	if (!baseline) return undefined;
+	// 自动对照只对「人工决策」做后验：findRetroBaseline 在无决策时会回退到最新 strategy run，
+	// 那条路径会让从未有人决策的市场在每次例行再导入时凭空产出 validated/challenged，
+	// 直接推高「验证率」与「策略历史准确率」。策略自我对照要留档就走 compass_retro action=check 显式发起。
+	if (!baseline.decision) return undefined;
 	const elapsedDays = Math.floor((snapshotCapturedTime(evidence) - snapshotCapturedTime(baseline.snapshot)) / 86_400_000);
 	if (elapsedDays < 7) return undefined;
 	return createSnapshotOutcomeCheck(store, baseline, evidence, "compass-auto");
@@ -1439,8 +1702,7 @@ export function recordRetroActuals(
 	const baseline = findRetroBaseline(store, candidate.marketId, undefined, "go");
 	if (!baseline) throw new Error(`候选 ${candidate.id} 没有可锚定的 go 决策与基线快照`);
 	const strategy = exactStrategyForRun(store, baseline.run);
-	const target = Number(strategy?.definition.meta.target_daily_units ?? 10);
-	const verdict = actualsOutcomeVerdict(input.actuals, Number.isFinite(target) && target > 0 ? target : 10);
+	const verdict = actualsOutcomeVerdict(input.actuals, strategyTargetDailyUnits(strategy?.definition));
 	const check: OutcomeCheck = {
 		id: shortId("chk"),
 		marketId: candidate.marketId,
@@ -1552,9 +1814,14 @@ export function retireLesson(store: CompassStore, input: { lessonRef: string; re
 	return lesson;
 }
 
+// 复盘到期节奏取自默认策略 meta 的 retro_* 字段；缺策略或缺字段时由 retroDueConfig 回退内置口径。
+// listRetroDue 与复盘报告必须共用同一份配置，否则 TUI/Web 的到期数会和报告正文对不上。
+function defaultRetroDueConfig(store: CompassStore): RetroDueConfig {
+	return retroDueConfig(latestStrategyIfPresent(store)?.definition.meta);
+}
+
 export function listRetroDue(store: CompassStore, now = nowIso()): RetroDueItem[] {
-	const strategy = store.strategies.filter((item) => item.id === "jingpu-daily10").sort((a, b) => b.version - a.version)[0];
-	return dueRetroItems(store, now, retroDueConfig(strategy?.definition.meta));
+	return dueRetroItems(store, now, defaultRetroDueConfig(store));
 }
 
 // 深研阶段的合并指标（快照 + 利润 + 风险 + 评论）：待办派生与 verify 硬门槛共用同一口径。
@@ -1567,7 +1834,7 @@ function deepResearchMetricsFor(store: CompassStore, marketId: string): MetricMa
 export function listWorkbenchTodos(store: CompassStore, now = nowIso()): WorkbenchTodo[] {
 	// 非法 now 统一回退当前时钟，避免预算月界与时间类待办各用一套时钟
 	const resolvedNow = Number.isFinite(Date.parse(now)) ? now : nowIso();
-	const budgets = budgetStatus(store, monthPrefix(new Date(resolvedNow)));
+	const budgets = budgetStatus(store, budgetMonth(new Date(resolvedNow)));
 	const retroDue = listRetroDue(store, resolvedNow);
 	const deepResearchMetrics = store.candidates
 		.filter((candidate) => candidate.stage === "deep_research")
@@ -1593,7 +1860,7 @@ interface TodoResolutionRules {
 	basis(store: CompassStore, record: TodoResolution, now: string): TodoResolutionBasis | undefined;
 }
 
-const monthBasis = (_store: CompassStore, _record: TodoResolution, now: string): TodoResolutionBasis => ({ month: monthPrefix(new Date(now)) });
+const monthBasis = (_store: CompassStore, _record: TodoResolution, now: string): TodoResolutionBasis => ({ month: budgetMonth(new Date(now)) });
 
 // per-kind 查表：扩闭环 kind 只需加一行，四个动作的主流程不动
 const TODO_RESOLUTION_RULES: Record<ResolvableTodoKind, TodoResolutionRules> = {
@@ -1663,6 +1930,29 @@ function statusLabel(status: TodoResolutionStatus): string {
 	return TODO_RESOLUTION_STATUS_LABELS[status];
 }
 
+// 水位比对：per-kind 规则每次只落其中一个锚点字段，三个字段全等即同一水位
+function sameBasis(a: TodoResolutionBasis, b: TodoResolutionBasis): boolean {
+	return a.month === b.month && a.snapshotWatermark === b.snapshotWatermark && a.stageEnteredAt === b.stageEnteredAt;
+}
+
+// 水位变化的人话提示：拒绝勾选时必须让运营看懂「到底什么变了」，而不是只丢一句「水位不一致」
+const BASIS_CHANGE_HINTS: Record<ResolvableTodoKind, string> = {
+	metric_divergence: "该市场进来了新的导出快照，参与比较的数据已变",
+	budget_warning: "已跨入新的预算月，用量重新计算",
+	budget_fused: "已跨入新的预算月，用量重新计算",
+	deep_missing_data: "候选重新进入了深研阶段，属新一轮周期",
+};
+
+// 末轮提交时记下的水位是否已失效。**complete 的拒绝条件与 submit 的重入放行条件共用同一判据**：
+// 保证「勾不了 ⇔ 能重新提交」，运营任何时候都有出路，不会卡死在「验证通过却勾不掉」的中间态
+function attemptBasisStale(store: CompassStore, record: TodoResolution, now: string): boolean {
+	const submitted = record.attempts[record.attempts.length - 1]?.basisAtSubmit;
+	// 本字段上线前的旧记录一律按失效处理：错位的最坏情况只能是多提醒一次，绝不能是漏提醒
+	if (!submitted) return true;
+	const current = TODO_RESOLUTION_RULES[record.kind].basis(store, record, now);
+	return !current || !sameBasis(submitted, current);
+}
+
 export function submitTodoResolution(
 	store: CompassStore,
 	input: { todoRef: string; note: string; evidence?: Array<{ ref: string; note?: string }> },
@@ -1681,13 +1971,23 @@ export function submitTodoResolution(
 	// 若先查清单会把「请先重开」误报成「待办不存在」，把运营指向错误的下一步
 	const existing = findTodoResolution(store, input.todoRef);
 	if (existing?.status === "submitted") throw new Error(`待办 ${input.todoRef} 已提交，正在等待 agent 验证（当前「待验证」）`);
-	if (existing?.status === "verified") throw new Error(`待办 ${input.todoRef} 已验证通过，请直接勾选已处理`);
+	// verified 态默认不接受重复提交；但当提交时的水位已失效（新导出 / 新预算月 / 重入深研）时
+	// complete 必然拒绝勾选——此处必须放行重新提交，否则运营卡死在「勾不了也提交不了」
+	if (existing?.status === "verified" && !attemptBasisStale(store, existing, now)) {
+		throw new Error(`待办 ${input.todoRef} 已验证通过，请直接勾选已处理`);
+	}
 	if (existing?.status === "resolved") throw new Error(`待办 ${input.todoRef} 已勾选处理，如需重新处理请先重开`);
 	// 必须命中当前活跃派生清单：条件已自然解决的待办不接受提交
 	const todo = listWorkbenchTodos(store, now).find((item) => item.id === input.todoRef);
 	if (!todo) throw new Error(`待办 ${input.todoRef} 不存在或已消失（可能条件已解决）`);
 	if (!isResolvableTodoKind(todo.kind)) throw new Error(`待办 ${input.todoRef} 属 ${todo.kind}，该类待办由系统动作自动消失，无需提交处理结果`);
 	const attempt: TodoResolutionAttempt = { submittedAt: now, submittedBy: actor, note, evidence };
+	// 提交时刻的水位：complete 据此判断「提交→勾选之间是否出现未经核对的新事实」。
+	// 与勾选时同源（同一张 per-kind 规则表）；取不到时留空，后续按失效处理
+	const stampBasis = (target: TodoResolution): void => {
+		const basisAtSubmit = TODO_RESOLUTION_RULES[target.kind].basis(store, target, now);
+		if (basisAtSubmit) attempt.basisAtSubmit = basisAtSubmit;
+	};
 	if (!existing) {
 		const record: TodoResolution = {
 			id: shortId("tdr"),
@@ -1703,10 +2003,12 @@ export function submitTodoResolution(
 		if (todo.marketId) record.marketId = todo.marketId;
 		if (todo.candidateId) record.candidateId = todo.candidateId;
 		if (todo.source) record.source = todo.source;
+		stampBasis(record);
 		(store.todoResolutions ??= []).push(record);
 		return record;
 	}
-	// rejected / reopened：追加新一轮，历史轮次与重开留痕全部保留；标题快照刷新为当前派生标题
+	// rejected / reopened / 水位已失效的 verified：追加新一轮，历史轮次与重开留痕全部保留；标题快照刷新为当前派生标题
+	stampBasis(existing);
 	existing.attempts.push(attempt);
 	existing.status = "submitted";
 	existing.titleSnapshot = todo.title;
@@ -1747,6 +2049,23 @@ export function completeTodoResolution(store: CompassStore, input: { todoRef: st
 	if (record.status !== "verified") throw new Error(`待办 ${input.todoRef} 须先经 agent 验证通过才能勾选已处理（当前「${statusLabel(record.status)}」）`);
 	const basis = TODO_RESOLUTION_RULES[record.kind].basis(store, record, now);
 	if (!basis) throw new Error(`待办 ${input.todoRef} 无法确定抑制水位（关联市场或候选已不可用），暂不能勾选已处理`);
+	// 勾选 = 给「尚未发生的事实」预埋抑制，因此必须在勾选这一刻重新确认两件事：
+	// ① 条目仍在活跃清单——条件已自然解决时勾选只会埋下未来的告警黑洞（跨月后勾选预算告警会落次月
+	//    水位，把整个次月的新告警吞掉）；listWorkbenchTodos 对单来源市场是纯内存派生，多来源市场
+	//    会经 metricDivergences 的 q 重算读到快照明细 sidecar（勾选是写路径，这点开销可接受）；
+	// ② 水位与提交时一致——提交后到达的新导出 / 新预算月 / 新深研周期没有任何人核对过，
+	//    按旧结论勾选会把它们一并抑制。两条都是「宁可多提醒一次，绝不漏提醒」的直接落地。
+	const todo = listWorkbenchTodos(store, now).find((item) => item.id === record.todoId);
+	if (!todo) {
+		throw new Error(`待办 ${input.todoRef} 已不在活跃清单（条件可能已自然解决，如预算已跨月或偏差已消失），无需勾选；若日后重新浮出，请重新提交处理结果`);
+	}
+	const submitted = currentAttempt(record).basisAtSubmit;
+	if (!submitted) {
+		throw new Error(`待办 ${input.todoRef} 的处理记录缺少提交时水位（本校验上线前的旧记录），为免漏提醒不放行勾选；请重新提交处理结果并请 agent 重新验证`);
+	}
+	if (!sameBasis(submitted, basis)) {
+		throw new Error(`待办 ${input.todoRef} 自提交后已出现新事实（${BASIS_CHANGE_HINTS[record.kind]}），不能按旧结论勾选；请重新提交处理结果并请 agent 重新验证（compass_todo action=submit todo_id=${record.todoId}）`);
+	}
 	record.status = "resolved";
 	record.resolvedAt = now;
 	record.resolvedBy = actor;
@@ -1803,84 +2122,140 @@ export interface BacktestMarketRow {
 	marketId: string;
 	marketName: string;
 	snapshotId: string;
+	// 该行用哪一档模式重跑：对照复盘时取产生基线决策那次 run 的模式，否则按自动粗筛的 screen
+	mode: StrategyMode;
+	// 该行对照的复盘 id；缺省表示这是「市场最新快照」翻转行，不参与对齐率
+	checkId?: string;
 	baselineOutcome: StrategyEvaluation["outcome"];
 	strategyOutcome: StrategyEvaluation["outcome"];
 	baselineScore: number;
 	strategyScore: number;
 }
 
+// 单侧对齐口径：review 是策略主动弃权（「缺硬指标，转人工」），既不算对也不算错。
+// 把弃权算错，「敢下结论」的策略被无差别扣分；把弃权算进分母，对齐率随弃权数单调下降。
+// 两种口径都会让「多弃权」变成免费的挡箭牌，所以分母只算 decided，
+// 另报 coverage = decided / 可比对照数，让运营自己看样本够不够。
+export interface BacktestAlignmentSide {
+	decided: number;
+	correct: number;
+	abstained: number;
+	rate: number | null;
+	coverage: number | null;
+}
+
 export interface BacktestResult {
 	strategy: string;
 	baselineStrategy: string;
+	markets: number;
 	matrix: Record<string, number>;
 	flips: BacktestMarketRow[];
 	rows: BacktestMarketRow[];
-	alignment: { strategy: number | null; baseline: number | null; comparableChecks: number };
+	alignment: { strategy: BacktestAlignmentSide; baseline: BacktestAlignmentSide; comparableChecks: number };
 }
 
 function desiredOutcomeForCheck(check: OutcomeCheck): "pass" | "reject" | undefined {
-	if (check.verdict === "inconclusive") return undefined;
+	// 「可判」判据的唯一所有者是 history.ts 的 isComparableCheck；这里只负责把可判 check
+	// 翻译成期望 outcome。各写一套会让「比率认这条、alignment 不认」重新分叉（审计 G16）。
+	if (!isComparableCheck(check)) return undefined;
 	if (check.decisionStatus === "go") return check.verdict === "validated" ? "pass" : "reject";
-	if (check.decisionStatus === "no_go") return check.verdict === "validated" ? "reject" : "pass";
-	return undefined;
+	return check.verdict === "validated" ? "reject" : "pass";
+}
+
+function emptyAlignmentSide(): BacktestAlignmentSide {
+	return { decided: 0, correct: 0, abstained: 0, rate: null, coverage: null };
+}
+
+function tallyAlignment(side: BacktestAlignmentSide, outcome: StrategyEvaluation["outcome"], desired: "pass" | "reject"): void {
+	if (outcome !== "pass" && outcome !== "reject") {
+		side.abstained += 1;
+		return;
+	}
+	side.decided += 1;
+	if (outcome === desired) side.correct += 1;
 }
 
 export function backtestStrategies(store: CompassStore, strategyRef: string, baselineStrategyRef?: string): BacktestResult {
 	const strategy = findStrategyVersion(store, strategyRef);
-	const baseline = findStrategyVersion(store, baselineStrategyRef ?? "jingpu-daily10");
-	const rows: BacktestMarketRow[] = [];
-	for (const market of store.markets) {
-		const snapshot = latestSnapshotIfPresent(store, market.id);
-		if (!snapshot) continue;
-		const baselineEvaluation = evaluateStrategyVersionOnSnapshot(store, market.id, baseline, "full", snapshot.id);
-		const strategyEvaluation = evaluateStrategyVersionOnSnapshot(store, market.id, strategy, "full", snapshot.id);
-		rows.push({
-			marketId: market.id,
-			marketName: market.name,
-			snapshotId: snapshot.id,
+	const baseline = findStrategyVersion(store, baselineStrategyRef ?? DEFAULT_STRATEGY_ID);
+	const marketNames = new Map(store.markets.map((market) => [market.id, market.name]));
+	// 同一 (市场, 快照, 模式) 只重跑一次：复盘证据快照往往就是市场最新快照，
+	// 每次重跑都要新建 StrategyContext，且引用榜单的规则会触发快照明细读盘。
+	const rowsByKey = new Map<string, BacktestMarketRow>();
+	const evaluateRow = (marketId: string, snapshotId: string, mode: StrategyMode): BacktestMarketRow | undefined => {
+		const key = `${marketId}|${snapshotId}|${mode}`;
+		const cached = rowsByKey.get(key);
+		if (cached) return cached;
+		const marketName = marketNames.get(marketId);
+		if (marketName === undefined) return undefined;
+		// 证据快照可能已随市场清理消失：跳过该行，而不是让整次回测抛错
+		if (!store.snapshots.some((item) => item.id === snapshotId && item.marketId === marketId)) return undefined;
+		const baselineEvaluation = evaluateStrategyVersionOnSnapshot(store, marketId, baseline, mode, snapshotId);
+		const strategyEvaluation = evaluateStrategyVersionOnSnapshot(store, marketId, strategy, mode, snapshotId);
+		const row: BacktestMarketRow = {
+			marketId,
+			marketName,
+			snapshotId,
+			mode,
 			baselineOutcome: baselineEvaluation.outcome,
 			strategyOutcome: strategyEvaluation.outcome,
 			baselineScore: baselineEvaluation.score,
 			strategyScore: strategyEvaluation.score,
-		});
+		};
+		rowsByKey.set(key, row);
+		return row;
+	};
+	// 翻转矩阵仍看「市场最新快照」：运营关心换策略后当前看板会怎么翻。
+	// 模式固定 screen——粗筛是导入时自动跑的那一档；用 full 会把「还没做利润测算/风险清单」
+	// 的市场一律折成 review，矩阵与看板对不上。
+	const latestRows: BacktestMarketRow[] = [];
+	for (const market of store.markets) {
+		const snapshot = latestSnapshotIfPresent(store, market.id);
+		if (!snapshot) continue;
+		const row = evaluateRow(market.id, snapshot.id, "screen");
+		if (row) latestRows.push(row);
 	}
 	const matrix: Record<string, number> = {};
 	for (const before of ["pass", "review", "reject"] as const) for (const after of ["pass", "review", "reject"] as const) matrix[`${before}→${after}`] = 0;
-	for (const row of rows) {
-		const key = `${row.baselineOutcome}→${row.strategyOutcome}`;
-		matrix[key] = (matrix[key] ?? 0) + 1;
-	}
-	const latestComparable = new Map<string, OutcomeCheck>();
-	for (const check of [...store.outcomeChecks].sort((a, b) => b.createdAt.localeCompare(a.createdAt))) {
-		if (desiredOutcomeForCheck(check) && !latestComparable.has(check.marketId)) latestComparable.set(check.marketId, check);
-	}
-	let strategyCorrect = 0;
-	let baselineCorrect = 0;
+	for (const row of latestRows) matrix[`${row.baselineOutcome}→${row.strategyOutcome}`] += 1;
+	// 与 outcomeStatistics 的四率共用同一份去重样本：两个面不得各排各的序。
+	// 就地重写会漏掉 id 兜底——同毫秒并列时（真实导入链路上会自然发生）两边会选中相反的 check，
+	// 「复盘比率与 backtest 一致率同口径」这句话就不成立了。
+	const latestComparable = latestComparableChecks(store.outcomeChecks);
+	const strategySide = emptyAlignmentSide();
+	const baselineSide = emptyAlignmentSide();
 	let comparable = 0;
-	for (const [marketId, check] of latestComparable) {
-		const row = rows.find((item) => item.marketId === marketId);
+	for (const check of latestComparable) {
 		const desired = desiredOutcomeForCheck(check);
-		if (!row || !desired) continue;
-		comparable++;
-		if (row.strategyOutcome === desired) strategyCorrect++;
-		if (row.baselineOutcome === desired) baselineCorrect++;
+		if (!desired) continue;
+		// 对齐标签取自这条复盘，重跑就必须落在同一张证据快照上：市场最新快照可能是
+		// 之后一次 inconclusive 导入带来的，两者不是一回事（否则一次缺列导入就能把对齐打到 0）。
+		// 模式同理取产生基线决策那次 run 的模式，缺省 screen。
+		const mode = (check.baselineRunId ? store.strategyRuns.find((run) => run.id === check.baselineRunId)?.mode : undefined) ?? "screen";
+		const row = evaluateRow(check.marketId, check.evidenceSnapshotId ?? check.baselineSnapshotId, mode);
+		if (!row) continue;
+		row.checkId ??= check.id;
+		comparable += 1;
+		tallyAlignment(strategySide, row.strategyOutcome, desired);
+		tallyAlignment(baselineSide, row.baselineOutcome, desired);
+	}
+	for (const side of [strategySide, baselineSide]) {
+		side.rate = side.decided ? side.correct / side.decided : null;
+		side.coverage = comparable ? side.decided / comparable : null;
 	}
 	return {
 		strategy: `${strategy.id}@v${strategy.version}`,
 		baselineStrategy: `${baseline.id}@v${baseline.version}`,
+		markets: latestRows.length,
 		matrix,
-		flips: rows.filter((row) => row.baselineOutcome !== row.strategyOutcome),
-		rows,
-		alignment: {
-			strategy: comparable ? strategyCorrect / comparable : null,
-			baseline: comparable ? baselineCorrect / comparable : null,
-			comparableChecks: comparable,
-		},
+		flips: latestRows.filter((row) => row.baselineOutcome !== row.strategyOutcome),
+		rows: [...rowsByKey.values()],
+		alignment: { strategy: strategySide, baseline: baselineSide, comparableChecks: comparable },
 	};
 }
 
-export function generateRetroReport(store: CompassStore, generatedAt = nowIso()): string {
-	return renderRetroReport(store, generatedAt);
+export function generateRetroReport(store: CompassStore, generatedAt = nowIso(), options: RetroReportOptions = {}): string {
+	return renderRetroReport(store, generatedAt, defaultRetroDueConfig(store), options);
 }
 
 export function leadHistoryNote(store: CompassStore, marketId: string): string[] {
@@ -1890,22 +2265,22 @@ export function leadHistoryNote(store: CompassStore, marketId: string): string[]
 }
 
 export function importHistoryNote(store: CompassStore, marketId: string, snapshotId: string, check?: OutcomeCheck): string[] {
-	const snapshots = store.snapshots.filter((item) => item.marketId === marketId).sort((a, b) => b.capturedAt.localeCompare(a.capturedAt));
+	const snapshots = store.snapshots.filter((item) => item.marketId === marketId).sort(compareSnapshotRecencyDesc);
 	const current = store.snapshots.find((item) => item.id === snapshotId);
-	const previous = snapshots.find((item) => item.id !== snapshotId && current && item.capturedAt < current.capturedAt);
+	const previous = snapshots.find((item) => item.id !== snapshotId && current && compareSnapshotRecency(item, current) < 0);
 	const lines: string[] = [];
 	if (previous && current) {
 		const deltas = calculateMetricDeltas(previous.metrics, current.metrics).filter((item) => item.baseline !== item.current).slice(0, 5);
 		if (deltas.length) lines.push(`快照对照 ${previous.id}→${current.id}：${deltas.map(formatDelta).join("；")}`);
 	}
-	const decision = store.decisionLog.filter((item) => item.marketId === marketId && item.type === "decision").sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+	const decision = latestBy(store.decisionLog.filter((item) => item.marketId === marketId && item.type === "decision"), (item) => item.createdAt);
 	if (decision) lines.push(`既往决策：${decision.decisionStatus ?? "—"} · ${decision.reason}`);
 	if (check) lines.push(`已生成 ${check.id}：${check.verdict} · ${check.verdictReason}${check.verdict === "challenged" ? "；建议重跑 compass_strategy_run" : ""}`);
 	return renderHistoryNote(lines);
 }
 
 export function strategyHistoryNote(store: CompassStore, run: StrategyRun): string[] {
-	const previous = store.strategyRuns.filter((item) => item.marketId === run.marketId && item.id !== run.id).sort((a, b) => b.runAt.localeCompare(a.runAt))[0];
+	const previous = latestBy(store.strategyRuns.filter((item) => item.marketId === run.marketId && item.id !== run.id), (item) => item.runAt);
 	const lines: string[] = [];
 	if (previous) {
 		const previousVeto = previous.result.rules.filter((rule) => rule.status === "veto").length;
@@ -1926,8 +2301,15 @@ export function decisionHistoryNote(store: CompassStore, candidate: Candidate): 
 	const lines = [`决策链：${chain.length} 条留痕；当前 ${candidate.decisionStatus ?? "未决策"}，stage=${candidate.stage}。`];
 	if (market) {
 		const peers = similarMarkets(store, { marketId: market.id, limit: 3 });
-		const peerChecks = peers.flatMap((peer) => store.outcomeChecks.filter((check) => check.marketId === peer.market.id && check.decisionStatus === "go" && check.verdict !== "inconclusive"));
-		if (peerChecks.length) lines.push(`相似市场 go 品实绩达成率 ${(peerChecks.filter((check) => check.verdict === "validated").length / peerChecks.length * 100).toFixed(0)}%（${peerChecks.length} 条可判定复盘）。`);
+		// 与 history.outcomeStatistics 同口径：**按市场去重**，一个市场只投一票。
+		// 按条数加权会让长期跟踪的 peer（每次例行导入攒一条 check）主导整条比率——
+		// 3 个 peer 里的一个就能把数字带偏。复用 latestComparableChecks，绝不在这里
+		// 另写一份去重：批次四 Deviation 15 记着「第二份实现缺 id 兜底、同毫秒时两个面
+		// 选中相反的 check」那次事故。
+		const peerIds = new Set(peers.map((peer) => peer.market.id));
+		const peerChecks = latestComparableChecks(store.outcomeChecks.filter((check) => peerIds.has(check.marketId)))
+			.filter((check) => check.decisionStatus === "go");
+		if (peerChecks.length) lines.push(`相似市场 go 品实绩达成率 ${(peerChecks.filter((check) => check.verdict === "validated").length / peerChecks.length * 100).toFixed(0)}%（${peerChecks.length} 个市场，按市场去重：同一市场只取最新一条可判对照）。`);
 		for (const lesson of matchingLessonsForMarket(store, market.id, 2)) lines.push(`命中经验 ${lesson.id}：${lesson.title}（evidence: ${lesson.evidence.slice(0, 3).join("、")}）`);
 	}
 	return renderHistoryNote(lines);
@@ -1936,19 +2318,23 @@ export function decisionHistoryNote(store: CompassStore, candidate: Candidate): 
 export function generateMarketReport(
 	store: CompassStore,
 	marketRef: string,
-	strategyRef = "jingpu-daily10",
+	strategyRef = DEFAULT_STRATEGY_ID,
 ): GeneratedReport {
 	const market = findMarket(store, marketRef);
 	const snapshot = latestSnapshot(store, market.id);
 	const strategy = findStrategyVersion(store, strategyRef);
-	const { context } = buildStrategyContext(store, market.id);
-	context.targetMonthlyUnits = Number(strategy.definition.meta.monthly_units_q ?? 300);
+	const { context } = buildStrategyContext(store, market.id, strategyTargetMonthlyUnits(strategy.definition));
 	const evaluation = evaluateStrategy(strategy.definition, context, "full");
 	const candidate = store.candidates.find((item) => item.marketId === market.id);
-	const decisions = store.decisionLog.filter((item) => item.marketId === market.id).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-	const risk = store.riskRecords.filter((item) => item.marketId === market.id).sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
-	const review = store.reviewAnalyses.filter((item) => item.marketId === market.id).sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
-	const profit = store.profitEstimates.filter((item) => item.marketId === market.id).sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+	// 并列时后插入的排前面，与 latestBy 同口径（sort 稳定，比较返回 0 会保持原序即最早在前）
+	const decisions = store.decisionLog
+		.map((item, index) => ({ item, index }))
+		.filter(({ item }) => item.marketId === market.id)
+		.sort((a, b) => b.item.createdAt.localeCompare(a.item.createdAt) || b.index - a.index)
+		.map(({ item }) => item);
+	const risk = latestBy(store.riskRecords.filter((item) => item.marketId === market.id), (item) => item.createdAt);
+	const review = latestBy(store.reviewAnalyses.filter((item) => item.marketId === market.id), (item) => item.createdAt);
+	const profit = latestBy(store.profitEstimates.filter((item) => item.marketId === market.id), (item) => item.createdAt);
 	const attributedCostCny = store.costEvents.filter((item) => item.marketId === market.id).reduce((sum, item) => sum + item.amountCny, 0);
 	const fusedBudgetSources = budgetStatus(store).filter((pool) => pool.state === "fused").map((pool) => pool.source);
 	const data: MarketReportData = {

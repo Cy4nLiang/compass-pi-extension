@@ -1,3 +1,4 @@
+import { compareSnapshotRecency, compareSnapshotRecencyDesc, SNAPSHOT_FRESHNESS_DAYS, snapshotFreshness } from "./defaults.ts";
 import type { RetroDueItem } from "./history.ts";
 import {
 	RESOLVABLE_TODO_KINDS,
@@ -67,7 +68,8 @@ const FIELD_LABELS: Record<string, string> = {
 };
 
 const DAY_MS = 86_400_000;
-const STALE_SNAPSHOT_DAYS = 30;
+// 线索建卡后多久还没有首个快照就浮出待办。量的是「建卡年龄」而非「快照年龄」，
+// 与 SNAPSHOT_FRESHNESS_DAYS.deepResearch 数值相同纯属巧合，两者不得联动。
 const LEAD_WITHOUT_SNAPSHOT_DAYS = 7;
 const ESCALATE_OVERDUE_DAYS = 30;
 
@@ -130,30 +132,31 @@ export function stageEntryTimes(store: CompassStore, stage: CandidateStage): Map
 }
 
 // 偏差水位：标记「参与比较的快照集合」本身，而不是它的最大 capturedAt。
-// metricDivergences（service.ts:1243）取各来源最新快照逐指标比较，任一来源被更新的导出替换，
+// metricDivergences 取各来源最新快照逐指标比较，任一来源被更新的导出替换，
 // 参与比较的值就变了。若水位取全市场最大 capturedAt，回填补录（capturedAt 早于全市场最新、
 // 但晚于该来源上一份，如补导前天的 Sorftime 导出）会改写偏差事实却不推高水位，已勾选条目
 // 静默到下一份更新快照为止——正是 spec §5 方案 G 判为不可接受的告警黑洞。
 // 指纹按 source 排序拼接：集合不变则完全相等（同 capturedAt 重导时该来源参与比较的快照不变，
 // 指纹同样不变，继续抑制）。导出供 service 勾选时落 basis.snapshotWatermark 复用同一口径。
-// 两处约定：① 选「该来源最新」用与 metricDivergences 排序相同的 localeCompare，取值相同者保留先入库那条，
-// 与其稳定排序取首条等价；② 指纹分隔符依赖 SNAPSHOT_SOURCES（types.ts）的来源名不含 "@" 与 "|"。
+// 两处约定：① 选「该来源最新」用与 metricDivergences 相同的 (capturedAt, importedAt) 二元组比较，
+// 取值相同者比 importedAt——同日重导的修正版胜出，指纹随之改变、已勾选条目重新浮出（宁多提醒不漏提醒）；
+// ② 指纹分隔符依赖 SNAPSHOT_SOURCES（types.ts）的来源名不含 "@"、"#" 与 "|"。
 export function divergenceWatermarks(store: CompassStore): Map<string, string> {
-	const latestBySource = new Map<string, Map<string, string>>();
+	const latestBySource = new Map<string, Map<string, MarketSnapshot>>();
 	for (const snapshot of store.snapshots) {
 		let sources = latestBySource.get(snapshot.marketId);
 		if (!sources) {
-			sources = new Map<string, string>();
+			sources = new Map<string, MarketSnapshot>();
 			latestBySource.set(snapshot.marketId, sources);
 		}
 		const previous = sources.get(snapshot.source);
-		if (previous === undefined || snapshot.capturedAt.localeCompare(previous) > 0) sources.set(snapshot.source, snapshot.capturedAt);
+		if (previous === undefined || compareSnapshotRecency(snapshot, previous) > 0) sources.set(snapshot.source, snapshot);
 	}
 	const watermarks = new Map<string, string>();
 	for (const [marketId, sources] of latestBySource) {
 		watermarks.set(marketId, [...sources.entries()]
 			.sort((a, b) => a[0].localeCompare(b[0]))
-			.map(([source, capturedAt]) => `${source}@${capturedAt}`)
+			.map(([source, snapshot]) => `${source}@${snapshot.capturedAt}#${snapshot.importedAt}`)
 			.join("|"));
 	}
 	return watermarks;
@@ -269,8 +272,8 @@ export function deriveTodos(input: DeriveTodosInput): WorkbenchTodo[] {
 				kind: "budget_fused",
 				source: pool.source,
 				title: `预算熔断：${pool.source}`,
-				reason: `当月用量已达上限（${usage}），付费补数链路停摆`,
-				suggestedAction: `compass_budget configure source=${pool.source} 提高上限，或降级 C 档数据源；次月自动恢复`,
+				reason: `当月（UTC 月）用量已达上限（${usage}），付费补数链路停摆`,
+				suggestedAction: `compass_budget configure source=${pool.source} 提高上限，或降级 C 档数据源；否则 UTC 次月自动恢复（北京时间次月 1 日 08:00 清零）`,
 			}, () => ({ month: currentMonth }));
 		} else {
 			push({
@@ -278,26 +281,34 @@ export function deriveTodos(input: DeriveTodosInput): WorkbenchTodo[] {
 				kind: "budget_warning",
 				source: pool.source,
 				title: `预算 80% 告警：${pool.source}`,
-				reason: `当月用量已达 80%（${usage}）`,
+				reason: `当月（UTC 月）用量已达 80%（${usage}）`,
 				suggestedAction: "compass_budget status 核对用量，评估是否提高上限或收紧补数",
 			}, () => ({ month: currentMonth }));
 		}
 	}
 
 	// P1 retro_challenged：市场最新复盘结论为 challenged 且此后候选无任何处置动作
+	// 取「最新一条非 inconclusive」而不是「最新一条」：inconclusive 的定义就是证据不足
+	// （领域不变式：缺新快照或数字实绩时 verdict 只能 inconclusive），它不携带任何结论，
+	// 不得把仍然成立的 challenged 顶掉。例行导入极易产出 inconclusive（换导出模板缺列、
+	// 重放证据不晚于 T0），一次就能让 P1 告警静默消失且毫无处置留痕。
 	const latestCheckByMarket = new Map<string, CompassStore["outcomeChecks"][number]>();
 	for (const check of [...store.outcomeChecks].sort((a, b) => b.createdAt.localeCompare(a.createdAt))) {
+		if (check.verdict === "inconclusive") continue;
 		if (!latestCheckByMarket.has(check.marketId)) latestCheckByMarket.set(check.marketId, check);
 	}
 	for (const check of latestCheckByMarket.values()) {
 		if (check.verdict !== "challenged") continue;
-		// 处置判据：check 之后该市场出现过 strategy 重跑 / 阶段移动 / 最终决策留痕即视为已处置。
+		// 处置判据：check 之后该市场出现过**人工** strategy 重跑 / 阶段移动 / 最终决策留痕才算已处置。
 		// 不能用 candidate.updatedAt 做代理——例行 CSV 导入会刷新它（假阳性清除），
-		// 而 decideCandidate 不刷新它（真处置清不掉）
+		// 而 decideCandidate 不刷新它（真处置清不掉）。
+		// 也不能认所有 strategy 日志：例行导入默认跑一次粗筛并写 type=strategy（importMarketAndScreen），
+		// 无人处置的最高优先级告警会在最日常的操作后无痕消失。只认 trigger="manual"，
+		// 缺 trigger 的存量日志按非手动处理——宁可多提醒一次，绝不漏提醒。
 		const handled = store.decisionLog.some((log) =>
 			log.marketId === check.marketId
-			&& (log.type === "strategy" || log.type === "stage_move" || log.type === "decision")
-			&& log.createdAt > check.createdAt);
+			&& log.createdAt > check.createdAt
+			&& (log.type === "stage_move" || log.type === "decision" || (log.type === "strategy" && log.trigger === "manual")));
 		if (handled) continue;
 		const candidate = store.candidates.find((item) => item.marketId === check.marketId);
 		push({
@@ -312,7 +323,7 @@ export function deriveTodos(input: DeriveTodosInput): WorkbenchTodo[] {
 	}
 
 	const latestSnapshotByMarket = new Map<string, MarketSnapshot>();
-	for (const snapshot of [...store.snapshots].sort((a, b) => b.capturedAt.localeCompare(a.capturedAt))) {
+	for (const snapshot of [...store.snapshots].sort(compareSnapshotRecencyDesc)) {
 		if (!latestSnapshotByMarket.has(snapshot.marketId)) latestSnapshotByMarket.set(snapshot.marketId, snapshot);
 	}
 	const latestRiskByMarket = new Map<string, RiskRecord>();
@@ -397,14 +408,14 @@ export function deriveTodos(input: DeriveTodosInput): WorkbenchTodo[] {
 		const snapshot = latestSnapshotByMarket.get(candidate.marketId);
 		if (snapshot) {
 			const age = daysBetween(snapshot.capturedAt, now);
-			if (age > STALE_SNAPSHOT_DAYS) {
+			if (snapshotFreshness(age) === "stale") {
 				push({
 					id: `todo_snapshot_stale_${candidate.id}`,
 					kind: "snapshot_stale",
 					marketId: candidate.marketId,
 					candidateId: candidate.id,
 					title: "市场快照过期",
-					reason: `最新快照已 ${age} 天（>${STALE_SNAPSHOT_DAYS} 天）`,
+					reason: `最新快照已 ${age} 天（>${SNAPSHOT_FRESHNESS_DAYS.screen} 天）`,
 					suggestedAction: "/compass-import 导入新导出的 CSV 刷新快照",
 				});
 			}

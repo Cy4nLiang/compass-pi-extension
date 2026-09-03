@@ -1660,10 +1660,16 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			const [verb = "status", ...rest] = args.trim().split(/\s+/u).filter(Boolean);
 			const action = verb.toLocaleLowerCase();
 			const repo = repository(ctx);
-			const persist = async () => {
-				mutedGaps = pruneMutedGaps(mutedGaps);
+			// 先写盘、写成功了才改内存。反过来的话，写失败时内存已经变了而文件没变：
+			// 命令报错、但 /compass-fill status 读内存照样显示新值，要重启 pi 才暴露真相。
+			// 设置类命令的失败必须是「什么都没发生」，不能是「看着像成功了」。
+			const persist = async (next: { mode: GapfillMode; muted: MutedGap[] }) => {
+				const muted = pruneMutedGaps(next.muted);
 				const backupExisting = gapfillStateUnreadable;
-				await withFileMutationQueue(repo.gapfillStatePath, () => repo.writeGapfillState({ version: 1, mode: fillMode, mutedGaps }, { backupExisting }));
+				await withFileMutationQueue(repo.gapfillStatePath, () => repo.writeGapfillState({ version: 1, mode: next.mode, mutedGaps: muted }, { backupExisting }));
+				// 走到这里说明已经落盘，现在才认这份新状态
+				fillMode = next.mode;
+				mutedGaps = muted;
 				// 备份只需一次：写完之后文件已经是本会话认得的形状
 				gapfillStateUnreadable = false;
 				// 档位与静音直接改变状态栏的缺口段，改完立刻刷新，别等下一次写事务
@@ -1681,8 +1687,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 				return;
 			}
 			if ((GAPFILL_MODES as readonly string[]).includes(action)) {
-				fillMode = action as GapfillMode;
-				await persist();
+				await persist({ mode: action as GapfillMode, muted: mutedGaps });
 				const strictHint = fillMode === "strict" ? "（strict 的调用拦截二期生效，本期与 guided 表现相同）" : "";
 				notify(`罗盘补数档位：${fillMode}${strictHint}`, "info");
 				return;
@@ -1706,8 +1711,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 					label = `${market.name}（整个市场）`;
 				}
 				const until = new Date(Date.now() + days * 86_400_000).toISOString();
-				mutedGaps = [...mutedGaps.filter((item) => item.id !== id), { id, until }];
-				await persist();
+				await persist({ mode: fillMode, muted: [...mutedGaps.filter((item) => item.id !== id), { id, until }] });
 				notify(`已静音 ${label} 至 ${until.slice(0, 10)}：尾注与状态栏不再提示，compass_gaps list 仍可见`, "info");
 				return;
 			}
@@ -1715,8 +1719,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 				const target = rest[0];
 				if (!target) throw new Error("用法：/compass-fill unmute <gap_id或market_ref或all>");
 				if (target === "all") {
-					mutedGaps = [];
-					await persist();
+					await persist({ mode: fillMode, muted: [] });
 					notify("已清空全部静音", "info");
 					return;
 				}
@@ -1730,8 +1733,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 					}
 				}
 				if (!mutedGaps.some((item) => item.id === id)) throw new Error(`${target} 当前没有静音记录；/compass-fill status 看现有静音`);
-				mutedGaps = mutedGaps.filter((item) => item.id !== id);
-				await persist();
+				await persist({ mode: fillMode, muted: mutedGaps.filter((item) => item.id !== id) });
 				notify(`已取消静音 ${target}`, "info");
 				return;
 			}

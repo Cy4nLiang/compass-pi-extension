@@ -164,8 +164,21 @@ test("/compass-fill mute 把 market_ref 解析成 market_id 后再存", async ()
 	assert.match(muteBody, /findMarket\(store, target\)/u, "mute 必须把市场名解析成 market_id，否则静音是静默 no-op");
 	assert.match(muteBody, /gap\.id === target/u, "gap_id 也要校验存在，不然同样是静默 no-op");
 	// 过期条目不写回文件：否则 state.jsonc 会越积越大
-	assert.match(commandBody, /mutedGaps = pruneMutedGaps\(mutedGaps\);/u, "persist 前要剪掉过期静音");
+	assert.match(commandBody, /pruneMutedGaps\(next\.muted\)/u, "写盘前要剪掉过期静音");
 	assert.match(commandBody, /refreshStatus\(ctx, await readStore\(ctx\)\)/u, "改完档位/静音要立刻刷状态栏，别等下一次写事务");
+	// 先写盘、成功了才认新状态。反过来的话写失败时内存已经变了而文件没变，
+	// status 读内存显示新值、重启才暴露，运营会以为设置生效了（2026-09-04 冒烟实际踩到）
+	const persistBody = commandBody.slice(commandBody.indexOf("const persist ="), commandBody.indexOf('if (action === "status")'));
+	const writeAt = persistBody.indexOf("writeGapfillState");
+	assert.notEqual(writeAt, -1, "persist 里找不到落盘调用——切片已失效");
+	for (const assign of ["fillMode = next.mode;", "mutedGaps = muted;"]) {
+		const at = persistBody.indexOf(assign);
+		assert.notEqual(at, -1, `persist 里找不到 ${assign}`);
+		assert.ok(at > writeAt, `${assign} 出现在落盘之前：写失败时内存会与磁盘不一致`);
+	}
+	// 四个改动分支都必须经 persist(...) 提交，不能有谁绕过去直接赋值
+	const strayAssign = commandBody.slice(commandBody.indexOf('if (action === "status")')).match(/^\s*(fillMode|mutedGaps) =/gmu);
+	assert.equal(strayAssign, null, `有分支绕过 persist 直接改内存：${strayAssign?.join(" / ")}`);
 });
 
 // refreshStatus 与 /compass 的非 TUI 分支必须传同一组 options，

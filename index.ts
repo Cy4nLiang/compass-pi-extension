@@ -1528,7 +1528,18 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			if (!source) return;
 			const imported = await performImport(ctx, { path, marketName, source, runScreen: true });
 			rememberTouch({ marketId: imported.market.id, candidateId: imported.candidate.id, action: "import", conclusion: `粗筛=${imported.screenRun?.result.outcome ?? "未运行"}${imported.outcomeCheck ? `；复盘=${imported.outcomeCheck.verdict}` : ""}`, ids: [imported.snapshot.id, ...(imported.outcomeCheck ? [imported.outcomeCheck.id] : [])] });
-			ctx.ui.notify(`${imported.market.name} 已导入；粗筛=${imported.screenRun?.result.outcome ?? "未运行"}${imported.outcomeCheck ? `；复盘=${imported.outcomeCheck.verdict} (${imported.outcomeCheck.id})` : ""}`, imported.screenRun?.result.outcome === "reject" || imported.outcomeCheck?.verdict === "challenged" ? "warning" : "info");
+			// 补数缺口尾注挂在**工具**返回的 details.data 上，由 tool_result 钩子合并进正文；
+			// 斜杠命令不产生 tool result，那条链路整个不经过钩子。导入是唯一会产生新缺口的动作，
+			// 而 /compass-import 恰恰是运营最常用的导入入口，所以这里补一次同样的派生。
+			// 预算与工具路径一致（≤5 行 / 400 字），文案也用同一个【补数缺口】标题。
+			const importGapNote = capHistoryLines(gapNoteFor(imported.store, imported.market.id, imported.candidate.id), 5, 400);
+			ctx.ui.notify(
+				[
+					`${imported.market.name} 已导入；粗筛=${imported.screenRun?.result.outcome ?? "未运行"}${imported.outcomeCheck ? `；复盘=${imported.outcomeCheck.verdict} (${imported.outcomeCheck.id})` : ""}`,
+					...(importGapNote.length ? ["【补数缺口】", ...importGapNote.map((line) => `· ${line}`)] : []),
+				].join("\n"),
+				imported.screenRun?.result.outcome === "reject" || imported.outcomeCheck?.verdict === "challenged" ? "warning" : "info",
+			);
 		},
 	});
 

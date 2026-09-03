@@ -179,6 +179,21 @@ test("状态栏与 /compass 通知用同一组缺口 options", async () => {
 	assert.deepEqual(bare, [], `这些调用没传缺口 options，会绕过 /compass-fill off 与静音：${bare.map((line) => line.trim()).join(" / ")}`);
 });
 
+// 斜杠命令不产生 tool result，tool_result 钩子的尾注合并整条链路都不经过。
+// /compass-import 是运营最常用的导入入口，也是唯一会产生新缺口的动作——漏了它，
+// 缺口提示对「用命令导入」的运营等于不存在（2026-09-04 冒烟实际踩到）。
+test("/compass-import 命令路径也挂补数缺口尾注", async () => {
+	const source = await readFile(join(repoRoot, "index.ts"), "utf8");
+	const start = source.indexOf('pi.registerCommand("compass-import"');
+	assert.notEqual(start, -1, "找不到 /compass-import 的注册块");
+	const body = source.slice(start, source.indexOf("pi.registerCommand(", start + 10));
+	assert.match(body, /gapNoteFor\(imported\.store, imported\.market\.id, imported\.candidate\.id\)/u, "命令路径没有派生缺口尾注");
+	assert.match(body, /【补数缺口】/u, "缺口段要用与工具尾注相同的标题");
+	// 与工具路径同一份展示预算，别让命令路径自己长出一套上限。
+	// 实参里嵌着 gapNoteFor(...)，用 [^)]* 会在内层右括号就截断——这条正则栽过一次
+	assert.match(body, /capHistoryLines\([\s\S]*?, 5, 400\)/u, "命令路径的缺口段必须走 5 行 / 400 字的同一预算");
+});
+
 test("compass_gaps 与 compass-fill 各自按 PI_LAN_SHARED 二次判定", async () => {
 	const source = await readFile(join(repoRoot, "index.ts"), "utf8");
 	// 纵深两层：工具与命令都不依赖工作区 guard 的单层拦截。

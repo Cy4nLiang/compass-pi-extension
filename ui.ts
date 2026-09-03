@@ -1,12 +1,21 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { SNAPSHOT_FRESHNESS_DAYS, compareSnapshotRecencyDesc, snapshotNeedsRefresh } from "./defaults.ts";
+import { deriveGaps, summarizeGaps, type MutedGap } from "./gaps.ts";
 import { outcomeStatistics } from "./history.ts";
 import { budgetMonth, budgetStatus, gateDefaultsLine, listRetroDue, listWorkbenchTodos } from "./service.ts";
 import { todoResolutionBadge } from "./todo.ts";
 import { CANDIDATE_STAGES, STAGE_LABELS, TODO_GROUP_LABELS, TODO_PRIORITIES, type CompassStore, type WorkbenchTodo } from "./types.ts";
 
 const TAB_NAMES = ["总览", "待办", "市场", "候选池", "预算", "复盘"] as const;
+
+export interface CompactDashboardOptions {
+	// 调用方已算好的待办清单，避免同一次写事务里重复推导（含快照明细的同步读）
+	todos?: WorkbenchTodo[];
+	mutedGaps?: readonly MutedGap[];
+	// /compass-fill off 时传 false：状态栏不显示缺口段
+	gapsEnabled?: boolean;
+}
 
 function ageDays(date: string): number {
 	return Math.max(0, Math.floor((Date.now() - Date.parse(date)) / 86_400_000));
@@ -17,14 +26,16 @@ function padAnsi(value: string, width: number): string {
 	return clipped + " ".repeat(Math.max(0, width - visibleWidth(clipped)));
 }
 
-export function compactDashboardSummary(store: CompassStore): string {
+export function compactDashboardSummary(store: CompassStore, options: CompactDashboardOptions = {}): string {
 	const active = store.candidates.filter((candidate) => !["archived", "review"].includes(candidate.stage)).length;
 	const review = store.candidates.filter((candidate) => candidate.gateOutcome === "review").length;
 	const rejected = store.candidates.filter((candidate) => candidate.gateOutcome === "reject").length;
-	const spent = budgetStatus(store).reduce((sum, pool) => sum + pool.spentCny, 0);
+	const budgets = budgetStatus(store);
+	const spent = budgets.reduce((sum, pool) => sum + pool.spentCny, 0);
 	// listWorkbenchTodos 内部会再算一次 budgetStatus/listRetroDue；<10³ 量级毫秒级双算，
-	// 换取待办口径与待办页完全一致（Task 3 review F-3 备忘：接受双算并注明）
-	const todos = listWorkbenchTodos(store);
+	// 换取待办口径与待办页完全一致（Task 3 review F-3 备忘：接受双算并注明）。
+	// 调用方已经算过时经 options.todos 传进来复用：它对多来源市场会触发快照明细的同步读
+	const todos = options.todos ?? listWorkbenchTodos(store);
 	const due = todos.filter((todo) => todo.kind === "retro_due").length;
 	const urgent = todos.filter((todo) => todo.priority === 1).length;
 	// 口径唯一所有者是 history.outcomeStatistics（按市场去重、只算有人工决策锚点的 check）；
@@ -33,7 +44,18 @@ export function compactDashboardSummary(store: CompassStore): string {
 	const validationRate = rate === null ? "—" : `${(rate * 100).toFixed(0)}%`;
 	// 已提交待 agent 验证的条目：运营看得见「球在会话侧」，避免提交后无声等待
 	const pendingVerify = todos.filter((todo) => todo.resolution?.status === "submitted").length;
-	return `${store.markets.length} 市场 · ${active} 活跃候选 · ${review} 待复核 · ${rejected} 否决 · ${due} 待复盘 · ${todos.length} 待办${urgent ? `（P1 ${urgent}）` : ""}${pendingVerify ? ` · 待验证 ${pendingVerify}` : ""} · 验证率 ${validationRate} · 本月 ¥${spent.toFixed(0)}`;
+	// 补数缺口：只读派生，算不出来就不显示这一段（状态栏是装饰视图，绝不因它失败）。
+	// /compass-fill off 时整段消失
+	let gapPart = "";
+	if (options.gapsEnabled !== false) {
+		try {
+			const gaps = summarizeGaps(deriveGaps(store, { todos, budgets, muted: options.mutedGaps }));
+			if (gaps.total > 0) gapPart = ` · 缺口 ${gaps.total}（可自动 ${gaps.auto}）`;
+		} catch {
+			gapPart = "";
+		}
+	}
+	return `${store.markets.length} 市场 · ${active} 活跃候选 · ${review} 待复核 · ${rejected} 否决 · ${due} 待复盘 · ${todos.length} 待办${urgent ? `（P1 ${urgent}）` : ""}${pendingVerify ? ` · 待验证 ${pendingVerify}` : ""}${gapPart} · 验证率 ${validationRate} · 本月 ¥${spent.toFixed(0)}`;
 }
 
 export class CompassDashboard {

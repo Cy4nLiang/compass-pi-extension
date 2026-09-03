@@ -363,6 +363,7 @@ export class CompassRepository {
 	readonly rawDir: string;
 	readonly reportsDir: string;
 	readonly snapshotDataDir: string;
+	readonly gapfillDir: string;
 	readonly lockPath: string;
 
 	constructor(projectRoot: string, configDirName = ".pi") {
@@ -376,6 +377,7 @@ export class CompassRepository {
 		this.rawDir = resolve(this.dataDir, "raw");
 		this.reportsDir = resolve(this.dataDir, "reports");
 		this.snapshotDataDir = resolve(this.dataDir, "snapshots");
+		this.gapfillDir = resolve(this.dataDir, "gapfill");
 		this.lockPath = `${this.storePath}.lock`;
 	}
 
@@ -680,5 +682,49 @@ export class CompassRepository {
 		// 裸 writeFile 的「先截断后写」会让并发写方读到截断内容、失败时毁掉上一份好报告
 		await this.writeAtomic(safePath, markdown, 0o600);
 		await chmod(safePath, 0o600).catch(() => undefined);
+	}
+
+	// 补数档位与静音清单。resolveOutputPath 复用不了（它硬性要求 .md 且必须落在 reports/ 内），
+	// 所以这里自建一条路径解析，写法与 writeReport 相同：mkdir 0700 → 临时文件 + rename → 0600。
+	// 扩展名必须是 .jsonc：index.ts 的 bash 读守卫会拦住 .pi/compass/ 下命中 `.json\b` 的命令，
+	// 叫 state.json 会让运营连 cat 一眼都不行。
+	get gapfillStatePath(): string {
+		const candidate = canonicalPath(resolve(this.gapfillDir, "state.jsonc"));
+		if (!pathWithin(this.dataDir, candidate)) throw new Error("补数状态文件必须位于 .pi/compass/gapfill 目录内");
+		return candidate;
+	}
+
+	// 读侧 fail open（补数档位只是个开关，读不到绝不能拦住会话启动），但**要分清两种失败**：
+	// 文件不存在是第一次使用的常态，静默即可；解析失败 / 权限不足是运营手改坏了或环境有问题，
+	// 必须让调用方能说出来——一律吞掉的话，档位与整份静音清单会无声回到默认值。
+	async readGapfillState(): Promise<{ value?: unknown; error?: string }> {
+		let raw: string;
+		try {
+			raw = await readFile(this.gapfillStatePath, "utf8");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") return {};
+			return { error: `读取失败：${error instanceof Error ? error.message : String(error)}` };
+		}
+		try {
+			return { value: JSON.parse(raw) };
+		} catch (error) {
+			return { error: `解析失败：${error instanceof Error ? error.message : String(error)}` };
+		}
+	}
+
+	// backupExisting：上一次读失败时置真。写是整份覆盖，直接盖掉就等于把运营手改坏的那份
+	// （以及里面还认得出的静音清单）永久销毁；先留一份 .bak 再覆盖，代价一次 copy。
+	async writeGapfillState(state: unknown, options: { backupExisting?: boolean } = {}): Promise<void> {
+		const target = this.gapfillStatePath;
+		await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+		if (options.backupExisting) {
+			try {
+				await this.writeAtomic(`${target}.bak`, await readFile(target, "utf8"), 0o600);
+			} catch {
+				// 没有旧文件或读不动：没什么可备份的，继续写新的
+			}
+		}
+		await this.writeAtomic(target, `${JSON.stringify(state, null, "\t")}\n`, 0o600);
+		await chmod(target, 0o600).catch(() => undefined);
 	}
 }

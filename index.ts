@@ -17,6 +17,21 @@ import { Type } from "typebox";
 import { DOMAIN_TOOLS, rankTools, searchTerms } from "./catalog.ts";
 import { compareSnapshotRecencyDesc, snapshotTtlDays } from "./defaults.ts";
 import { estimateProfit, normalizeProfitInput } from "./economics.ts";
+import {
+	GAPFILL_MODES,
+	GAP_AUTO_TIERS,
+	GAP_ORIGINS,
+	deriveGaps,
+	diffGaps,
+	gapActionLine,
+	gapTtlDays,
+	renderGapNote,
+	summarizeGaps,
+	transientProfitUnpersistedGap,
+	type GapRecord,
+	type GapfillMode,
+	type MutedGap,
+} from "./gaps.ts";
 import { capHistoryLines, marketMatchesPrompt, renderHistoryBrief, renderSessionLedger, retroReportFileName, type SessionLedgerItem } from "./history.ts";
 import { performCsvImport } from "./importer.ts";
 import {
@@ -78,7 +93,7 @@ import {
 } from "./service.ts";
 import { CompassRepository } from "./store.ts";
 import { DEEP_RESEARCH_REQUIRED_FIELDS, todoResolutionBadge } from "./todo.ts";
-import { CANDIDATE_STAGES, DECISION_LOG_TYPES, DECISION_STATUSES, GATE_OUTCOMES, POLICY_FLAGS, REVIEW_THEME_CATEGORIES, REVIEW_THEME_FIXABILITIES, RISK_STATUSES, SEASON_FLAGS, SNAPSHOT_SOURCES, STRATEGY_MODES, TODO_KINDS, TODO_RESOLUTION_STATUS_LABELS, TODO_RESOLUTION_STATUSES, type CandidateStage, type CompassStore, type DecisionLog, type DecisionStatus, type OutcomeActuals, type ReviewTheme } from "./types.ts";
+import { CANDIDATE_STAGES, DECISION_LOG_TYPES, DECISION_STATUSES, GATE_OUTCOMES, POLICY_FLAGS, REVIEW_THEME_CATEGORIES, REVIEW_THEME_FIXABILITIES, RISK_STATUSES, SEASON_FLAGS, SNAPSHOT_SOURCES, STRATEGY_MODES, TODO_KINDS, TODO_RESOLUTION_STATUS_LABELS, TODO_RESOLUTION_STATUSES, type Candidate, type CandidateStage, type CompassStore, type WorkbenchTodo, type DecisionLog, type DecisionStatus, type OutcomeActuals, type ReviewTheme } from "./types.ts";
 import { compactDashboardSummary, CompassDashboard } from "./ui.ts";
 import { startCompassWebServer, type CompassWebServer } from "./web/server.ts";
 
@@ -101,6 +116,8 @@ interface CompassDetails {
 interface CompassResultData {
 	payload?: unknown;
 	historyNote?: string[];
+	// 本市场新增的补数缺口摘要（<=5 行）。tool_result 里与 historyNote 合并，缺口行排前
+	gapNote?: string[];
 	touch?: {
 		marketId?: string;
 		candidateId?: string;
@@ -205,6 +222,16 @@ export default function compassExtension(pi: ExtensionAPI): void {
 	let historyBriefEnabled = true;
 	let dueNotified = false;
 	const briefedMarkets = new Set<string>();
+	// 宿主的受限共享模式：禁用一切写档与付费动作。工具与命令各判一次（纵深，不依赖单层守卫）
+	const lanShared = process.env.PI_LAN_SHARED === "1";
+	// 补数档位与静音清单：session_start 只读恢复上次设置，受限会话强制 off 且不读不写；
+	// 唯一写入点是 /compass-fill 命令 handler（命令不是热路径 hook，是天然安全点）
+	let fillMode: GapfillMode = lanShared ? "off" : "guided";
+	let mutedGaps: MutedGap[] = [];
+	// 本会话读状态文件失败过（解析坏 / 权限）：下一次写之前先备份，别把旧内容永久盖掉
+	let gapfillStateUnreadable = false;
+	// 已在本会话展示过的缺口指纹：尾注只列「新增」，避免每次写事务重复刷同一批
+	const seenGapFingerprints = new Set<string>();
 	const sessionLedger: SessionLedgerItem[] = [];
 	// 未落盘的 MCP 计量：server → tool → 次数。热路径 hook 只做内存自增（不变式：hook 零写事务），
 	// 在安全点（任意写事务顺带 / 打开工作台 / 查预算与待办 / 正常退出）统一落账
@@ -323,9 +350,86 @@ export default function compassExtension(pi: ExtensionAPI): void {
 	function refreshStatus(ctx: ExtensionContext, store: CompassStore): void {
 		if (!ctx.hasUI) return;
 		try {
-			ctx.ui.setStatus("compass", ctx.ui.theme.fg("accent", `罗盘 ${compactDashboardSummary(store)}`));
+			const summary = compactDashboardSummary(store, { todos: todosFor(store), mutedGaps, gapsEnabled: fillMode !== "off" });
+			ctx.ui.setStatus("compass", ctx.ui.theme.fg("accent", `罗盘 ${summary}`));
 		} catch {
 			// 状态栏是装饰性派生视图：推导失败跳过刷新，不把已提交的写事务上抛成工具失败
+		}
+	}
+
+	// listWorkbenchTodos 对多来源市场会经 metricDivergences 触发快照明细的同步读。
+	// 同一个 store 实例上只算一次：状态栏刷新与写工具收口的缺口尾注拿到的是同一个对象，
+	// 不做这层缓存的话，一次写事务会把它算两遍（外加 compactDashboardSummary 里已有的双算）
+	const todosByStore = new WeakMap<CompassStore, WorkbenchTodo[]>();
+	function todosFor(store: CompassStore): WorkbenchTodo[] {
+		const cached = todosByStore.get(store);
+		if (cached) return cached;
+		const todos = listWorkbenchTodos(store);
+		todosByStore.set(store, todos);
+		return todos;
+	}
+
+	// 从状态文件恢复档位与静音。受限会话固定 off 且完全不读文件（那是 owner 的偏好）。
+	// 读失败分两种：文件不存在是常态、静默；解析坏或权限不足要说出来并记下，
+	// 否则「12 条静音全部失效」看起来像功能坏了，且下一次写会把旧内容永久盖掉
+	async function restoreGapfillState(ctx: ExtensionContext, repo: CompassRepository): Promise<void> {
+		if (lanShared) return;
+		const { value, error } = await repo.readGapfillState();
+		if (error) {
+			gapfillStateUnreadable = true;
+			if (ctx.hasUI) ctx.ui.notify(`罗盘补数设置${error}，本会话按默认 guided；修好后 /reload 生效`, "warning");
+		}
+		const saved = value as { mode?: unknown; mutedGaps?: unknown } | undefined;
+		if (saved && typeof saved.mode === "string" && (GAPFILL_MODES as readonly string[]).includes(saved.mode)) fillMode = saved.mode as GapfillMode;
+		if (Array.isArray(saved?.mutedGaps)) mutedGaps = pruneMutedGaps(saved.mutedGaps);
+	}
+
+	// 过期的静音条目既不该参与匹配，也不该被写回文件慢慢堆积
+	function pruneMutedGaps(items: readonly unknown[]): MutedGap[] {
+		const now = Date.now();
+		return items.filter((item): item is MutedGap => {
+			if (!item || typeof item !== "object") return false;
+			const muted = item as MutedGap;
+			return typeof muted.id === "string" && Boolean(muted.id) && typeof muted.until === "string" && Date.parse(muted.until) > now;
+		});
+	}
+
+	// 人工缺口的内部 SOP 覆盖层。通用模板在 compass 公开仓库的 gaps.ts，内部口径只留在
+	// 宿主项目的 .pi/gapfill/hints.json（不进公开仓库）；文件缺失或损坏一律降级回通用模板
+	async function loadGapHints(ctx: ExtensionContext): Promise<Record<string, { how?: string; template?: string }>> {
+		try {
+			const target = repository(ctx).resolveInputPath(".pi/gapfill/hints.json");
+			const parsed = JSON.parse(await readFile(target, "utf8")) as { fields?: Record<string, { how?: string; template?: string }> };
+			return parsed.fields ?? {};
+		} catch {
+			return {};
+		}
+	}
+
+	// 写工具收口处的缺口尾注：必须在 mutateStore **返回之后**调用（写事务禁止嵌套）。
+	// 全程纯内存、零 I/O；只列本市场新增（fingerprint diff），算不出来就不加尾注
+	function gapNoteFor(store: CompassStore, marketId: string | undefined, candidateId?: string): string[] {
+		if (fillMode === "off" || !marketId) return [];
+		try {
+			// 一个市场可能有多张活跃候选卡，而 stage 决定表头的 TTL（深研 7d vs 测试 1d）。
+			// 优先用本次写动作真正涉及的那张；拿不到就取最近更新的一张，而不是数组里恰好排第一的
+			const live = store.candidates.filter((item) => item.marketId === marketId && item.stage !== "archived");
+			const candidate =
+				(candidateId ? live.find((item) => item.id === candidateId) : undefined) ??
+				live.reduce<Candidate | undefined>((best, item) => (!best || Date.parse(item.updatedAt) > Date.parse(best.updatedAt) ? item : best), undefined);
+			if (!candidate) return [];
+			const gaps = deriveGaps(store, { todos: todosFor(store), budgets: budgetStatus(store), muted: mutedGaps, marketId });
+			const { added, fingerprints } = diffGaps(seenGapFingerprints, gaps);
+			for (const fingerprint of fingerprints) seenGapFingerprints.add(fingerprint);
+			const snapshot = latestSnapshotIfPresent(store, marketId);
+			return renderGapNote(added, {
+				marketName: store.markets.find((item) => item.id === marketId)?.name ?? marketId,
+				stage: candidate.stage,
+				snapshotAgeDays: snapshot ? Math.max(0, Math.floor((Date.now() - Date.parse(snapshot.capturedAt)) / 86_400_000)) : undefined,
+				ttlDays: gapTtlDays(candidate.stage),
+			});
+		} catch {
+			return [];
 		}
 	}
 
@@ -419,6 +523,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 					lines: imported.parsed.warnings,
 					data: resultData({
 						historyNote: importHistoryNote(imported.store, imported.market.id, imported.snapshot.id, imported.outcomeCheck),
+						gapNote: gapNoteFor(imported.store, imported.market.id, imported.candidate.id),
 						touch: { marketId: imported.market.id, candidateId: imported.candidate.id, action: "import", conclusion: summary, ids: [imported.snapshot.id, ...(imported.outcomeCheck ? [imported.outcomeCheck.id] : [])] },
 					}),
 				}),
@@ -544,13 +649,20 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			});
 			const result = estimateProfit(input);
 			let estimateId: string | undefined;
+			let gapNote: string[] = [];
 			if (marketId) {
 				const recorded = await mutateStore(ctx, (store) => recordProfitEstimate(store, input, result, actorName(params.actor)));
 				estimateId = recorded.result.id;
+				gapNote = gapNoteFor(recorded.store, marketId, recorded.result.candidateId);
+			} else if (fillMode !== "off") {
+				// 没有 market_ref 时 recordProfitEstimate 根本不被调用，store 里零痕迹——
+				// 这条缺口 deriveGaps 永远看不到，只能在这里就地产出一条会话瞬时记录
+				const summaryLine = `毛利 ${(result.grossMargin * 100).toFixed(1)}%`;
+				gapNote = [transientProfitUnpersistedGap({ summary: summaryLine }).reason, "下一步：带 market_ref 重算即可持久化并进入策略上下文"];
 			}
 			const scenarios = result.netMarginScenarios.map((scenario, index) => `TACOS ${(scenario.tacos * 100).toFixed(0)}% => 净利率 ${(scenario.netMargin * 100).toFixed(1)}%，月净利 ${result.monthlyNetProfitScenarios[index].monthlyNetProfit.toFixed(2)}，回本 ${result.paybackMonthsScenarios[index].paybackMonths ?? "不可"} 月`);
 			const summary = `毛利 ${(result.grossMargin * 100).toFixed(1)}% · BE-CPC ${result.breakEvenCpc.toFixed(2)} · CPC承受度 ${result.cpcRatio?.toFixed(2) ?? "缺数据"} · 启动资金 ${result.startupCapital.toFixed(2)}`;
-			return textResult([summary, ...scenarios, ...result.warnings.map((warning) => `警告：${warning}`), estimateId ? `estimate_id=${estimateId}` : "未关联市场，未持久化"].join("\n"), details({ title: "利润测算", status: result.grossMargin >= 0.4 && result.cpcRatio !== undefined && result.cpcRatio <= 0.8 ? "success" : "warning", summary, lines: [...scenarios, ...result.warnings] }));
+			return textResult([summary, ...scenarios, ...result.warnings.map((warning) => `警告：${warning}`), estimateId ? `estimate_id=${estimateId}` : "未关联市场，未持久化"].join("\n"), details({ title: "利润测算", status: result.grossMargin >= 0.4 && result.cpcRatio !== undefined && result.cpcRatio <= 0.8 ? "success" : "warning", summary, lines: [...scenarios, ...result.warnings], data: resultData({ gapNote }) }));
 		},
 		renderCall: renderCallLabel("compass_profit_estimate"),
 		renderResult: renderCompassResult,
@@ -583,7 +695,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 				status: run.result.outcome === "pass" ? "success" : "warning",
 				summary,
 				lines,
-				data: resultData({ payload: run.result, historyNote: strategyHistoryNote(store, run), touch: { marketId: run.marketId, action: "strategy", conclusion: summary, ids: [run.id, run.snapshotId] } }),
+				data: resultData({ payload: run.result, historyNote: strategyHistoryNote(store, run), gapNote: gapNoteFor(store, run.marketId), touch: { marketId: run.marketId, action: "strategy", conclusion: summary, ids: [run.id, run.snapshotId] } }),
 			}));
 		},
 		renderCall: renderCallLabel("compass_strategy_run"),
@@ -722,7 +834,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			actor: Type.Optional(Type.String()),
 		}),
 		async execute(_id, params, _signal, _update, ctx) {
-			const { result: record } = await mutateStore(ctx, (store) => recordRisk(store, {
+			const { result: record, store: riskStore } = await mutateStore(ctx, (store) => recordRisk(store, {
 				marketRef: params.market_ref,
 				certStatus: params.cert_status,
 				ipRiskLevel: params.ip_risk_level,
@@ -734,7 +846,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 				actor: actorName(params.actor),
 			}));
 			const summary = `总体=${record.overall} · 认证=${record.certStatus} · IP=${record.ipRiskLevel} · 季节=${record.seasonFlag} · 政策=${record.policyFlag} · 物流=${record.logisticsRisk}`;
-			return textResult(`${summary}\nrisk_id=${record.id}\nevidence=${record.evidence.map((item) => item.url ?? item.title ?? item.category).join("；") || "无；不可判定为已完成官方核验"}`, details({ title: "风险核查已留痕", status: record.overall === "pass" ? "success" : "warning", summary, lines: record.evidence.map((item) => `${item.category}: ${item.url ?? item.note ?? "无链接"}`) }));
+			return textResult(`${summary}\nrisk_id=${record.id}\nevidence=${record.evidence.map((item) => item.url ?? item.title ?? item.category).join("；") || "无；不可判定为已完成官方核验"}`, details({ title: "风险核查已留痕", status: record.overall === "pass" ? "success" : "warning", summary, lines: record.evidence.map((item) => `${item.category}: ${item.url ?? item.note ?? "无链接"}`), data: resultData({ gapNote: gapNoteFor(riskStore, record.marketId, record.candidateId) }) }));
 		},
 		renderCall: renderCallLabel("compass_risk_check"),
 		renderResult: renderCompassResult,
@@ -763,7 +875,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			actor: Type.Optional(Type.String()),
 		}),
 		async execute(_id, params, _signal, _update, ctx) {
-			const { result: analysis } = await mutateStore(ctx, (store) => recordReviewAnalysis(store, {
+			const { result: analysis, store: reviewStore } = await mutateStore(ctx, (store) => recordReviewAnalysis(store, {
 				marketRef: params.market_ref,
 				sourceAsins: params.source_asins,
 				reviewCount: params.review_count,
@@ -775,7 +887,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			}));
 			const lines = analysis.themes.sort((a, b) => b.count - a.count).map((theme) => `${theme.name} | ${theme.count} | ${theme.fixability} | ${theme.recommendation ?? "—"}`);
 			const summary = `${analysis.reviewCount} 条评论 · ${analysis.themes.length} 个主题 · 星级差 ${analysis.estimatedRatingGap ?? "缺数据"}`;
-			return textResult([summary, `analysis_id=${analysis.id}`, ...lines].join("\n"), details({ title: "差评分析已留痕", status: "success", summary, lines }));
+			return textResult([summary, `analysis_id=${analysis.id}`, ...lines].join("\n"), details({ title: "差评分析已留痕", status: "success", summary, lines, data: resultData({ gapNote: gapNoteFor(reviewStore, analysis.marketId) }) }));
 		},
 		renderCall: renderCallLabel("compass_reviews_record"),
 		renderResult: renderCompassResult,
@@ -1230,6 +1342,105 @@ export default function compassExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.registerTool({
+		name: "compass_gaps",
+		label: "Compass Gaps",
+		description: [
+			"选品数据缺口清单与补数计划（只读派生，不写库、不花钱、不自动抓取）。",
+			"list（默认）：把策略缺指标、待办、CSV 缺列告警、利润缺 CPC 与假设默认值、风险缺证据链接、差评缺原句、复盘缺实绩汇成一份清单，按成本档分组。",
+			"plan：给某个市场的每条缺口列出候选来源、预计调用次数、预算池可用性与写回入口；人工缺口给通用填空模板。",
+			"缺数据一律按缺数据处理：模板里的 {{占位符}} 没拿到就留空，绝不猜数字或替运营填。",
+		].join("\n"),
+		parameters: Type.Object({
+			action: Type.Optional(StringEnum(["list", "plan"] as const)),
+			market_ref: Type.Optional(Type.String({ description: "market_id 或唯一市场名；plan 必填" })),
+			origin: Type.Optional(StringEnum(GAP_ORIGINS)),
+			tier: Type.Optional(StringEnum(GAP_AUTO_TIERS)),
+			limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
+		}),
+		async execute(_id, params, _signal, _update, ctx) {
+			const action = params.action ?? "list";
+			// 纵深第一层（第二层在 /compass-fill）：受限会话是白名单，只放行只读子命令。
+			// 将来新增的任何 action 默认落在白名单之外——忘了改这里的后果是「功能不可用」，
+			// 而不是「付费动作被静默放过去」
+			if (lanShared && action !== "list" && action !== "plan") {
+				throw new Error(`局域网受限会话只允许 compass_gaps list 与 plan，不允许 ${action}`);
+			}
+			const store = await readStoreFlushingUsage(ctx);
+			const market = params.market_ref ? findMarket(store, params.market_ref) : undefined;
+			const budgets = budgetStatus(store);
+			const all = deriveGaps(store, { todos: todosFor(store), budgets, muted: mutedGaps, marketId: market?.id });
+			const filtered = all.filter((gap) => (!params.origin || gap.origin === params.origin) && (!params.tier || gap.autoTier === params.tier));
+
+			if (action === "plan") {
+				if (!market) throw new Error("compass_gaps action=plan 需要 market_ref（先用 action=list 看有哪些市场）");
+				// 受限会话不加载宿主的内部提示层：hints.json 是 owner 的内部 SOP
+				const hints = lanShared ? {} : await loadGapHints(ctx);
+				const lines: string[] = [];
+				for (const gap of filtered) {
+					const hint = hints[gap.field];
+					lines.push(`${gap.label}（${gap.field} · P${gap.priority} · ${gap.autoTier}）：${gap.reason}`);
+					for (const option of gap.sources) {
+						const calls = option.estimatedCalls ? `预计 ${option.estimatedCalls} 次` : "不计次";
+						const pool = option.tier === "A" ? `${option.available ? "可用" : "不可用"}／${option.limitConfigured ? "已配上限" : "未配可生效上限"}` : "免费";
+						// hints.json 写的是**人工怎么补**（找谁要报价、后台在哪张报表），只覆盖人工那一档。
+						// 按 field 无差别覆盖会把这段内部话术印到「C 档 重导 CSV」和「A 档 sorftime」行下面
+						const scoped = option.tier === "manual" ? hint : undefined;
+						lines.push(`  ${option.tier} 档 ${option.source}（auto=${option.auto} · ${calls} · ${pool} · 写回 ${option.writeBack}）：${scoped?.how ?? option.how}`);
+						const template = scoped?.template ?? option.template;
+						if (template) lines.push(`    模板：${template}`);
+					}
+				}
+				const summary = `${market.name} · ${filtered.length} 条缺口 · ${summarizeGaps(filtered).auto} 条可自动`;
+				const body = [summary, `market=${market.id}`, ...(lines.length ? lines : ["该市场当前没有缺口"])].join("\n");
+				return textResult(body, details({
+					title: "补数计划",
+					status: filtered.length ? "warning" : "success",
+					summary,
+					lines: lines.slice(0, 12),
+					data: resultData({ payload: { marketId: market.id, gaps: filtered } }),
+				}));
+			}
+
+			const limited = filtered.slice(0, params.limit ?? 30);
+			const groups: Array<[string, GapRecord[]]> = [
+				["C 档 · 本地可自动补", limited.filter((gap) => gap.autoTier === "C_auto")],
+				["A 档 · 需运营确认（自动补数二期上线）", limited.filter((gap) => gap.autoTier === "A_confirm")],
+				["人工", limited.filter((gap) => gap.autoTier === "manual")],
+			];
+			const lines: string[] = [];
+			for (const [title, items] of groups) {
+				if (!items.length) continue;
+				lines.push(`【${title}】`);
+				for (const gap of items) {
+					const muted = gap.mutedUntil ? `（静音至 ${gap.mutedUntil.slice(0, 10)}）` : "";
+					lines.push(`P${gap.priority} ${gap.marketName} · ${gap.label}${muted} · ${gap.id}`);
+					lines.push(`  ${gap.reason}`);
+					lines.push(`  → ${gapActionLine(gap)}`);
+				}
+			}
+			const counts = summarizeGaps(filtered);
+			const hidden = filtered.length - limited.length;
+			if (hidden > 0) lines.push(`（另有 ${hidden} 条未展开：加 market_ref= / origin= / tier= 缩小范围，或调大 limit）`);
+			// summarizeGaps 只数未静音的，而正文照旧把静音条目列出来（这是 list 的定位）。
+			// 静音数必须一并说出来，否则会出现「0 条缺口」下面跟着三行条目的自相矛盾
+			const mutedCount = filtered.length - counts.total;
+			const mutedPart = mutedCount > 0 ? ` · 静音 ${mutedCount}` : "";
+			const summary = filtered.length
+				? `${counts.total} 条缺口 · 可自动 ${counts.auto} · 需确认 ${counts.confirm} · 人工 ${counts.manual}${mutedPart}`
+				: "当前没有待补的数据缺口";
+			return textResult([summary, ...(lines.length ? lines : ["没有缺口"])].join("\n"), details({
+				title: "补数缺口",
+				status: counts.total ? "warning" : "success",
+				summary,
+				lines: lines.slice(0, 12),
+				data: resultData({ payload: { gaps: filtered } }),
+			}));
+		},
+		renderCall: renderCallLabel("compass_gaps"),
+		renderResult: renderCompassResult,
+	});
+
+	pi.registerTool({
 		name: "compass_tools",
 		label: "Compass Tools",
 		description: "搜索并启用罗盘 Amazon US 精铺选品工具。先描述任务（如 CSV导入、利润测算、风险核查、候选池、报告），工具会动态加载相关能力。",
@@ -1287,7 +1498,8 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			// 打开工作台前先把未落盘计量落账，保证预算/待办页数字新鲜（安全点之一）
 			const store = await readStoreFlushingUsage(ctx);
 			if (ctx.mode !== "tui") {
-				ctx.ui.notify(compactDashboardSummary(store), "info");
+				// 与 refreshStatus 传同一组 options：不然 /compass-fill off 与静音在这条通知里失效
+				ctx.ui.notify(compactDashboardSummary(store, { todos: todosFor(store), mutedGaps, gapsEnabled: fillMode !== "off" }), "info");
 				return;
 			}
 			await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
@@ -1417,6 +1629,105 @@ export default function compassExtension(pi: ExtensionAPI): void {
 		},
 	});
 
+	// 补数档位与静音。命令 handler 不是热路径 hook，是唯一允许落盘档位的安全点；
+	// 位置必须在所有 pi.on(...) 之前——static-invariants 按「行首一个 tab 的 pi.on」切片，
+	// 夹在两个 hook 之间的写事务标记会被判成「热路径 hook 出现写事务」
+	pi.registerCommand("compass-fill", {
+		description: lanShared
+			? "罗盘补数：局域网受限会话固定 off，不可调度"
+			: "罗盘补数档位：/compass-fill status|guided|strict|off|mute <gap_id或market_ref> [天数]|unmute <gap_id或all>",
+		handler: async (args, ctx) => {
+			const notify = (text: string, level: "info" | "warning" = "info") => {
+				if (ctx.hasUI) ctx.ui.notify(text, level);
+			};
+			// 纵深第二层（第一层在 compass_gaps 的 execute）：受限会话连 status 都不去读状态文件，
+			// 那是 owner 的偏好；单一注册点、只在 handler 首行分叉——不注册会让裸命令变成送给 LLM 的文本
+			if (lanShared) {
+				notify("罗盘补数：局域网受限会话固定 off，改档请在 owner 会话执行", "warning");
+				return;
+			}
+			const [verb = "status", ...rest] = args.trim().split(/\s+/u).filter(Boolean);
+			const action = verb.toLocaleLowerCase();
+			const repo = repository(ctx);
+			const persist = async () => {
+				mutedGaps = pruneMutedGaps(mutedGaps);
+				const backupExisting = gapfillStateUnreadable;
+				await withFileMutationQueue(repo.gapfillStatePath, () => repo.writeGapfillState({ version: 1, mode: fillMode, mutedGaps }, { backupExisting }));
+				// 备份只需一次：写完之后文件已经是本会话认得的形状
+				gapfillStateUnreadable = false;
+				// 档位与静音直接改变状态栏的缺口段，改完立刻刷新，别等下一次写事务
+				try {
+					refreshStatus(ctx, await readStore(ctx));
+				} catch {
+					// 状态栏是装饰视图，刷不动不影响设置已经落盘
+				}
+			};
+
+			if (action === "status") {
+				const muted = mutedGaps.length ? `静音 ${mutedGaps.length} 条` : "无静音";
+				const strictHint = fillMode === "strict" ? "；strict 的调用拦截二期生效，本期与 guided 表现相同" : "";
+				notify(`罗盘补数：${fillMode} · ${muted}${strictHint}`, "info");
+				return;
+			}
+			if ((GAPFILL_MODES as readonly string[]).includes(action)) {
+				fillMode = action as GapfillMode;
+				await persist();
+				const strictHint = fillMode === "strict" ? "（strict 的调用拦截二期生效，本期与 guided 表现相同）" : "";
+				notify(`罗盘补数档位：${fillMode}${strictHint}`, "info");
+				return;
+			}
+			if (action === "mute") {
+				const target = rest[0];
+				if (!target) throw new Error("用法：/compass-fill mute <gap_id或market_ref> [天数]");
+				const days = rest[1] ? Number.parseInt(rest[1], 10) : 7;
+				if (!Number.isFinite(days) || days <= 0 || days > 365) throw new Error("静音天数必须是 1–365 的整数");
+				// 缺口的匹配键是 gap_id 或 **market_id**，而运营照文档写的是市场名。
+				// 这里当场解析一次：解析不出来就报错，绝不把一条永远匹配不上的记录静默写进文件
+				const store = await readStore(ctx);
+				let id = target;
+				let label = target;
+				if (target.startsWith("gap_")) {
+					const known = deriveGaps(store, { todos: todosFor(store), budgets: budgetStatus(store) }).some((gap) => gap.id === target);
+					if (!known) throw new Error(`没有找到缺口 ${target}；用 compass_gaps list 看当前的 gap_id（缺口消失后不需要静音）`);
+				} else {
+					const market = findMarket(store, target);
+					id = market.id;
+					label = `${market.name}（整个市场）`;
+				}
+				const until = new Date(Date.now() + days * 86_400_000).toISOString();
+				mutedGaps = [...mutedGaps.filter((item) => item.id !== id), { id, until }];
+				await persist();
+				notify(`已静音 ${label} 至 ${until.slice(0, 10)}：尾注与状态栏不再提示，compass_gaps list 仍可见`, "info");
+				return;
+			}
+			if (action === "unmute") {
+				const target = rest[0];
+				if (!target) throw new Error("用法：/compass-fill unmute <gap_id或market_ref或all>");
+				if (target === "all") {
+					mutedGaps = [];
+					await persist();
+					notify("已清空全部静音", "info");
+					return;
+				}
+				// 与 mute 对称：运营多半用当初静音时输入的那个词（常常是市场名）来取消
+				let id = target;
+				if (!mutedGaps.some((item) => item.id === target) && !target.startsWith("gap_")) {
+					try {
+						id = findMarket(await readStore(ctx), target).id;
+					} catch {
+						// 解析不出就按原样匹配，下面的「没有静音记录」提示会说清楚
+					}
+				}
+				if (!mutedGaps.some((item) => item.id === id)) throw new Error(`${target} 当前没有静音记录；/compass-fill status 看现有静音`);
+				mutedGaps = mutedGaps.filter((item) => item.id !== id);
+				await persist();
+				notify(`已取消静音 ${target}`, "info");
+				return;
+			}
+			throw new Error("用法：/compass-fill status|guided|strict|off|mute <gap_id或market_ref> [天数]|unmute <gap_id或all>");
+		},
+	});
+
 	pi.registerCommand("compass-retro", {
 		description: "交互式复盘会：到期列表 → 对照/实绩 → 报告 → 经验卡",
 		handler: async (_args, ctx) => {
@@ -1505,7 +1816,15 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			const market = matches.find((item) => !briefedMarkets.has(item.id));
 			const key = market?.id ?? "$general";
 			if (briefedMarkets.has(key)) return;
-			const content = renderHistoryBrief(store, { marketId: market?.id, queryKeywords: terms.filter((term) => term.length >= 2), dueCount: listRetroDue(store).length });
+			// 缺口行只对「命中了具体市场」的那一支算，且靠 briefedMarkets 去重后每市场每会话至多一次；
+			// 泛化那一支（$general）不算——避免每轮 prompt 都做一次全量待办推导
+			let gapSummary: { total: number; auto: number; confirm: number; manual: number } | undefined;
+			if (market && fillMode !== "off") {
+				const gaps = deriveGaps(store, { todos: todosFor(store), budgets: budgetStatus(store), muted: mutedGaps, marketId: market.id });
+				const counts = summarizeGaps(gaps);
+				if (counts.total > 0) gapSummary = counts;
+			}
+			const content = renderHistoryBrief(store, { marketId: market?.id, queryKeywords: terms.filter((term) => term.length >= 2), dueCount: listRetroDue(store).length, gapSummary });
 			if (content.split("\n").length < 2) return;
 			briefedMarkets.add(key);
 			return { message: { customType: "compass-history-brief", content, display: true, details: { marketId: market?.id } } };
@@ -1531,16 +1850,32 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			if (!value || value.kind !== TOOL_DETAILS_KIND) return;
 			const data = value.data as CompassResultData | undefined;
 			rememberTouch(data?.touch);
-			if (!historyBriefEnabled || event.toolName === "compass_market_report" || !data?.historyNote?.length || event.isError) return;
-			const note = capHistoryLines(data.historyNote, 7, 650);
-			if (!note.length) return;
+			if (event.toolName === "compass_market_report" || event.isError) return;
+			// 两个开关互不遮蔽：历史对照归 /compass-history-brief，补数缺口归 /compass-fill。
+			// data 不一定是 CompassResultData（compass_market_scan 传的是裸数组），一律走可选链
+			const rawGap = fillMode === "off" ? [] : (data?.gapNote ?? []);
+			const rawHistory = historyBriefEnabled ? (data?.historyNote ?? []) : [];
+			if (!rawGap.length && !rawHistory.length) return;
+			// 缺口行排前，先切 5 行 / 400 字；剩余额度再给历史对照。
+			// 两段共用同一个 7 行 / 650 字的硬预算（compass/CLAUDE.md 展示预算段）
+			const gapNote = capHistoryLines(rawGap, 5, 400);
+			const gapChars = gapNote.reduce((sum, line) => sum + line.length + 1, 0);
+			const note = capHistoryLines(rawHistory, Math.max(0, 7 - gapNote.length), Math.max(0, 650 - gapChars));
+			if (!gapNote.length && !note.length) return;
 			const content = [...event.content];
 			const textIndex = content.findIndex((item) => item.type === "text");
 			if (textIndex < 0) return;
 			const text = content[textIndex];
 			if (text.type !== "text") return;
-			content[textIndex] = { ...text, text: `${text.text}\n\n【历史对照】\n${note.map((line) => `· ${line}`).join("\n")}` };
-			return { content, details: { ...value, lines: [...(value.lines ?? []), "【历史对照】", ...note] } };
+			const sections: string[] = [];
+			if (gapNote.length) sections.push(`【补数缺口】\n${gapNote.map((line) => `· ${line}`).join("\n")}`);
+			if (note.length) sections.push(`【历史对照】\n${note.map((line) => `· ${line}`).join("\n")}`);
+			content[textIndex] = { ...text, text: `${text.text}\n\n${sections.join("\n\n")}` };
+			const appended = [
+				...(gapNote.length ? ["【补数缺口】", ...gapNote] : []),
+				...(note.length ? ["【历史对照】", ...note] : []),
+			];
+			return { content, details: { ...value, lines: [...(value.lines ?? []), ...appended] } };
 		} catch {
 			return;
 		}
@@ -1608,7 +1943,20 @@ export default function compassExtension(pi: ExtensionAPI): void {
 		briefedMarkets.clear();
 		sessionLedger.length = 0;
 		dueNotified = false;
+		seenGapFingerprints.clear();
 		const repo = repository(ctx);
+		// 补数档位与静音：纯读、无锁，放在下面的写事务之外；受限会话固定 off 且不读文件
+		fillMode = lanShared ? "off" : "guided";
+		mutedGaps = [];
+		gapfillStateUnreadable = false;
+		// 整段自带 try：`gapfillStatePath` 的 getter 在路径被换成指向 dataDir 之外的符号链接时会抛，
+		// 抛出去就会顶掉 session_start——一个纯展示开关绝不能拦住会话启动（store.ts 那条注释的原意）
+		try {
+			await restoreGapfillState(ctx, repo);
+		} catch (error) {
+			gapfillStateUnreadable = true;
+			if (ctx.hasUI) ctx.ui.notify(`罗盘补数设置读取失败，本会话按默认 guided：${error instanceof Error ? error.message : String(error)}`, "warning");
+		}
 		try {
 			await withFileMutationQueue(repo.storePath, async () => {
 				const { store } = await repo.update(

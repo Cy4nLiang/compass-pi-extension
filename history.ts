@@ -848,7 +848,9 @@ export function capHistoryLines(lines: string[], maxLines: number, maxChars: num
 
 export function renderHistoryBrief(
 	store: CompassStore,
-	input: { marketId?: string; queryKeywords?: string[]; dueCount?: number },
+	// gapSummary 由调用方派生后传进来：history.ts 只吃 store + 入参，不 import gaps.ts，
+	// 也不把「全量待办推导」的成本压进每轮 prompt 都跑的 before_agent_start
+	input: { marketId?: string; queryKeywords?: string[]; dueCount?: number; gapSummary?: { total: number; auto: number; confirm: number; manual: number } },
 ): string {
 	const lines = ["【罗盘历史速览】（自动注入，证据以快照为准）"];
 	const market = input.marketId ? store.markets.find((item) => item.id === input.marketId) : undefined;
@@ -871,6 +873,8 @@ export function renderHistoryBrief(
 	}
 	const dueCount = input.dueCount ?? dueRetroItems(store).length;
 	if (dueCount > 0) lines.push(`· 待复盘：${dueCount} 个候选逾期 → compass_retro action=due`);
+	const gaps = input.gapSummary;
+	if (gaps && gaps.total > 0) lines.push(`· 补数缺口 ${gaps.total}：可自动 ${gaps.auto} / 需确认 ${gaps.confirm} / 人工 ${gaps.manual} → compass_gaps list`);
 	if (market) lines.push(`详情：compass_history action=timeline market_ref=${market.id}；本摘要不替代快照证据。`);
 	else lines.push("详情：compass_history action=similar；本摘要不替代快照证据。");
 	return capHistoryLines(lines, 12, 1_200).join("\n");

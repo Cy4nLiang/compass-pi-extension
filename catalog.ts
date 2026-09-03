@@ -18,6 +18,7 @@ export const DOMAIN_TOOLS = [
 	"compass_asin_history",
 	"compass_keyword_metrics",
 	"compass_data_route",
+	"compass_gaps",
 	"compass_history",
 	"compass_retro",
 ] as const;
@@ -49,6 +50,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
 	{ name: "compass_asin_history", keywords: "asin history bsr price 历史 价格 评论", description: "读取同一 ASIN 跨快照历史" },
 	{ name: "compass_keyword_metrics", keywords: "keyword search volume cpc 关键词 搜索量", description: "读取关键词跨快照指标" },
 	{ name: "compass_data_route", keywords: "route source freshness cost 数据 路由 新鲜度 补数", description: "按阶段、字段、新鲜度和预算规划数据源" },
+	{ name: "compass_gaps", keywords: "gap fill missing 缺口 缺数据 补数 缺失 字段 计划 清单 引导 数据", description: "汇总选品数据缺口并给出按成本档分组的补数计划" },
 	{ name: "compass_history", keywords: "history retro 历史 复盘 相似 经验 教训 回看 验证 timeline outcome lesson", description: "统一查询时间线、决策检索、相似市场、复盘台账与经验卡" },
 	{ name: "compass_retro", keywords: "retro outcome actuals backtest lesson 复盘 实绩 回测 经验 验证 错杀", description: "执行到期复盘、快照对照、实绩录入、策略回测与经验管理" },
 ];

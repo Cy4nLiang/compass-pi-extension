@@ -139,6 +139,26 @@ test("接线四：compactDashboardSummary 保留「待办」计数（含 P1 与�
 	);
 });
 
+test("接线五：compactDashboardSummary 保留补数缺口计数", async () => {
+	const summaryBody = await readUiSource().then((source) => exportedFunctionBody(source, "compactDashboardSummary"));
+	assert.ok(
+		/deriveGaps\(store, \{ todos, budgets, muted: options\.mutedGaps \}\)/u.test(summaryBody),
+		"compactDashboardSummary 不再派生补数缺口，或没有复用已算好的 todos / budgets（会多算一遍并可能触发快照明细同步读）",
+	);
+	assert.ok(
+		/缺口 \$\{gaps\.total\}（可自动 \$\{gaps\.auto\}）/u.test(summaryBody),
+		"状态栏不再显示「缺口 n（可自动 a）」：缺口在写事务后的唯一常显位没了",
+	);
+	assert.ok(
+		/options\.gapsEnabled !== false/u.test(summaryBody),
+		"缺口段不再受 /compass-fill off 控制：运营关不掉这条提示",
+	);
+	assert.ok(
+		/catch \{\n\t\t\tgapPart = "";\n\t\t\}/u.test(summaryBody),
+		"缺口派生没有兜住异常：状态栏是装饰视图，派生失败绝不能把已提交的写事务上抛成失败",
+	);
+});
+
 test("反向哨兵：三个切片器对 ui.ts 现有结构仍然有效", async () => {
 	// 上面几条用例都建立在切片器能正确定位的前提上；切片一旦错位或失效，这条先红
 	const source = await readUiSource();

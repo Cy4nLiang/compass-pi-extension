@@ -44,7 +44,8 @@ export interface DeriveTodosInput {
 	now?: string;
 }
 
-const BASE_PRIORITY: Record<TodoKind, TodoPriority> = {
+// 优先级映射的唯一所有者。gaps.ts 也引用它，避免缺口与待办两处口径漂移
+export const BASE_PRIORITY: Record<TodoKind, TodoPriority> = {
 	budget_fused: 1,
 	retro_challenged: 1,
 	gate_review: 2,
@@ -60,7 +61,7 @@ const BASE_PRIORITY: Record<TodoKind, TodoPriority> = {
 // 深研阶段必须齐备的硬指标（与 compass_data_route 的 deep_research 字段口径一致）
 export const DEEP_RESEARCH_REQUIRED_FIELDS = ["main_cpc", "gross_margin", "cpc_ratio", "waist_rating_median"] as const;
 
-const FIELD_LABELS: Record<string, string> = {
+export const FIELD_LABELS: Record<string, string> = {
 	main_cpc: "主词CPC",
 	gross_margin: "毛利率",
 	cpc_ratio: "CPC承受度",

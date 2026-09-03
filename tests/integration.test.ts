@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, mkdir, symlink, writeFile, utimes } from "node:fs/promises";
+import { mkdtemp, readFile, rm, mkdir, stat, symlink, writeFile, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -1802,4 +1802,35 @@ test("a fallback baseline whose veto already passed at decision time cannot be r
 	assert.equal(t2.outcomeCheck?.baselineRunId, t0.screenRun?.id);
 	assert.equal(t2.outcomeCheck?.verdict, "inconclusive");
 	assert.match(t2.outcomeCheck?.verdictReason ?? "", /基线否决前提在决策当下已经转 pass/);
+});
+
+test("补数状态文件：不存在静默、坏内容要说出来，覆盖前先留备份", async () => {
+	const root = await mkdtemp(join(tmpdir(), "compass-gapfill-state-"));
+	try {
+		const repo = new CompassRepository(root);
+
+		// 第一次使用：文件不存在是常态，静默回默认
+		assert.deepEqual(await repo.readGapfillState(), {});
+
+		await repo.writeGapfillState({ version: 1, mode: "strict", mutedGaps: [{ id: "gap_demo", until: "2099-01-01T00:00:00.000Z" }] });
+		const saved = await repo.readGapfillState();
+		assert.equal((saved.value as { mode?: string }).mode, "strict");
+		assert.equal(saved.error, undefined);
+		const mode = await stat(repo.gapfillStatePath);
+		assert.equal(mode.mode & 0o777, 0o600, "状态文件必须是 0600");
+
+		// 运营手改坏了（.jsonc 就是给人看的）：必须报出来，不能静默把档位与静音清单退回默认
+		await writeFile(repo.gapfillStatePath, '{ "version": 1, "mode": "strict", }\n', "utf8");
+		const broken = await repo.readGapfillState();
+		assert.equal(broken.value, undefined);
+		assert.match(broken.error ?? "", /解析失败/u, "解析失败必须与「文件不存在」区分开");
+
+		// 之后的第一次写会整份覆盖：先留一份 .bak，别把还认得出的旧内容永久销毁
+		await repo.writeGapfillState({ version: 1, mode: "guided", mutedGaps: [] }, { backupExisting: true });
+		const backup = await readFile(`${repo.gapfillStatePath}.bak`, "utf8");
+		assert.match(backup, /"mode": "strict"/u, "备份里应保留运营手改前的内容");
+		assert.equal((await repo.readGapfillState()).error, undefined, "覆盖后的新文件必须能正常解析");
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
 });

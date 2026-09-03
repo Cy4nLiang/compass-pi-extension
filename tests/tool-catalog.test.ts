@@ -25,6 +25,7 @@ const GOLDEN: Array<{ query: string; expected: DomainToolName }> = [
 	{ query: "这个ASIN的历史价格走势", expected: "compass_asin_history" },
 	{ query: "关键词搜索量趋势", expected: "compass_keyword_metrics" },
 	{ query: "数据新鲜度不够要补数", expected: "compass_data_route" },
+	{ query: "缺口清单", expected: "compass_gaps" },
 	{ query: "相似市场的经验教训", expected: "compass_history" },
 	{ query: "执行到期复盘录实绩", expected: "compass_retro" },
 ];

@@ -100,7 +100,7 @@ test("DOMAIN_TOOLS 与 TOOL_CATALOG 逐条对齐", async () => {
 	const source = await readFile(join(repoRoot, "catalog.ts"), "utf8");
 	const domain = domainToolsFromSource(source);
 	const catalog = catalogToolsFromSource(source);
-	assert.equal(domain.length, 17, `DOMAIN_TOOLS 现在是 ${domain.length} 条；增删工具时请同步本用例与 README 工具表`);
+	assert.equal(domain.length, 18, `DOMAIN_TOOLS 现在是 ${domain.length} 条；增删工具时请同步本用例与 README 工具表`);
 	assert.equal(new Set(domain).size, domain.length, "DOMAIN_TOOLS 有重复项");
 	assert.equal(new Set(catalog).size, catalog.length, "TOOL_CATALOG 有重复的 name");
 	// tsc 只约束 CATALOG→DOMAIN 方向（name 的类型是 DOMAIN_TOOLS[number]），
@@ -123,4 +123,79 @@ test("README 工具表覆盖全部对外工具", async () => {
 	for (const name of documented) {
 		assert.ok(expected.has(name), `README 工具表列出了不存在的工具 ${name}（改名/下线后文档漂移）`);
 	}
+});
+
+// 五个写工具的 execute：按「name: "<tool>"」切到下一个 registerTool 块为止。
+// 用位置断言而不是 grep 计数——计数是「可以被悄悄删掉一处而不报警的量」
+const GAP_NOTE_WRITE_TOOLS = [
+	"compass_import_csv",
+	"compass_strategy_run",
+	"compass_profit_estimate",
+	"compass_risk_check",
+	"compass_reviews_record",
+] as const;
+
+function toolBody(source: string, name: string): string {
+	const start = source.indexOf(`name: "${name}"`);
+	assert.notEqual(start, -1, `index.ts 里找不到工具 ${name} 的注册块——切片器已失效`);
+	const next = source.indexOf("pi.registerTool({", start);
+	return source.slice(start, next === -1 ? source.length : next);
+}
+
+test("五个写工具的 execute 都产出 gapNote", async () => {
+	const source = await readFile(join(repoRoot, "index.ts"), "utf8");
+	for (const name of GAP_NOTE_WRITE_TOOLS) {
+		assert.match(toolBody(source, name), /gapNote/u, `写工具 ${name} 的收口没有产出 gapNote：缺口尾注会在这条链路上静默消失`);
+	}
+	// compass_market_scan 一次触碰全部市场，逐市场追加会立刻撞满尾注预算：明确不挂
+	assert.doesNotMatch(toolBody(source, "compass_market_scan"), /gapNote/u, "compass_market_scan 不该挂 gapNote（批量视图走 compass_gaps list）");
+});
+
+// 缺口的匹配键只有 gap_id 与 market_id，而四份运营文档写的都是「gap_id 或 市场名」。
+// 不在命令里把市场名解析成 id，就会写进一条永远匹配不上的记录，回执却报「已静音」。
+test("/compass-fill mute 把 market_ref 解析成 market_id 后再存", async () => {
+	const source = await readFile(join(repoRoot, "index.ts"), "utf8");
+	const commandStart = source.indexOf('pi.registerCommand("compass-fill"');
+	assert.notEqual(commandStart, -1, "找不到 /compass-fill 的注册块");
+	const commandBody = source.slice(commandStart, source.indexOf("pi.registerCommand(", commandStart + 10));
+	const muteStart = commandBody.indexOf('if (action === "mute")');
+	assert.notEqual(muteStart, -1, "找不到 mute 分支");
+	const muteBody = commandBody.slice(muteStart, commandBody.indexOf('if (action === "unmute")'));
+	assert.match(muteBody, /findMarket\(store, target\)/u, "mute 必须把市场名解析成 market_id，否则静音是静默 no-op");
+	assert.match(muteBody, /gap\.id === target/u, "gap_id 也要校验存在，不然同样是静默 no-op");
+	// 过期条目不写回文件：否则 state.jsonc 会越积越大
+	assert.match(commandBody, /mutedGaps = pruneMutedGaps\(mutedGaps\);/u, "persist 前要剪掉过期静音");
+	assert.match(commandBody, /refreshStatus\(ctx, await readStore\(ctx\)\)/u, "改完档位/静音要立刻刷状态栏，别等下一次写事务");
+});
+
+// refreshStatus 与 /compass 的非 TUI 分支必须传同一组 options，
+// 否则 /compass-fill off 与静音在其中一条通路上失效，两处口径打架
+test("状态栏与 /compass 通知用同一组缺口 options", async () => {
+	const source = await readFile(join(repoRoot, "index.ts"), "utf8");
+	// 按行抓：调用里嵌着 todosFor(store)，用 [^)]* 会在内层括号就截断
+	const calls = source.split("\n").filter((line) => line.includes("compactDashboardSummary("));
+	assert.equal(calls.length, 2, `compactDashboardSummary 的调用点应恰好两处（refreshStatus 与 /compass 非 TUI 分支），实得 ${calls.length}`);
+	const bare = calls.filter((call) => !call.includes("mutedGaps") || !call.includes("gapsEnabled"));
+	assert.deepEqual(bare, [], `这些调用没传缺口 options，会绕过 /compass-fill off 与静音：${bare.map((line) => line.trim()).join(" / ")}`);
+});
+
+test("compass_gaps 与 compass-fill 各自按 PI_LAN_SHARED 二次判定", async () => {
+	const source = await readFile(join(repoRoot, "index.ts"), "utf8");
+	// 纵深两层：工具与命令都不依赖工作区 guard 的单层拦截。
+	// 断言必须钉到「真的会拦」的那个分支上——只搜 lanShared 会被 description 里的三元表达式满足
+	assert.match(
+		toolBody(source, "compass_gaps"),
+		/if \(lanShared && action !== "list" && action !== "plan"\)/u,
+		"compass_gaps 的 execute 必须自己判一次受限模式，且是白名单（只放行 list/plan）",
+	);
+	const commandStart = source.indexOf('pi.registerCommand("compass-fill"');
+	assert.notEqual(commandStart, -1, "找不到 /compass-fill 的注册块");
+	const commandBody = source.slice(commandStart, source.indexOf("pi.registerCommand(", commandStart + 10));
+	const handlerBody = commandBody.slice(commandBody.indexOf("handler:"));
+	assert.match(handlerBody, /if \(lanShared\) \{/u, "/compass-fill 的 handler 必须自锁：扩展命令不经 guard，光在 description 里写不算");
+	assert.match(handlerBody, /局域网受限会话固定 off/u, "受限分支必须给出明确回执");
+	assert.match(source, /const lanShared = process\.env\.PI_LAN_SHARED === "1";/u, "受限判据必须与 guard 同源");
+	// 命令 handler 会落盘档位，必须注册在所有 pi.on 之前——否则会被 hookBodies 切进某个热路径 hook
+	const firstHook = source.search(/^\tpi\.on\("/mu);
+	assert.ok(commandStart < firstHook, "/compass-fill 必须注册在所有 pi.on(...) 之前（它的 handler 带写事务标记）");
 });

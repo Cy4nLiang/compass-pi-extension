@@ -63,6 +63,7 @@ Agent 会先调用 `compass_tools`，按需动态激活相关工具。
 | `compass_asin_history` | 本地 ASIN 跨快照历史 |
 | `compass_keyword_metrics` | 本地关键词搜索量/CPC 历史 |
 | `compass_data_route` | 按字段 × 新鲜度 × 阶段 × 预算生成补数计划 |
+| `compass_gaps` | 汇总数据缺口并按成本档给出补数计划（只读，不花钱） |
 | `compass_history` | 时间线、决策检索、相似市场、OutcomeCheck 统计与经验卡 |
 | `compass_retro` | 到期复盘、快照对照、实绩录入、复盘报告、策略回测与 Lesson 管理 |
 
@@ -78,6 +79,7 @@ Agent 会先调用 `compass_tools`，按需动态激活相关工具。
 - `/compass-strategy [策略 id|名称|id@vN]`：编辑 YAML 并保存新版本（写 `@vN` 可基于历史版本改，保存仍是追加新版本）
 - `/compass-retro`：交互式复盘会（到期项 → 对照/实绩 → 报告 → Lesson）
 - `/compass-history-brief on|off`：切换本会话自动历史速览与工具尾注
+- `/compass-fill status|guided|strict|off|mute <gap_id或market_ref> [天数]|unmute <gap_id或all>`：补数缺口提示的档位与静音（跨会话保留）
 
 ## Web 工作台
 
@@ -117,6 +119,7 @@ cd .pi/extensions/compass && COMPASS_ROOT=../../.. npm run web
 ├── store.json       # 0600，策略、指标、决策日志、OutcomeCheck、Lesson 与快照元数据
 ├── raw/             # 原始 CSV 不可变归档
 ├── snapshots/       # 每个快照的 listing/keyword 数据文件（按需回放）
+├── gapfill/         # 0600，补数档位与静音清单（state.jsonc）
 └── reports/         # Markdown 选品报告
 ```
 

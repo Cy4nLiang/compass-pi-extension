@@ -1487,6 +1487,10 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			if (action === "approve") {
 				// 门禁顺序是刻意的：能不能应答 → 是不是能弹窗的前端 → 映射表能不能用 → 池子允不允许
 				// → 最后才弹窗。倒过来先弹窗再查这些，运营会做完选择才被告知「其实做不了」。
+				//
+				// 注意这个顺序只覆盖**本分支内部**：`findMarket` 在 execute 顶部、所有 action 分支
+				// 之前就跑了，所以 market_ref 写错时先报的是「未找到市场」而不是 mode 拒绝。
+				// 那不是 bug（假 ref 本来就该报错），但别把 mode 当成第一道门。
 				if (!ctx.hasUI) throw new Error("compass_gaps action=approve 要当面确认，而当前会话没有 UI（print / json 模式）。请在 pi 的 TUI 里执行。");
 				if (ctx.mode !== "tui") throw new Error(`compass_gaps action=approve 只在 TUI 会话里放行（当前 mode=${ctx.mode}）：花钱的动作要运营本人在终端上按下确认。`);
 				if (!market) throw new Error("compass_gaps action=approve 需要 market_ref（先用 action=plan 看这个市场缺什么）");
@@ -1504,8 +1508,14 @@ export default function compassExtension(pi: ExtensionAPI): void {
 					// 不说的话运营被指去 plan，而 plan 只在来源行里写一句「未配可生效上限」，
 					// 要在几十行里认出那五个字才行。
 					const unlimited = store.budgetPools.filter((pool) => pool.tier === "A" && pool.enabled && !hasEffectiveLimit(pool)).map((pool) => pool.source);
+					// 命令里给**哪个池名**是这条报错的全部价值：给错了，运营照做一遍缺口照样升不上来，
+					// 还得自己再想一次。所以优先取「这个市场的缺口自己指向的 A 档来源」——缺口层虽然
+					// 把该选项降级成了 manual，`gap.sources` 里那条 A 档记录还在，`option.source` 就是
+					// 该配的那个池。取不到（这个市场压根没有 A 档路由）才回落到第一个没配上限的池。
+					const wanted = [...new Set(filtered.flatMap((gap) => gap.sources.filter((option) => option.tier === "A").map((option) => option.source)))];
+					const target = wanted.find((source) => unlimited.includes(source)) ?? unlimited[0];
 					const why = unlimited.length
-						? `。${unlimited.join(" / ")} 还没有可生效的上限（只配金额上限而单价缺省时自动计量恒为 0，熔断门空转），A 档在这种状态下不会被提供——先配上限：compass_budget configure source=${unlimited[0]} monthly_call_limit=<次数>`
+						? `。${unlimited.join(" / ")} 还没有可生效的上限（只配金额上限而单价缺省时自动计量恒为 0，熔断门空转），A 档在这种状态下不会被提供——先配上限：compass_budget configure source=${target} monthly_call_limit=<次数>`
 						: "";
 					throw new Error(`${market.name} 当前没有需要确认的 A 档缺口${why}；先跑 compass_gaps action=plan market_ref=${market.id} 看还缺什么。`);
 				}

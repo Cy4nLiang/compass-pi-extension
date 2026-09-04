@@ -63,7 +63,7 @@ Agent 会先调用 `compass_tools`，按需动态激活相关工具。
 | `compass_asin_history` | 本地 ASIN 跨快照历史 |
 | `compass_keyword_metrics` | 本地关键词搜索量/CPC 历史 |
 | `compass_data_route` | 按字段 × 新鲜度 × 阶段 × 预算生成补数计划 |
-| `compass_gaps` | 汇总数据缺口并按成本档给出补数计划（只读，不花钱） |
+| `compass_gaps` | 汇总数据缺口并按成本档给出补数计划；`approve` 当面确认后授权付费补数，`convert` 把返回体确定性地转成可导入的 CSV |
 | `compass_history` | 时间线、决策检索、相似市场、OutcomeCheck 统计与经验卡 |
 | `compass_retro` | 到期复盘、快照对照、实绩录入、复盘报告、策略回测与 Lesson 管理 |
 

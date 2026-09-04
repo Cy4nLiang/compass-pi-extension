@@ -637,7 +637,7 @@ test("每一档的动作行都指向自己那档的来源，不拿 sources[0] �
 	assert.doesNotMatch(line, /local_history/u);
 });
 
-test("A 档缺口的尾注不给一期跑不通的命令", () => {
+test("A 档缺口的尾注给出可照做的 approve 命令（带 market_ref）", () => {
 	const store = baseStore();
 	addMarket(store, "mkt_demo_a", "demo a");
 	addCandidate(store, "cand_demo_a", "mkt_demo_a", "deep_research");
@@ -646,11 +646,13 @@ test("A 档缺口的尾注不给一期跑不通的命令", () => {
 	const gaps = derive(store, { budgets: [SORFTIME_CONFIGURED] }).filter((gap) => gap.autoTier === "A_confirm");
 	assert.ok(gaps.length > 0);
 	const note = renderGapNote(gaps, { marketName: "demo a", stage: "deep_research", ttlDays: 7 });
+	// 二期起 A 档给的是可照做的命令。钉的是「命令带上了市场」——只钉 action=approve 的话，
+	// 把 market_ref 丢掉也照样绿，而没有市场的那条命令运营复制过去就报错
 	assert.ok(
-		note.every((line) => !line.includes("compass_gaps approve")),
-		"一期没有 approve，尾注不得指向它",
+		note.some((line) => /compass_gaps action=approve market_ref=\S+/u.test(line)),
+		`A 档尾注要给出带 market_ref 的 approve 命令：\n${note.join("\n")}`,
 	);
-	assert.ok(note.some((line) => line.includes("二期上线")));
+	assert.ok(note.every((line) => !line.includes("二期上线")), "功能已上线，尾注不得再说「二期上线」");
 });
 
 // ── 路由表与公开仓库卫生 ──────────────────────────────────────────────────────

@@ -789,10 +789,11 @@ export function gapActionLine(gap: GapRecord): string {
 		const free = gap.sources.find((option) => option.tier === "C" && option.auto === "yes" && option.available) ?? gap.sources[0];
 		return `C 档：${free?.how ?? "本地可补"}`;
 	}
-	// 一期没有 approve：A 档只如实告知「二期上线」，不给运营一条现在跑不通的命令
+	// A 档给的是**可照做的命令**。approve 会当面弹一次确认，所以这里不必替运营犹豫；
+	// 但也要说清它会花钱，别让人以为和 C 档一样点了就完事
 	if (gap.autoTier === "A_confirm") {
 		const paid = gap.sources.find((option) => option.tier === "A" && option.available && option.limitConfigured);
-		return `A 档 ${paid?.source ?? "sorftime"} 可补（需运营确认，自动补数二期上线）；本期先按 C 档或人工处理`;
+		return `A 档 ${paid?.source ?? "sorftime"} 可补（会花钱）：compass_gaps action=approve market_ref=${gap.marketId} 当面确认后自动补齐`;
 	}
 	const manual = gap.sources.find((option) => option.tier === "manual") ?? gap.sources[0];
 	return manual?.template ? `人工：${manual.template}` : `人工：${manual?.how ?? "按业务口径补齐"}`;

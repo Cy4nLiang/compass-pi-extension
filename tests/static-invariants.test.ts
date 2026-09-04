@@ -76,6 +76,61 @@ test("载荷缓存排在计量之后、另起 try，且热路径零 I/O", async 
 	}
 });
 
+test("补数确认门：hook 不重复注册、compass_gaps 串行、额度预扣在 tool_call", async () => {
+	const source = await readFile(join(repoRoot, "index.ts"), "utf8");
+
+	// ① 每个 hook 名只能注册一次。hookBodies 用 Map.set，同名后者覆盖前者——注册第二个
+	// pi.on("tool_call") 会让上面「热路径零写事务」只检查后一段，前一段的写事务被静默放过
+	const names = [...source.matchAll(HOOK_HEADER)].map((match) => match[1]);
+	assert.equal(names.length, new Set(names).size, `有 hook 被注册了两次：${names.join("、")}。切片器按名字覆盖，重复注册会让热路径断言只检查最后一段`);
+
+	const start = source.indexOf('name: "compass_gaps"');
+	assert.ok(start > 0, "找不到 compass_gaps 的注册块——本用例的切片已失效");
+	const nextTool = source.indexOf("pi.registerTool({", start);
+	const block = nextTool === -1 ? source.slice(start) : source.slice(start, nextTool);
+
+	// ② 弹窗期间别的工具不许跑：uiPromptDepth 是全 runner 共享的计数器，并发弹窗会让
+	// 「弹窗未渲染」的能力检测误判；convert 还会删溢写文件，并发两次会互删对方没读的文件
+	assert.match(block, /^\t\texecutionMode: "sequential",$/mu, "compass_gaps 必须声明 executionMode: sequential");
+
+	// ③ 弹窗必须带 timeout。宿主对工具执行没有任何超时或强制取消（裸 await execute），
+	// 不传 timeout = agent 永久停摆且没有任何兜底。这是硬要求，不是保险
+	const selectAt = block.indexOf("await ctx.ui.select(");
+	assert.ok(selectAt > 0, "approve 里找不到 ctx.ui.select 调用");
+	const selectCall = block.slice(selectAt, block.indexOf(");", selectAt) + 2);
+	assert.match(selectCall, /timeout: 60_000/u, "approve 的弹窗必须带 timeout：宿主没有工具超时兜底，不传就是永久停摆");
+
+	const toolCall = hookBodies(source).get("tool_call");
+	assert.ok(toolCall, 'index.ts 里找不到 pi.on("tool_call")');
+	// ④ 确认门并进那个唯一的 tool_call hook，且排在熔断门**之后**：
+	// 熔断是硬边界，拿着确认单也不该越过
+	const gateAt = toolCall.indexOf("evaluateMcpGate(");
+	const ticketAt = toolCall.indexOf("gapfillTicketGate(");
+	assert.ok(ticketAt > 0, "确认门必须并进 tool_call hook，不要另起一个 pi.on");
+	assert.ok(ticketAt > gateAt, "确认门必须排在熔断门之后：熔断是硬边界，有确认单也不该越过");
+
+	// ⑤ 缩进即嵌套：compass_gaps 不匹配任何池前缀，它的 action 拦截必须在池名预过滤分支
+	// **之外**（3 tab，与 compass_import_csv 那段同级）；确认门则在分支内（4 tab）
+	assert.match(toolCall, /^\t{3}if \(event\.toolName === "compass_gaps" && fillMode === "off"\) \{$/mu, "compass_gaps 的 action 拦截要在池名预过滤分支之外，否则永远进不去");
+	assert.match(toolCall, /^\t{4}const refusal = gapfillTicketGate\(/mu, "确认门在预过滤分支之内");
+
+	// ⑥ 额度预扣必须发生在 tool_call。宿主同一轮是「先把整批调用的 tool_call 判定跑完，
+	// 再 Promise.all 执行」——扣在 tool_result 的话同一批里的调用彼此看不见对方，
+	// 运营批的 3 次挡不住一批 6 个调用
+	const toolResult = hookBodies(source).get("tool_result");
+	assert.ok(toolResult, 'index.ts 里找不到 pi.on("tool_result")');
+	assert.equal(/remainingCalls\s*-=/u.test(toolResult), false, "额度预扣不能留在 tool_result：同一批并行调用会全部放行");
+	assert.match(toolResult, /if \(!sample\.billable\) refundTicketCall\(/u, "只有不计费的失败才退额度：计费的调用钱已经花了");
+
+	const gateStart = source.indexOf("function gapfillTicketGate(");
+	const gateEnd = source.indexOf("function refundTicketCall(");
+	assert.ok(gateStart > 0 && gateEnd > gateStart, "抽不到 gapfillTicketGate 的函数体——本用例的切片已失效");
+	const gateBody = source.slice(gateStart, gateEnd);
+	assert.match(gateBody, /covered\.remainingCalls -= 1;/u, "额度预扣要发生在 tool_call 的门禁函数里");
+	// ⑦ 确认单授权的是运营看到的那条链路，不是「这个池随便调」
+	assert.match(gateBody, /covered\.tools\.includes\(tool\)/u, "确认单要按工具白名单判，不能只看池名");
+});
+
 test("生命周期 hook 仍带写事务——切片失效时这条先红", async () => {
 	// 反向哨兵：若 hookBodies 切出空片段或错位，上一条用例会假绿，而这条会立刻失败
 	const source = await readFile(join(repoRoot, "index.ts"), "utf8");

@@ -1285,7 +1285,9 @@ export function recordMcpUsage(
 	return events;
 }
 
-function mcpCallTargetServers(store: CompassStore, call: { toolName: string; input?: Record<string, unknown> }): string[] {
+// 导出给 index.ts 的 strict 档确认单判定用：与熔断门解析同一个「这次调用打向哪个池」，
+// 两边各写一份迟早分裂成「熔断按 A 池算、确认单按 B 池算」
+export function mcpCallTargetServers(store: CompassStore, call: { toolName: string; input?: Record<string, unknown> }): string[] {
 	// 最长前缀优先，防止短池名抢占长池名的工具（与 pi-mcp-adapter 的 server 解析口径一致）
 	const byLength = [...store.budgetPools].sort((a, b) => b.source.length - a.source.length);
 	for (const pool of byLength) {

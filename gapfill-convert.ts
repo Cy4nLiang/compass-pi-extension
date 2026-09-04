@@ -1,5 +1,6 @@
 import { readFile, rmdir, unlink } from "node:fs/promises";
-import { dirname } from "node:path";
+import { tmpdir } from "node:os";
+import { basename, dirname, resolve } from "node:path";
 import { CSV_ALIAS_HEADERS } from "./csv.ts";
 import type { CompassRepository } from "./store.ts";
 
@@ -19,6 +20,70 @@ export interface SorftimeFieldMap {
 	/** compass 列名（= FIELD_ALIASES 每组首别名） → 载荷里的字段名或点路径 */
 	listing: Record<string, string>;
 	keyword: Record<string, string>;
+	/** 调用链：approve 用它算这批要几次调用、以及 ticket 的工具白名单。缺省表示映射表没声明链路 */
+	chain?: SorftimeChainStep[];
+}
+
+/** 映射表 `chain` 数组里的一步。工具名只在映射表里出现，compass 源码不硬编码第三方工具名。 */
+export interface SorftimeChainStep {
+	step: number;
+	tool: string;
+	required?: string[];
+}
+
+/**
+ * 校验映射表并归一成 SorftimeFieldMap。缺字段一律抛错、**不降级**：
+ * 映射表不全时转出来的 CSV 会静默缺列，而 parseMarketCsv 对缺列零告警（E0 负向对照实测），
+ * 事后没人能从结果反推出「是映射表坏了」。
+ *
+ * 列名合法性也在这里查（headerFor 会抛）——approve 在花掉 3 次真实调用**之前**先跑一遍，
+ * 免得钱花完了才在写文件那一步发现映射表里有个列名 csv.ts 不认识。
+ */
+export function parseSorftimeFieldMap(raw: unknown): SorftimeFieldMap {
+	const asRecord = (value: unknown, what: string): Record<string, unknown> => {
+		if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${what} 必须是对象`);
+		return value as Record<string, unknown>;
+	};
+	const asPathMap = (value: unknown, what: string): Record<string, string> => {
+		const out: Record<string, string> = {};
+		for (const [key, item] of Object.entries(asRecord(value, what))) {
+			if (typeof item !== "string" || !item) throw new Error(`${what}.${key} 必须是非空字符串（点路径）`);
+			out[key] = item;
+		}
+		if (!Object.keys(out).length) throw new Error(`${what} 一列都没有`);
+		return out;
+	};
+
+	const root = asRecord(raw, "映射表");
+	const rows = asRecord(root.rows, "rows");
+	if (typeof rows.listing !== "string" || !rows.listing) throw new Error("rows.listing 必须是非空点路径");
+	if (typeof rows.keyword !== "string" || !rows.keyword) throw new Error("rows.keyword 必须是非空点路径");
+
+	const map: SorftimeFieldMap = {
+		rows: { listing: rows.listing, keyword: rows.keyword },
+		listing: asPathMap(root.listing, "listing"),
+		keyword: asPathMap(root.keyword, "keyword"),
+	};
+
+	if (root.chain !== undefined) {
+		if (!Array.isArray(root.chain) || !root.chain.length) throw new Error("chain 必须是非空数组");
+		map.chain = root.chain.map((item, index) => {
+			const step = asRecord(item, `chain[${index}]`);
+			if (typeof step.tool !== "string" || !step.tool) throw new Error(`chain[${index}].tool 必须是非空字符串`);
+			return {
+				step: typeof step.step === "number" ? step.step : index + 1,
+				tool: step.tool,
+				required: Array.isArray(step.required) ? step.required.filter((value): value is string => typeof value === "string") : undefined,
+			};
+		});
+	}
+
+	// 身份列必须映射：convert 靠 asin / keyword 判断一行到底属于哪一类（与 csv.ts 同口径）。
+	// 少了它们，同一 server 其它步骤的返回体就会混进行里，「两类行必须齐」的守卫随之失效
+	if (!map.listing.asin) throw new Error("listing 必须映射 asin：convert 靠它判定 listing 行，缺了会把别的返回体当成 listing");
+	if (!map.keyword.keyword) throw new Error("keyword 必须映射 keyword：convert 靠它判定关键词行，缺了会把类目检索的返回当成关键词");
+	for (const column of [...Object.keys(map.listing), ...Object.keys(map.keyword)]) headerFor(column);
+	return map;
 }
 
 /**
@@ -58,6 +123,28 @@ interface McpResultSummaryShape {
 const DETAILS_MAX_BYTES = 16 * 1024;
 
 /**
+ * 溢写文件名的形状（pi-mcp-adapter 的 mcp-output-guard）：目录是
+ * `mkdtemp(join(tmpdir(), "pi-mcp-output-"))`，文件是 `${"output"|"mcp-result"}-<8 位 hex>.txt`。
+ * **只删长这样的路径。**
+ *
+ * 这不是洁癖：取值链①下 `details.mcpResult` 是**服务端返回的原始对象**（MCP 的 ResultSchema
+ * 是 loose object，任意顶层字段原样透传），服务端只要塞一个 `fullResultPath` 进来，就能指使
+ * 我们在转换成功后 unlink 任意文件。下面的 `extractMcpPayload` 已经在源头挡了一道（只认
+ * `omitted === true` 时的 fullResultPath），这里是第二道：删除侧不判断「像不像」，只判断
+ * 「是不是我们自己写出来的那个」。
+ *
+ * 判据对不上时**跳过删除**而不是抛错——最坏结果是一个临时文件留在系统临时目录里，
+ * 比误删一个真文件轻得多。
+ */
+const SPILL_FILE_NAME = /^(?:output|mcp-result)-[0-9a-f]{8}\.txt$/u;
+export function isAdapterSpillPath(path: string): boolean {
+	if (!path) return false;
+	const resolved = resolve(path);
+	const dir = dirname(resolved);
+	return SPILL_FILE_NAME.test(basename(resolved)) && basename(dir).startsWith("pi-mcp-output-") && dirname(dir) === resolve(tmpdir());
+}
+
+/**
  * 从一次 MCP 工具结果里抽出可用载荷。**纯函数、零 I/O**：溢写文件只记路径不读，
  * 文本只存不 parse——它跑在 `tool_result` 热路径上。
  *
@@ -79,7 +166,11 @@ export function extractMcpPayload(
 	const record = details as { mcpResult?: unknown; outputGuard?: OutputGuardDetails };
 	const guard = record.outputGuard;
 	const summary = record.mcpResult as McpResultSummaryShape | undefined;
-	const cleanupPaths = [guard?.fullOutputPath, summary?.fullResultPath].filter((path): path is string => typeof path === "string" && path.length > 0);
+	// 只把 **adapter 自己写出来的**溢写路径记进清理列表。链①下 mcpResult 是服务端原始对象，
+	// 它自带的 fullResultPath 是伪造的（真正的溢写只发生在 omitted === true 那一档），
+	// 无条件收下等于把 unlink 的目标交给对端决定
+	const spilled = [guard?.fullOutputPath, summary?.omitted === true ? summary.fullResultPath : undefined];
+	const cleanupPaths = spilled.filter((path): path is string => typeof path === "string" && isAdapterSpillPath(path));
 
 	if (record.mcpResult !== undefined && summary?.omitted !== true) {
 		return { payload: { value: record.mcpResult, cleanupPaths }, approxBytes: DETAILS_MAX_BYTES };
@@ -91,10 +182,13 @@ export function extractMcpPayload(
 	if (text && guard?.truncated !== true) {
 		return { payload: { text, cleanupPaths }, approxBytes: text.length };
 	}
-	if (typeof summary?.fullResultPath === "string" && summary.fullResultPath) {
+	// ③④ 读溢写文件同样只认 adapter 写出来的路径。这两条链的前提本来就排除了服务端伪造
+	// （③ 要求 omitted === true，④ 的 outputGuard 由 adapter 生成），多这一道是为了让
+	// 「文件路径必须是我们自己写的」在读与删两侧是同一条判据，将来谁动了链的顺序也不会破
+	if (typeof summary?.fullResultPath === "string" && isAdapterSpillPath(summary.fullResultPath)) {
 		return { payload: { filePath: summary.fullResultPath, fileHoldsToolResult: true, cleanupPaths }, approxBytes: 0 };
 	}
-	if (typeof guard?.fullOutputPath === "string" && guard.fullOutputPath) {
+	if (typeof guard?.fullOutputPath === "string" && isAdapterSpillPath(guard.fullOutputPath)) {
 		return { payload: { filePath: guard.fullOutputPath, cleanupPaths }, approxBytes: 0 };
 	}
 	return undefined;
@@ -270,15 +364,26 @@ export async function convertSorftimePayloads(deps: ConvertDeps, input: ConvertI
 		resolved.push({ payload, body: await resolvePayload(payload) });
 	}
 
+	// 身份列过滤：确认单窗口内**同一个 server 的所有载荷**都会进来，而链路第 1 步
+	// （类目检索）的返回体根就是 `data[]`，与 rows.keyword 的点路径撞形——不过滤的话
+	// 那几行候选类目会被当成关键词行，把「两类行必须齐」那道守卫喂饱，残缺快照照样写出去。
+	// 判据用 csv.ts 自己判定行类型的那两列：listing 认 asin，关键词认 keyword。
+	const listingIdPath = input.map.listing.asin;
+	const keywordIdPath = input.map.keyword.keyword;
+	const hasValue = (value: unknown) => value !== null && value !== undefined && String(value) !== "";
+
 	const listingRows: Array<Record<string, unknown>> = [];
 	const keywordRows: Array<Record<string, unknown>> = [];
 	for (const { body } of resolved) {
 		const listings = pickPath(body, input.map.rows.listing);
-		if (Array.isArray(listings)) listingRows.push(...(listings as Array<Record<string, unknown>>));
+		if (Array.isArray(listings)) {
+			listingRows.push(...(listings as Array<Record<string, unknown>>).filter((row) => hasValue(pickPath(row, listingIdPath))));
+		}
 		const keywords = pickPath(body, input.map.rows.keyword);
-		if (Array.isArray(keywords)) keywordRows.push(...(keywords as Array<Record<string, unknown>>));
+		if (Array.isArray(keywords)) {
+			keywordRows.push(...(keywords as Array<Record<string, unknown>>).filter((row) => hasValue(pickPath(row, keywordIdPath))));
+		}
 	}
-
 	if (!listingRows.length || !keywordRows.length) {
 		const missing = !listingRows.length ? " listing 行" : "关键词行";
 		throw new Error(

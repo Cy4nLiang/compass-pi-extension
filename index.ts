@@ -17,7 +17,7 @@ import { Type } from "typebox";
 import { DOMAIN_TOOLS, rankTools, searchTerms } from "./catalog.ts";
 import { compareSnapshotRecencyDesc, snapshotTtlDays } from "./defaults.ts";
 import { estimateProfit, normalizeProfitInput } from "./economics.ts";
-import { createMcpPayloadCache } from "./gapfill-convert.ts";
+import { convertSorftimePayloads, createMcpPayloadCache, parseSorftimeFieldMap, type McpPayloadEntry, type SorftimeFieldMap } from "./gapfill-convert.ts";
 import {
 	GAPFILL_MODES,
 	GAP_AUTO_TIERS,
@@ -70,6 +70,7 @@ import {
 	listWorkbenchTodos,
 	marketAmazonLinks,
 	generateMarketReport,
+	mcpCallTargetServers,
 	listStrategies,
 	moveCandidate,
 	recordCost,
@@ -411,6 +412,105 @@ export default function compassExtension(pi: ExtensionAPI): void {
 		} catch {
 			return {};
 		}
+	}
+
+	// 补数映射表：Sorftime 返回 → compass 列。它住在宿主工作区（`.pi/gapfill/`）而不是本仓库——
+	// 本仓库是公开的，映射表描述的是内部数据链路。缺失 / 损坏一律抛错**不降级**：
+	// 降级的后果是转出一份静默缺列的 CSV，而导入链对缺列零告警。
+	const GAPFILL_MAP_PATH = ".pi/gapfill/sorftime.map.json";
+	async function loadSorftimeFieldMap(ctx: ExtensionContext): Promise<SorftimeFieldMap> {
+		let raw: string;
+		try {
+			raw = await readFile(repository(ctx).resolveInputPath(GAPFILL_MAP_PATH), "utf8");
+		} catch {
+			throw new Error(`补数映射表读不到（${GAPFILL_MAP_PATH}）：没有它就无法把返回体确定性地映射成 CSV。请先在工作区补上这份文件再试。`);
+		}
+		try {
+			return parseSorftimeFieldMap(JSON.parse(raw) as unknown);
+		} catch (error) {
+			throw new Error(`补数映射表不可用（${GAPFILL_MAP_PATH}）：${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
+
+	// —— A 档补数的确认门（ticket）——
+	// 只在内存、只活到 /reload。用**单变量**而不是 Map：「同一时刻只有一张」若靠 Map 就成了
+	// 需要自觉遵守的约定，用单变量它是结构事实——第二次 approve 直接覆盖前一张。
+	interface GapfillTicket {
+		server: string;
+		tools: readonly string[];
+		/** 发放时的总额度，只用于退还时封顶 */
+		issuedCalls: number;
+		remainingCalls: number;
+		expiresAt: number;
+		gapIds: readonly string[];
+		marketId: string;
+		marketName: string;
+		issuedAt: string;
+	}
+	const TICKET_TTL_MS = 10 * 60_000;
+	let gapfillTicket: GapfillTicket | undefined;
+	// 只按**过期**判有效，不看剩余次数——次数用尽的确认单仍然是这一批的身份证：convert 要靠它
+	// 界定「哪些载荷属于这一批」。次数是调用额度，过期才是生命周期，两件事分开判。
+	function activeGapfillTicket(): GapfillTicket | undefined {
+		if (!gapfillTicket) return undefined;
+		if (gapfillTicket.expiresAt <= Date.now()) {
+			gapfillTicket = undefined;
+			return undefined;
+		}
+		return gapfillTicket;
+	}
+
+	// tool_call 时刻能不能拿到工具名，取决于模型用了哪种参数形态：网关的规范形态
+	// `{ server, tool }` 与直连前缀都拿得到；「参数被套进 args 里」的兼容形态拿不到
+	// （那时名字只在 details 里，而 details 要到 tool_result 才有）。拿不到就不判——
+	// 白名单是用来挡「拿着确认单去调别的接口」的，不该因为参数形态把正常调用也拦了
+	function mcpCallToolName(server: string, call: { toolName: string; input?: Record<string, unknown> }): string | undefined {
+		if (call.toolName.startsWith(`${server}_`)) return call.toolName.slice(server.length + 1);
+		if (call.toolName !== "mcp") return undefined;
+		const tool = call.input?.tool;
+		if (typeof tool !== "string" || !tool) return undefined;
+		return tool.startsWith(`${server}_`) ? tool.slice(server.length + 1) : tool;
+	}
+
+	// tool_call 侧的确认门：strict 档给拒绝理由，任何档位都做额度预扣。undefined = 放行。
+	// 只管 A 档（付费）池：B/C 与本地源不在补数确认的范围里，拦它们只会平添惊吓。
+	// 这里只能读 event.input——tool_call 发生在调用之前，details 还不存在（P4 说的
+	// 「读 details」是 tool_result 侧的口径）。池名解析与熔断门共用 mcpCallTargetServers。
+	function gapfillTicketGate(store: CompassStore, call: { toolName: string; input?: Record<string, unknown> }, strict: boolean): string | undefined {
+		const servers = mcpCallTargetServers(store, call);
+		if (!servers.length) return undefined;
+		const paid = servers.filter((server) => store.budgetPools.some((pool) => pool.source === server && pool.tier === "A"));
+		if (!paid.length) return undefined;
+		const ticket = activeGapfillTicket();
+		const covered = ticket && paid.includes(ticket.server) ? ticket : undefined;
+		if (strict) {
+			if (!covered) {
+				return `${paid.join(" / ")} 补数确认单缺失（strict 档）。A 档付费调用要先经运营当面确认：先跑 compass_gaps action=approve market_ref=<市场>（确认单 10 分钟有效）；不想每次确认就 /compass-fill guided 换回引导档。`;
+			}
+			if (covered.remainingCalls <= 0) {
+				return `${covered.server} 补数确认单额度已用完（strict 档）。扣了次数不等于拿到数据，超时与中断同样计费；要继续请重新跑 compass_gaps action=approve。`;
+			}
+			// 确认单授权的是**运营看到的那条链路**，不是「这个池随便调」。换个接口花的是同一笔钱，
+			// 而运营弹窗上从没见过它
+			const tool = mcpCallToolName(covered.server, call);
+			if (tool && !covered.tools.includes(tool)) {
+				return `${covered.server} 补数确认单不覆盖 ${tool}（strict 档）。这张单批的是 ${covered.tools.join(" / ")}——要调别的接口请重新跑 compass_gaps action=approve。`;
+			}
+		}
+		// 预扣必须发生在 tool_call。宿主同一轮的工具批次是「先把每个调用的 tool_call 判定跑完，
+		// 再 Promise.all 执行」，扣在 tool_result 的话同一批里的调用彼此看不见对方，
+		// 运营批的 3 次挡不住一批 6 个调用。纯内存自减，不破坏热路径纪律
+		if (covered) covered.remainingCalls -= 1;
+		return undefined;
+	}
+
+	// 不计费的失败（认证 / 连接 / 退避 / 审批被拒——请求根本没发出去）把预扣的额度还回来，
+	// 与计量侧跳过它们同口径。不还的话，一次连不上就白吃掉运营批的一次额度，最后一次被
+	// 「额度已用完」拦下时只能重新 approve，把已经成功的调用重跑一遍——那才是真花钱。
+	function refundTicketCall(server: string): void {
+		const ticket = activeGapfillTicket();
+		if (!ticket || ticket.server !== server) return;
+		ticket.remainingCalls = Math.min(ticket.issuedCalls, ticket.remainingCalls + 1);
 	}
 
 	// 写工具收口处的缺口尾注：必须在 mutateStore **返回之后**调用（写事务禁止嵌套）。
@@ -1355,15 +1455,20 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			"选品数据缺口清单与补数计划（只读派生，不写库、不花钱、不自动抓取）。",
 			"list（默认）：把策略缺指标、待办、CSV 缺列告警、利润缺 CPC 与假设默认值、风险缺证据链接、差评缺原句、复盘缺实绩汇成一份清单，按成本档分组。",
 			"plan：给某个市场的每条缺口列出候选来源、预计调用次数、预算池可用性与写回入口；人工缺口给通用填空模板。",
+			"approve：**唯一会花钱的子命令**。当面确认后发一张 10 分钟有效的确认单，授权按映射表声明的链路调用 Sorftime 补齐某个市场的完整快照；只在 TUI 会话里可用，扣次数不等于拿到数据。",
+			"convert：把确认单期间收到的 Sorftime 返回体按点路径映射成一份可直接导入的市场 CSV（不经 LLM 猜数字），并归档原始 JSON。两类行（listing 与关键词）必须同时拿到，否则拒绝写文件——残缺快照会让指标静默消失。",
 			"缺数据一律按缺数据处理：模板里的 {{占位符}} 没拿到就留空，绝不猜数字或替运营填。",
 		].join("\n"),
 		parameters: Type.Object({
-			action: Type.Optional(StringEnum(["list", "plan"] as const)),
-			market_ref: Type.Optional(Type.String({ description: "market_id 或唯一市场名；plan 必填" })),
+			action: Type.Optional(StringEnum(["list", "plan", "approve", "convert"] as const)),
+			market_ref: Type.Optional(Type.String({ description: "market_id 或唯一市场名；plan 与 approve 必填；convert 传了会与确认单校验" })),
 			origin: Type.Optional(StringEnum(GAP_ORIGINS)),
 			tier: Type.Optional(StringEnum(GAP_AUTO_TIERS)),
 			limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
 		}),
+		// approve 会弹窗等运营按键、convert 会写文件并删临时文件：都不能与别的工具调用并发，
+		// 否则两次 approve 会抢同一张确认单、两次 convert 会互相删对方还没读的溢写文件
+		executionMode: "sequential",
 		async execute(_id, params, _signal, _update, ctx) {
 			const action = params.action ?? "list";
 			// 纵深第一层（第二层在 /compass-fill）：受限会话是白名单，只放行只读子命令。
@@ -1378,6 +1483,153 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			const all = deriveGaps(store, { todos: todosFor(store), budgets, muted: mutedGaps, marketId: market?.id });
 			const filtered = all.filter((gap) => (!params.origin || gap.origin === params.origin) && (!params.tier || gap.autoTier === params.tier));
 
+			if (action === "approve") {
+				// 门禁顺序是刻意的：能不能应答 → 是不是能弹窗的前端 → 映射表能不能用 → 池子允不允许
+				// → 最后才弹窗。倒过来先弹窗再查这些，运营会做完选择才被告知「其实做不了」。
+				if (!ctx.hasUI) throw new Error("compass_gaps action=approve 要当面确认，而当前会话没有 UI（print / json 模式）。请在 pi 的 TUI 里执行。");
+				if (ctx.mode !== "tui") throw new Error(`compass_gaps action=approve 只在 TUI 会话里放行（当前 mode=${ctx.mode}）：花钱的动作要运营本人在终端上按下确认。`);
+				if (!market) throw new Error("compass_gaps action=approve 需要 market_ref（先用 action=plan 看这个市场缺什么）");
+
+				// 映射表先校验：3 次调用花出去之后才发现映射表坏了，点数是要不回来的
+				const map = await loadSorftimeFieldMap(ctx);
+				const chain = map.chain ?? [];
+				if (!chain.length) throw new Error(`补数映射表（${GAPFILL_MAP_PATH}）没有声明 chain：不知道按什么顺序调几次，无法确认。`);
+				const calls = chain.length;
+
+				const confirmGaps = filtered.filter((gap) => gap.autoTier === "A_confirm");
+				if (!confirmGaps.length) {
+					throw new Error(`${market.name} 当前没有需要确认的 A 档缺口；先跑 compass_gaps action=plan market_ref=${market.id} 看还缺什么。`);
+				}
+				// 付费源取自缺口自己给出的 A 档来源，不在这里硬编码池名——两处各写一份迟早分裂成
+				// 「计划里说找 X 补，确认时扣的是 Y 的额度」
+				const paidSources = [...new Set(confirmGaps.flatMap((gap) => gap.sources.filter((option) => option.tier === "A").map((option) => option.source)))];
+				if (paidSources.length !== 1) {
+					throw new Error(`这批缺口的 A 档来源不唯一（${paidSources.join("、") || "一个都没有"}），无法用一张确认单覆盖；请用 origin= 或 tier= 缩小到同一个来源再确认。`);
+				}
+				const server = paidSources[0];
+
+				const pending = pendingCallCounts();
+				// 弹窗与预检共用同一份**含 pending** 的池状态（P3）：readStoreFlushingUsage 已尽力把
+				// pending 落账，但它失败时会静默退回只读——那时 budgetStatus(store) 少算本会话的调用，
+				// 弹窗上就会给运营一个偏小的「本月已用」，而这正是他要据以决定花不花钱的数字
+				const pool = budgetStatus(store, undefined, pending).find((item) => item.source === server);
+				if (!pool) throw new Error(`预算池 ${server} 不存在：先 compass_budget configure source=${server} 建池再确认。`);
+				// 没有可生效上限 = 熔断永远不触发。这种状态下批准自动补数，等于把「花多少」这件事
+				// 交给运气；受限会话的启动器也按同一条规则拒绝启动
+				if (pool.state === "free") {
+					throw new Error(`${server} 预算池没有可生效的上限（monthly_call_limit 与 monthly_limit_cny 都没配），熔断永远不会触发——这种状态下不批准自动补数。先配上限：compass_budget configure source=${server} monthly_call_limit=<次数>。`);
+				}
+
+				// 模拟「这批最后一次调用发出之前」的计数。熔断判据是 callCount >= limit，第 N 次调用
+				// 之前的计数是「已用 + N-1」；写成「已用 + calls」会把「刚好用完最后 3 次」误判成配额不够
+				const projected = { ...pending, [server]: (pending[server] ?? 0) + calls - 1 };
+				const blocked = evaluateMcpGate(store, { toolName: "mcp", input: { server } }, projected);
+				if (blocked) throw new Error(`补数确认被拒绝：这批要 ${calls} 次调用，做不完就会熔断。${blocked.reason}`);
+
+				const limitText = pool.monthlyCallLimit !== undefined ? `限 ${pool.monthlyCallLimit} 次` : `限 ¥${pool.monthlyLimitCny}`;
+				const steps = chain.map((item) => `${item.step}. ${item.tool}${item.required?.length ? `（需要 ${item.required.join(" / ")}）` : ""}`);
+				const confirmOption = `确认：现在调用 ${calls} 次`;
+				const explainOption = `先看这 ${calls} 次分别做什么（不调用）`;
+				// 弹窗只回显次数与上限，**不回显池的 note**——note 是自由文本，实测会漂移（写着
+				// 「设为 1」而上限早就是 10），拿它当口径会让运营照着一个假数字做决定
+				const choice = await ctx.ui.select(
+					`补数确认：${market.name} · 将调用 ${server} ${calls} 次（本月已用 ${pool.callCount} / ${limitText}）`,
+					[confirmOption, explainOption, "取消"],
+					{ timeout: 60_000 },
+				);
+				if (choice === explainOption) {
+					const body = [`${market.name} · ${server} 补数链路（本次未调用、未扣次数）`, ...steps, "确认后再跑一次 approve。"].join("\n");
+					return textResult(body, details({ title: "补数确认", status: "info", summary: `${server} ${calls} 步链路预览（未调用）`, lines: steps }));
+				}
+				if (choice !== confirmOption) {
+					// 超时与 Esc 都走这里：ctx.ui.select 两种情况都返回 undefined，一律按取消处理
+					const summary = choice === undefined ? "确认超时或已取消，未调用、未扣次数" : "已取消，未调用、未扣次数";
+					return textResult(summary, details({ title: "补数确认", status: "info", summary }));
+				}
+
+				gapfillTicket = {
+					server,
+					tools: chain.map((item) => item.tool),
+					issuedCalls: calls,
+					remainingCalls: calls,
+					expiresAt: Date.now() + TICKET_TTL_MS,
+					gapIds: confirmGaps.map((gap) => gap.id),
+					marketId: market.id,
+					marketName: market.name,
+					issuedAt: new Date().toISOString(),
+				};
+				const lines = [
+					`已批准：${server} ${calls} 次调用，确认单 10 分钟内有效。`,
+					...steps,
+					`拿到返回后回来跑：compass_gaps action=convert market_ref=${market.id}`,
+					"注意：扣了次数不等于拿到数据——调用失败同样计费，失败就重新 approve，不要在同一张单里反复重试。",
+				];
+				return textResult(lines.join("\n"), details({
+					title: "补数确认",
+					status: "warning",
+					summary: `已批准 ${server} ${calls} 次调用 · ${market.name}`,
+					lines: steps,
+				}));
+			}
+
+			if (action === "convert") {
+				const ticket = activeGapfillTicket();
+				// 载荷可能还在缓存里，但「哪些属于这一批」只有确认单说得清；没单就不转，
+				// 免得把上一轮别的市场的返回体混进这张快照
+				if (!ticket) {
+					throw new Error("补数转换需要一张有效的确认单：先 compass_gaps action=approve market_ref=… 确认，再按提示调用，最后回来转换（确认单 10 分钟有效，过期请重新确认）。");
+				}
+				// 传了 market_ref 就必须与确认单一致。convert 通篇按 ticket 的市场写文件名与导入
+				// 指令，静默忽略参数的话，approve 德国、convert 时手滑写美国，出来的仍是德国那份
+				// 而运营以为转的是美国
+				if (market && market.id !== ticket.marketId) {
+					throw new Error(`确认单属于「${ticket.marketName}」（${ticket.marketId}），与 market_ref=${market.name} 不符。转换按确认单的市场进行；要转别的市场请先给它 approve。`);
+				}
+				const map = await loadSorftimeFieldMap(ctx);
+				const entries: McpPayloadEntry[] = mcpPayloads.since(ticket.server, ticket.issuedAt);
+				if (!entries.length) {
+					throw new Error(`确认单发出后没有收到任何 ${ticket.server} 返回：可能调用还没做，也可能中途 /reload 过（载荷缓存只活到 reload）。请重新调用后再转换。`);
+				}
+				// captured_at 用当天：本次调用拿的就是此刻的线上数据。Sorftime 返回体里没有可映射的
+				// 统计期字段（E0 已核），所以不去猜一个更早的日期——写早了会让新快照被判成旧于已有快照
+				const capturedDate = new Date().toISOString().slice(0, 10);
+				let result: Awaited<ReturnType<typeof convertSorftimePayloads>>;
+				try {
+					result = await convertSorftimePayloads(
+						{ repo: repository(ctx) },
+						{ payloads: entries, map, marketName: ticket.marketName, capturedDate, source: ticket.server },
+					);
+				} catch (error) {
+					// 转换失败时**不清确认单、不清缓存**：运营补上缺的那一步还能接着转。
+					// 顺带说清这一批缺哪几步——「两类行必须齐」这条抽象规则落到「你还没调 X」才可照做。
+					// 不把「链路没走全」本身当拒绝理由：node_id 已知时跳过第 1 步照样能凑齐两类行
+					const seen = new Set(entries.map((entry) => entry.tool));
+					const missed = ticket.tools.filter((tool) => !seen.has(tool));
+					const hint = missed.length ? `（这一批没见到 ${missed.join(" / ")} 的返回；确认单批的顺序是 ${ticket.tools.join(" → ")}）` : "";
+					throw new Error(`${error instanceof Error ? error.message : String(error)}${hint}`);
+				}
+				// 一张单只转一次：溢写文件已被删，留着缓存只会让下次读到不存在的路径
+				mcpPayloads.forget(entries.map((entry) => entry.toolCallId));
+				gapfillTicket = undefined;
+
+				const thin = result.coverage.filter((item) => item.total > 0 && item.filled < item.total).map((item) => `${item.column} ${item.filled}/${item.total}`);
+				const lines = [
+					`listing ${result.listingRows} 行 · 关键词 ${result.keywordRows} 行 → ${result.csvPath}`,
+					thin.length ? `未填满的列：${thin.join("、")}` : "映射的列全部填满",
+					result.unmappedFields.length ? `载荷里未映射的字段：${result.unmappedFields.slice(0, 12).join("、")}` : "载荷里没有未映射字段",
+					// source 必须显式写 sorftime：这份 CSV 是全英文表头，detectSource 会判成 generic_csv，
+					// 在已有的 sorftime 市场里凭空造出「多来源」，进而激活快照明细同步读与偏差待办
+					`下一步：compass_import_csv path=${result.csvPath} market_name="${ticket.marketName}" source=${ticket.server} captured_at=${capturedDate}`,
+				];
+				const summary = `${ticket.marketName} · listing ${result.listingRows} / 关键词 ${result.keywordRows}`;
+				return textResult([summary, ...lines].join("\n"), details({
+					title: "补数转换",
+					status: "success",
+					summary,
+					lines,
+					data: resultData({ payload: { csvPath: result.csvPath, marketId: ticket.marketId, coverage: result.coverage, archivedRaw: result.archivedRaw, cleaned: result.cleaned } }),
+				}));
+			}
 			if (action === "plan") {
 				if (!market) throw new Error("compass_gaps action=plan 需要 market_ref（先用 action=list 看有哪些市场）");
 				// 受限会话不加载宿主的内部提示层：hints.json 是 owner 的内部 SOP
@@ -1411,7 +1663,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			const limited = filtered.slice(0, params.limit ?? 30);
 			const groups: Array<[string, GapRecord[]]> = [
 				["C 档 · 本地可自动补", limited.filter((gap) => gap.autoTier === "C_auto")],
-				["A 档 · 需运营确认（自动补数二期上线）", limited.filter((gap) => gap.autoTier === "A_confirm")],
+				["A 档 · 需运营当面确认后自动补齐（会花钱）", limited.filter((gap) => gap.autoTier === "A_confirm")],
 				["人工", limited.filter((gap) => gap.autoTier === "manual")],
 			];
 			const lines: string[] = [];
@@ -1691,13 +1943,13 @@ export default function compassExtension(pi: ExtensionAPI): void {
 
 			if (action === "status") {
 				const muted = mutedGaps.length ? `静音 ${mutedGaps.length} 条` : "无静音";
-				const strictHint = fillMode === "strict" ? "；strict 的调用拦截二期生效，本期与 guided 表现相同" : "";
+				const strictHint = fillMode === "strict" ? "；strict：A 档付费调用必须先有 compass_gaps action=approve 发的确认单" : "";
 				notify(`罗盘补数：${fillMode} · ${muted}${strictHint}`, "info");
 				return;
 			}
 			if ((GAPFILL_MODES as readonly string[]).includes(action)) {
 				await persist({ mode: action as GapfillMode, muted: mutedGaps });
-				const strictHint = fillMode === "strict" ? "（strict 的调用拦截二期生效，本期与 guided 表现相同）" : "";
+				const strictHint = fillMode === "strict" ? "（strict：A 档付费调用必须先有 compass_gaps action=approve 发的确认单）" : "";
 				notify(`罗盘补数档位：${fillMode}${strictHint}`, "info");
 				return;
 			}
@@ -1870,7 +2122,11 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			// 否则缓存抛错会把计量一起吞掉，变成「花了钱不记账」，那是最坏的方向。
 			// 这里同样零 I/O：溢写文件只记路径不读，文本只存不 parse（热路径纪律）。
 			try {
-				if (sample) mcpPayloads.remember(sample, event);
+				if (sample) {
+					mcpPayloads.remember(sample, event);
+					// 退还确认单额度与缓存载荷共用这一个 try：两者都是补数的便利设施，坏了都不该影响计量
+					if (!sample.billable) refundTicketCall(sample.server);
+				}
 			} catch {
 				// 缓存是补数的便利设施，坏了不影响计量与工具结果
 			}
@@ -1925,6 +2181,19 @@ export default function compassExtension(pi: ExtensionAPI): void {
 				rememberPools(store);
 				const blocked = evaluateMcpGate(store, { toolName: event.toolName, input: event.input as Record<string, unknown> | undefined }, pendingCallCounts());
 				if (blocked) return { block: true, reason: blocked.reason };
+				// 补数确认门：strict 档给拒绝理由，任何档位都做额度预扣。排在熔断门**之后**——
+				// 熔断是硬边界，拿着确认单也不该越过；确认单只回答「这次调用有没有经过人」
+				const refusal = gapfillTicketGate(store, { toolName: event.toolName, input: event.input as Record<string, unknown> | undefined }, fillMode === "strict");
+				if (refusal) return { block: true, reason: refusal };
+			}
+			// compass_gaps 的付费 action 拦截。它不匹配任何池前缀，进不了上面那个预过滤分支，
+			// 所以只能另起一个独立 if（照下面 compass_import_csv 那段的写法）。
+			// off 档 = 运营明确关掉了补数：这时还能 approve 就等于「关了的开关照样能花钱」。
+			if (event.toolName === "compass_gaps" && fillMode === "off") {
+				const requested = event.input.action;
+				if (requested === "approve" || requested === "convert") {
+					return { block: true, reason: `补数功能当前是 off，${requested} 不可用。先 /compass-fill guided 或 /compass-fill strict 打开补数再试。` };
+				}
 			}
 			if (isToolCallEventType("read", event) && pathIsHistoryStore(ctx.cwd, event.input.path)) return { block: true, reason: guardReason };
 			if (isToolCallEventType("grep", event) && event.input.path && pathIsHistoryStore(ctx.cwd, event.input.path)) return { block: true, reason: guardReason };

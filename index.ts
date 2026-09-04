@@ -1597,7 +1597,9 @@ export default function compassExtension(pi: ExtensionAPI): void {
 				// 指令，静默忽略参数的话，approve 德国、convert 时手滑写美国，出来的仍是德国那份
 				// 而运营以为转的是美国
 				if (market && market.id !== ticket.marketId) {
-					throw new Error(`确认单属于「${ticket.marketName}」（${ticket.marketId}），与 market_ref=${market.name} 不符。转换按确认单的市场进行；要转别的市场请先给它 approve。`);
+					// 回显运营**输入的原文**，后面括注解析结果。只回显 market.name 的话，传 id 的人
+					// 会看到一个自己没打过的名字，第一反应是「工具搞错了」而不是「我传错了市场」
+					throw new Error(`确认单属于「${ticket.marketName}」（${ticket.marketId}），与 market_ref=${params.market_ref}（解析为「${market.name}」）不符。转换按确认单的市场进行；要转别的市场请先给它 approve。`);
 				}
 				const map = await loadSorftimeFieldMap(ctx);
 				const entries: McpPayloadEntry[] = mcpPayloads.since(ticket.server, ticket.issuedAt);

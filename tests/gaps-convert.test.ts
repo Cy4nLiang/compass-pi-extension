@@ -510,3 +510,35 @@ test("溢写路径只认 adapter 自己写的那个形状：服务端伪造的 f
 	assert.equal(isAdapterSpillPath(join(tmpdir(), "pi-mcp-output-Ab3", "mcp-result-0a1b2c3d.txt")), true);
 	assert.equal(isAdapterSpillPath(join(tmpdir(), "pi-mcp-output-Ab3", "output-deadbeef.txt")), true);
 });
+
+// 直连工具（sorftime_category_report 这种）的 details 形状与网关**不同**：
+// direct-tools.ts:570 是 `{ server, tool, ...guardedMcpDetails(guarded) }`，而
+// guardedMcpDetails 只在有值时才放字段，guardMcpOutput 又**不产生 mcpResult**
+// （那是网关侧 boundMcpResult 才有的）。所以直连成功只有两种形状：
+//   小返回 → { server, tool }，正文完整在 content 里
+//   大返回 → { server, tool, outputGuard: { truncated, fullOutputPath } }，正文被截断溢写
+// 这是本工作区**生产实际用的形状**（87 个直连工具），先前三档夹具全是网关形式，一条都没覆盖。
+test("直连工具的两种成功形状都能取到载荷（生产实际用的就是直连）", () => {
+	const body = JSON.stringify({ data: { top100_products: [{ asin: "B0DEMO0001" }] } });
+
+	// ① 小返回：没有 mcpResult 也没有 outputGuard，正文完整——必须走链②拿 text
+	const small = extractMcpPayload({ server: "sorftime", tool: "category_keywords" }, [{ type: "text", text: body }]);
+	assert.equal(small?.payload.text, body, "直连小返回要从 content 拿正文");
+	assert.equal(small?.payload.value, undefined);
+	assert.deepEqual(small?.payload.cleanupPaths, []);
+
+	// ② 大返回：正文被截断并溢写，只剩 outputGuard 这一条链可用。
+	// 这一档是 category_report（实测 ~79KB）的真实形状——它要是取不到，
+	// convert 会说「本批载荷里没有 listing 行」，而运营完全看不出是载荷被丢了
+	const spillPath = join(tmpdir(), "pi-mcp-output-Zz9", "output-0a1b2c3d.txt");
+	const large = extractMcpPayload(
+		{ server: "sorftime", tool: "category_report", outputGuard: { truncated: true, fullOutputPath: spillPath } },
+		[{ type: "text", text: "[truncated…]" }],
+	);
+	assert.equal(large?.payload.filePath, spillPath, "直连大返回要走 outputGuard 溢写链");
+	assert.equal(large?.payload.fileHoldsToolResult, undefined, "outputGuard 那条链文件里就是正文，不是整个 CallToolResult");
+	assert.deepEqual(large?.payload.cleanupPaths, [spillPath], "溢写文件要进清理列表");
+
+	// ③ 截断了却没给溢写路径（写文件也失败）：宁可不缓存，让 convert 说重来
+	assert.equal(extractMcpPayload({ server: "sorftime", tool: "category_report", outputGuard: { truncated: true } }, [{ type: "text", text: "[truncated…]" }]), undefined);
+});

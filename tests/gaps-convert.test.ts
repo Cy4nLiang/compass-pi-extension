@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -342,14 +342,23 @@ test("④ 只有正文溢写时用 fullOutputPath，文件里就是正文", () =
 	assert.notEqual(got?.payload.fileHoldsToolResult, true, "这条链的文件不需要二次取 content");
 });
 
-test("⑤ 写溢写文件也失败时不缓存——载荷彻底不可恢复，宁可让 convert 说重来", () => {
-	assert.equal(
-		extractMcpPayload({ mode: "call", server: "sorftime", tool: "t", mcpResult: { omitted: true, resultWriteError: "ENOSPC" }, outputGuard: { truncated: true, writeError: "ENOSPC" } }, [
-			{ type: "text", text: "[MCP text output truncated: …]" },
-		]),
-		undefined,
-	);
-	// 认证失败之类根本没有载荷的分支同样不缓存
+test("⑤ 溢写也失败时记成「不可恢复」，不是当作没这次调用（那会诱导运营再花钱）", () => {
+	// 这一档 2026-09-05 在线上真撞到了：运营烧掉 8 次配额，因为 convert 只说「没见到这一步
+	// 的返回」，读起来就是「再调一次」。而这一步**已经调过、已经扣过钱**，重试同样会失败。
+	// 原设计「宁可不缓存」是错的——「没缓存」与「没调用」在下游无法区分，而两者对运营的
+	// 意义完全相反：一个该重试，一个该去修磁盘。
+	const lost = extractMcpPayload({ mode: "call", server: "sorftime", tool: "t", mcpResult: { omitted: true, resultWriteError: "ENOSPC" }, outputGuard: { truncated: true, writeError: "ENOSPC" } }, [
+		{ type: "text", text: "[MCP text output truncated: …]" },
+	]);
+	assert.equal(lost?.payload.unavailable, "ENOSPC", "要带上 adapter 给的 writeError，那是唯一的直接证据");
+	assert.equal(lost?.payload.value, undefined);
+	assert.equal(lost?.payload.filePath, undefined);
+
+	// 截断了但 adapter 没给 writeError：仍要记，给一句通用说明
+	const noReason = extractMcpPayload({ server: "sorftime", tool: "t", outputGuard: { truncated: true } }, [{ type: "text", text: "[truncated…]" }]);
+	assert.match(noReason?.payload.unavailable ?? "", /溢写文件未写成/u);
+
+	// 认证失败之类**根本没发出请求**的分支照旧不缓存：那是真的「没这次调用」
 	assert.equal(extractMcpPayload({ mode: "call", error: "auth_required", server: "sorftime", tool: "t" }, []), undefined);
 	assert.equal(extractMcpPayload(undefined, []), undefined);
 });
@@ -539,6 +548,38 @@ test("直连工具的两种成功形状都能取到载荷（生产实际用的�
 	assert.equal(large?.payload.fileHoldsToolResult, undefined, "outputGuard 那条链文件里就是正文，不是整个 CallToolResult");
 	assert.deepEqual(large?.payload.cleanupPaths, [spillPath], "溢写文件要进清理列表");
 
-	// ③ 截断了却没给溢写路径（写文件也失败）：宁可不缓存，让 convert 说重来
-	assert.equal(extractMcpPayload({ server: "sorftime", tool: "category_report", outputGuard: { truncated: true } }, [{ type: "text", text: "[truncated…]" }]), undefined);
+	// ③ 截断了却没给溢写路径（写文件也失败）：记成不可恢复，convert 会明说重试无用
+	assert.match(extractMcpPayload({ server: "sorftime", tool: "category_report", outputGuard: { truncated: true } }, [{ type: "text", text: "[truncated…]" }])?.payload.unavailable ?? "", /溢写文件未写成/u, "拿不回来也要记一笔，别当作没调用过");
+});
+
+test("载荷不可恢复时，拒绝理由必须说「重试不会变好」而不是「请先补齐这一步的调用」", async () => {
+	// 2026-09-05 线上真实事故：运营照着「请先补齐这一步的调用再转换」重试，
+	// 每次都真扣钱、每次都同样失败，烧掉 8 次配额才发现是溢写写盘失败。
+	// 这条钉的是**措辞的方向**——错误信息在这里直接等于钱。
+	await withRepo(async (repo, root) => {
+		const before = await readdir(join(root, IMPORTS_DIR_NAME)).catch(() => [] as string[]);
+		await assert.rejects(
+			convertSorftimePayloads(
+				{ repo },
+				{
+					payloads: [
+						{ server: "sorftime", tool: "category_report", unavailable: "ENOSPC: no space left on device" },
+						inline(keywordPayload(2), "category_keywords"),
+					],
+					map: MAP,
+					marketName: "demo market",
+					capturedDate: "2026-09-05",
+				},
+			),
+			(error: Error) => {
+				assert.match(error.message, /已经拿不回来了/u, "要点明载荷丢了，不是没调用");
+				assert.match(error.message, /ENOSPC: no space left on device/u, "要带上 adapter 给的原因");
+				assert.match(error.message, /重试同一步不会变好/u, "这句是防止运营继续烧配额的那句");
+				assert.doesNotMatch(error.message, /请先补齐这一步的调用/u, "旧措辞会被读成「再调一次」，正是这次事故的成因");
+				return true;
+			},
+		);
+		const after = await readdir(join(root, IMPORTS_DIR_NAME)).catch(() => [] as string[]);
+		assert.deepEqual(after, before, "拒绝时不得写出任何 CSV");
+	});
 });

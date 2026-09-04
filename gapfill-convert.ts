@@ -101,6 +101,15 @@ export interface CachedPayload {
 	filePath?: string;
 	/** filePath 指向的是完整 CallToolResult 而不是正文时为真（mcpResult.fullResultPath 那条链） */
 	fileHoldsToolResult?: boolean;
+	/**
+	 * 载荷**不可恢复**：正文被截断，而溢写文件又没写成（磁盘满 / 临时目录不可写）。
+	 * 值是 adapter 给的 writeError，拿不到就给一句通用说明。
+	 *
+	 * 记下来而不是当作「没这次调用」——这两者对运营的意义完全相反：后者会让 convert 说
+	 * 「请先补齐这一步的调用」，而这一步**已经调过、已经扣过钱了**，再调一次同样会失败。
+	 * 把它冒出来，运营才知道要去解决溢写而不是继续烧配额。
+	 */
+	unavailable?: string;
 	/** 读完要删的临时文件；其所在目录随之一并清理 */
 	cleanupPaths?: string[];
 }
@@ -190,6 +199,13 @@ export function extractMcpPayload(
 	}
 	if (typeof guard?.fullOutputPath === "string" && isAdapterSpillPath(guard.fullOutputPath)) {
 		return { payload: { filePath: guard.fullOutputPath, cleanupPaths }, approxBytes: 0 };
+	}
+	// ⑤ 正文被截断，而两条溢写链都没给出可用路径——载荷**不可恢复**。
+	// 这里绝不能返回 undefined 了事：那等于「这次调用没发生过」，而它已经发生、已经扣过钱。
+	// convert 会照着「没见到这一步的返回」劝运营再调一次，同样会失败，钱照扣。
+	if (guard?.truncated === true || summary?.omitted === true) {
+		const why = guard?.writeError ?? summary?.resultWriteError ?? "正文被截断，溢写文件未写成";
+		return { payload: { unavailable: why, cleanupPaths }, approxBytes: 0 };
 	}
 	return undefined;
 }
@@ -386,6 +402,18 @@ export async function convertSorftimePayloads(deps: ConvertDeps, input: ConvertI
 	}
 	if (!listingRows.length || !keywordRows.length) {
 		const missing = !listingRows.length ? " listing 行" : "关键词行";
+		// 载荷不可恢复的那几次要**单独说**。它们已经调过、已经扣过钱，重试同一步同样会失败——
+		// 只说「没有 listing 行」会被读成「再调一次就好」，那是在诱导运营继续烧配额。
+		const lost = input.payloads.filter((payload) => payload.unavailable);
+		if (lost.length) {
+			const reasons = [...new Set(lost.map((payload) => payload.unavailable as string))].join("；");
+			throw new Error(
+				`补数转换被拒绝：这一批有 ${lost.length} 次调用的返回体**已经拿不回来了**（${reasons}）。` +
+					`这几次的钱已经花了，但正文被截断且溢写文件没写成，**重试同一步不会变好**——` +
+					`先解决溢写失败（多半是磁盘满或临时目录不可写），再重新 approve。` +
+					`当前这一批缺${missing}，不会写出残缺快照。`,
+			);
+		}
 		throw new Error(
 			`补数转换被拒绝：本批载荷里没有${missing}，只能合成残缺快照。` +
 				`残缺快照会让策略指标静默消失（只有关键词行时 21 个指标只剩 4 个），且导入链对此零告警。` +

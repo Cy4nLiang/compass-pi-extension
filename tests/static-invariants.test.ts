@@ -195,6 +195,30 @@ test("状态栏与 /compass 通知用同一组缺口 options", async () => {
 // 斜杠命令不产生 tool result，tool_result 钩子的尾注合并整条链路都不经过。
 // /compass-import 是运营最常用的导入入口，也是唯一会产生新缺口的动作——漏了它，
 // 缺口提示对「用命令导入」的运营等于不存在（2026-09-04 冒烟实际踩到）。
+// ctx.ui.input 的第二参 placeholder 在 TUI 下**根本不渲染**：ExtensionInputComponent 的
+// 构造函数收下它就丢（`constructor(title, _placeholder, …)`，new Input() 不带参数），只有
+// RPC 才转发。所以任何写进 placeholder 的提示、示例、格式说明，运营都看不见。
+// 2026-09-04 实际后果：/compass-import 的市场名示例「yoga mat strap」从未显示，
+// 冒烟时把市场名输成了「1」。提示一律进 title。
+test("ctx.ui.input 不把提示写在 placeholder 里（TUI 下不渲染）", async () => {
+	const source = await readFile(join(repoRoot, "index.ts"), "utf8");
+	const calls = source.split("\n").filter((line) => line.includes("ctx.ui.input("));
+	assert.ok(calls.length >= 10, `只找到 ${calls.length} 处 ctx.ui.input 调用，切片可能已失效`);
+	// 允许的形状：input("标题") 或 input(`标题`) 或 input(标题, undefined, opts)
+	// 显式抓第二个实参再判，别用 `,\s*(?!undefined)`——\s* 会回溯成零宽，
+	// lookahead 落在空格上就恒真，对正确代码也报红
+	const secondArg = (line: string): string | undefined => /ctx\.ui\.input\((?:"[^"]*"|`[^`]*`)\s*,\s*([^,)]+)/u.exec(line)?.[1]?.trim();
+	const withPlaceholder = calls.filter((line) => {
+		const arg = secondArg(line);
+		return arg !== undefined && arg !== "undefined";
+	});
+	assert.deepEqual(
+		withPlaceholder.map((line) => line.trim()),
+		[],
+		"这些调用把提示写在了 placeholder（第二参）里，TUI 下运营看不到——把它并进 title",
+	);
+});
+
 test("/compass-import 命令路径也挂补数缺口尾注", async () => {
 	const source = await readFile(join(repoRoot, "index.ts"), "utf8");
 	const start = source.indexOf('pi.registerCommand("compass-import"');

@@ -1520,9 +1520,11 @@ export default function compassExtension(pi: ExtensionAPI): void {
 		description: "交互式导入市场 CSV：/compass-import <项目内路径>",
 		handler: async (args, ctx) => {
 			if (!ctx.hasUI) throw new Error("/compass-import 需要 TUI 或 RPC UI");
-			const path = args.trim() || await ctx.ui.input("CSV 路径", "compass-imports/sellersprite.csv");
+			// ctx.ui.input 的 placeholder 在 TUI 下是死参数：ExtensionInputComponent 收下就丢，
+			// new Input() 不带任何参数，只有 title 会渲染（RPC 才转发）。提示一律写进 title。
+			const path = args.trim() || await ctx.ui.input("CSV 路径（项目内相对路径，例 compass-imports/2026-09-04-市场-sorftime.csv）");
 			if (!path) return;
-			const marketName = await ctx.ui.input("市场/关键词族名称", "yoga mat strap");
+			const marketName = await ctx.ui.input("市场/关键词族名称（自由文本，例 yoga mat strap；与现有市场同名即追加快照，否则新建）");
 			if (!marketName) return;
 			const source = await ctx.ui.select("数据来源", [...SNAPSHOT_SOURCES]);
 			if (!source) return;
@@ -1624,7 +1626,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			const strategy = findStrategyVersion(store, ref);
 			const edited = await ctx.ui.editor(`编辑 ${strategy.name}@v${strategy.version}`, strategy.yaml);
 			if (!edited || edited === strategy.yaml) return;
-			const note = await ctx.ui.input("版本说明", `基于 v${strategy.version} 调整`);
+			const note = await ctx.ui.input(`版本说明（例：基于 v${strategy.version} 调整）`);
 			const saved = await mutateStore(ctx, (data) => saveStrategyVersion(data, { yaml: edited, actor: actorName(), changeNote: note }));
 			ctx.ui.notify(`已保存 ${saved.result.id}@v${saved.result.version}`, "info");
 		},
@@ -1764,11 +1766,11 @@ export default function compassExtension(pi: ExtensionAPI): void {
 							if (!Number.isFinite(parsed)) throw new Error(`不是有效数字：${value}`);
 							return parsed;
 						};
-						const dailyUnits = parseOptional(await ctx.ui.input("实际日销", "10"));
-						const tacos = parseOptional(await ctx.ui.input("TACOS（0–1）", "0.15"));
-						const returnRate = parseOptional(await ctx.ui.input("退货率（0–1）", "0.05"));
-						const netMargin = parseOptional(await ctx.ui.input("净利率（0–1，可为负）", "0.10"));
-						const note = await ctx.ui.input("实绩备注", "以店铺后台为准");
+						const dailyUnits = parseOptional(await ctx.ui.input("实际日销（件，例 10）"));
+						const tacos = parseOptional(await ctx.ui.input("TACOS（0–1，例 0.15）"));
+						const returnRate = parseOptional(await ctx.ui.input("退货率（0–1，例 0.05）"));
+						const netMargin = parseOptional(await ctx.ui.input("净利率（0–1，可为负，例 0.10）"));
+						const note = await ctx.ui.input("实绩备注（例：以店铺后台为准）");
 						const { result } = await mutateStore(ctx, (store) => recordRetroActuals(store, { candidateRef: candidateId, actuals: { dailyUnits, tacos, returnRate, netMargin, note }, actor: actorName() }));
 						createdChecks.push(result.id);
 						rememberTouch({ marketId: result.marketId, candidateId: result.candidateId, action: "retro.actuals", conclusion: `${item.marketName} ${result.verdict}`, ids: [result.id] });
@@ -1801,15 +1803,15 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			ctx.ui.notify(`复盘报告已保存：${outputPath}`, "info");
 			const save = await ctx.ui.confirm("沉淀经验", "本次复盘发现的规律是否保存为 lesson？");
 			if (!save) return;
-			const title = await ctx.ui.input("一句话规律", "");
+			const title = await ctx.ui.input("一句话规律");
 			if (!title) return;
 			const detail = await ctx.ui.editor("为什么，以及下次如何使用", "");
 			if (!detail) return;
-			const evidenceInput = createdChecks.length ? createdChecks.join(",") : await ctx.ui.input("证据 ID（chk_/dec_/run_，逗号分隔）", "");
+			const evidenceInput = createdChecks.length ? createdChecks.join(",") : await ctx.ui.input("证据 ID（chk_/dec_/run_，逗号分隔）");
 			const evidence = (evidenceInput ?? "").split(/[,，\s]+/u).filter(Boolean);
-			const categories = (await ctx.ui.input("适用类目（逗号分隔，可空）", "") ?? "").split(/[,，]+/u).map((item) => item.trim()).filter(Boolean);
-			const keywords = (await ctx.ui.input("适用关键词（逗号分隔，可空）", "") ?? "").split(/[,，]+/u).map((item) => item.trim()).filter(Boolean);
-			const metrics = (await ctx.ui.input("关联指标（逗号分隔，可空）", "") ?? "").split(/[,，]+/u).map((item) => item.trim()).filter(Boolean);
+			const categories = (await ctx.ui.input("适用类目（逗号分隔，可空）") ?? "").split(/[,，]+/u).map((item) => item.trim()).filter(Boolean);
+			const keywords = (await ctx.ui.input("适用关键词（逗号分隔，可空）") ?? "").split(/[,，]+/u).map((item) => item.trim()).filter(Boolean);
+			const metrics = (await ctx.ui.input("关联指标（逗号分隔，可空）") ?? "").split(/[,，]+/u).map((item) => item.trim()).filter(Boolean);
 			const { result: lesson, store: lessonStore } = await mutateStore(ctx, (data) => saveLesson(data, { title, detail, scope: { categories, keywords, metrics }, evidence, sourceRetro: outputPath, actor: actorName() }));
 			await withFileMutationQueue(output, () => repo.writeReport(output, generateRetroReport(lessonStore, generatedAt, reportOptions)));
 			rememberTouch({ action: "retro.save_lesson", conclusion: lesson.title, ids: [lesson.id, ...lesson.evidence] });

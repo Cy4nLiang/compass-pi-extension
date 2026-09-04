@@ -56,6 +56,26 @@ test("热路径 hook 不含任何写事务", async () => {
 	}
 });
 
+// MCP 载荷缓存挂在 tool_result 的非 compass 分支上。两条顺序是安全性要求不是风格：
+// 缓存必须排在计量**之后**，且不能与计量共用 catch——否则缓存抛错会把计量一起吞掉，
+// 变成「花了钱不记账」。热路径还必须零 I/O：溢写文件只记路径不读，文本只存不 parse。
+test("载荷缓存排在计量之后、另起 try，且热路径零 I/O", async () => {
+	const source = await readFile(join(repoRoot, "index.ts"), "utf8");
+	const body = hookBodies(source).get("tool_result");
+	assert.ok(body, "找不到 tool_result 片段");
+	const meterAt = body.indexOf("addPendingUsage(sample.server, sample.tool)");
+	const cacheAt = body.indexOf("mcpPayloads.remember(");
+	assert.notEqual(meterAt, -1, "找不到计量自增");
+	assert.notEqual(cacheAt, -1, "找不到载荷缓存调用");
+	assert.ok(cacheAt > meterAt, "缓存必须排在计量之后：共用一条路径时缓存抛错会把计量吞掉");
+	// 两段各自的 try：计量那段的 catch 与缓存那段的 catch 不能是同一个
+	assert.equal(body.slice(0, cacheAt).match(/\btry \{/gu)?.length, 2, "缓存必须另起一个 try，不与计量共用");
+	// 热路径零 I/O：读文件、解析 JSON 都不许出现在这个 hook 里
+	for (const forbidden of [/\breadFile\s*\(/u, /\breadFileSync\s*\(/u, /JSON\.parse\s*\(/u]) {
+		assert.equal(forbidden.test(body), false, `tool_result 里出现了 ${forbidden.source}：热路径必须零 I/O、零解析`);
+	}
+});
+
 test("生命周期 hook 仍带写事务——切片失效时这条先红", async () => {
 	// 反向哨兵：若 hookBodies 切出空片段或错位，上一条用例会假绿，而这条会立刻失败
 	const source = await readFile(join(repoRoot, "index.ts"), "utf8");

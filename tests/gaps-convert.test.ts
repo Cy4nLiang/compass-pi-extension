@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { CSV_ALIAS_HEADERS, parseMarketCsv } from "../csv.ts";
-import { convertSorftimePayloads, pickPath, slugForFileName, type CachedPayload, type SorftimeFieldMap } from "../gapfill-convert.ts";
+import { convertSorftimePayloads, createMcpPayloadCache, extractMcpPayload, pickPath, slugForFileName, type CachedPayload, type SorftimeFieldMap } from "../gapfill-convert.ts";
 import { calculateMarketMetrics } from "../metrics.ts";
 import { CompassRepository, IMPORTS_DIR_NAME } from "../store.ts";
 
@@ -281,5 +281,121 @@ test("写出的 CSV 权限 0600 且落在导入目录内", async () => {
 		assert.ok(result.csvPath.startsWith(`${IMPORTS_DIR_NAME}/`), `CSV 必须写在导入目录内，实得 ${result.csvPath}`);
 		const info = await stat(join(root, result.csvPath));
 		assert.equal(info.mode & 0o777, 0o600);
+	});
+});
+
+// ── 载荷抽取（H1）：五级链的顺序是这一节的全部重点 ──────────────────────────
+
+const textBlocks = (value: unknown) => [{ type: "text", text: JSON.stringify(value) }];
+
+test("① mcpResult 未被摘要时直接用它", () => {
+	const body = listingPayload(2);
+	const got = extractMcpPayload({ mode: "call", server: "sorftime", tool: "category_report", mcpResult: body }, textBlocks(body));
+	assert.equal(got?.payload.value, body, "应当是同一份对象引用，不拷贝");
+	assert.equal(got?.payload.text, undefined);
+});
+
+test("② 16–50 KiB 那一带：mcpResult 是摘要而正文完整——必须取正文，这是 PRD 的实锤缺陷", () => {
+	const body = keywordPayload(4);
+	// adapter 在整个 CallToolResult 超 16 KiB 时把 mcpResult 换成摘要，但正文没超 50 KiB 也没超
+	// 2000 行，所以 content 是完整的。照 PRD「优先 mcpResult」写会取到摘要 → 转出空 CSV
+	const summary = { omitted: true, reason: "result too large", rawResultBytes: 20_000, fullResultPath: "/tmp/pi-mcp-output-x/mcp-result-a.txt" };
+	const got = extractMcpPayload({ mode: "call", server: "sorftime", tool: "category_keywords", mcpResult: summary }, textBlocks(body));
+	assert.equal(got?.payload.value, undefined, "摘要不能被当成载荷");
+	assert.ok(got?.payload.text, "必须回退到完整正文");
+	assert.deepEqual(JSON.parse(got.payload.text), body);
+	// 摘要里的溢写路径仍要记下来清理
+	assert.deepEqual(got.payload.cleanupPaths, ["/tmp/pi-mcp-output-x/mcp-result-a.txt"]);
+});
+
+test("③ 正文被截断且有结果溢写：记 fullResultPath，并标明文件里是整个 CallToolResult", () => {
+	const got = extractMcpPayload(
+		{
+			mode: "call",
+			server: "sorftime",
+			tool: "category_report",
+			mcpResult: { omitted: true, fullResultPath: "/tmp/pi-mcp-output-a/mcp-result-1.txt" },
+			outputGuard: { truncated: true, fullOutputPath: "/tmp/pi-mcp-output-b/output-1.txt" },
+		},
+		[{ type: "text", text: "[MCP text output truncated: …]" }],
+	);
+	assert.equal(got?.payload.filePath, "/tmp/pi-mcp-output-a/mcp-result-1.txt", "结果链优先于正文链");
+	assert.equal(got?.payload.fileHoldsToolResult, true);
+	assert.equal(got?.payload.text, undefined, "截断的正文不能当载荷");
+	// 两条链各自 mkdtemp 过一个目录，两个文件都要清
+	assert.deepEqual(got.payload.cleanupPaths?.sort(), ["/tmp/pi-mcp-output-a/mcp-result-1.txt", "/tmp/pi-mcp-output-b/output-1.txt"]);
+	assert.equal(got.approxBytes, 0, "只记路径不占内存账");
+});
+
+test("④ 只有正文溢写时用 fullOutputPath，文件里就是正文", () => {
+	const got = extractMcpPayload(
+		{ mode: "call", server: "sorftime", tool: "category_report", outputGuard: { truncated: true, fullOutputPath: "/tmp/pi-mcp-output-c/output-9.txt" } },
+		[{ type: "text", text: "[MCP text output truncated: …]" }],
+	);
+	assert.equal(got?.payload.filePath, "/tmp/pi-mcp-output-c/output-9.txt");
+	assert.notEqual(got?.payload.fileHoldsToolResult, true, "这条链的文件不需要二次取 content");
+});
+
+test("⑤ 写溢写文件也失败时不缓存——载荷彻底不可恢复，宁可让 convert 说重来", () => {
+	assert.equal(
+		extractMcpPayload({ mode: "call", server: "sorftime", tool: "t", mcpResult: { omitted: true, resultWriteError: "ENOSPC" }, outputGuard: { truncated: true, writeError: "ENOSPC" } }, [
+			{ type: "text", text: "[MCP text output truncated: …]" },
+		]),
+		undefined,
+	);
+	// 认证失败之类根本没有载荷的分支同样不缓存
+	assert.equal(extractMcpPayload({ mode: "call", error: "auth_required", server: "sorftime", tool: "t" }, []), undefined);
+	assert.equal(extractMcpPayload(undefined, []), undefined);
+});
+
+test("缓存按批次取：只给本 server、本 ticket 窗口内的载荷", () => {
+	const cache = createMcpPayloadCache();
+	const at = (iso: string, id: string, server = "sorftime") =>
+		cache.remember({ server, tool: "category_report" }, { toolCallId: id, details: { mode: "call", server, tool: "t", mcpResult: { a: id } }, content: [], receivedAt: iso });
+	at("2026-09-04T10:00:00.000Z", "before");
+	at("2026-09-04T10:05:00.000Z", "inside");
+	at("2026-09-04T10:06:00.000Z", "other", "keepa");
+	const batch = cache.since("sorftime", "2026-09-04T10:01:00.000Z");
+	assert.deepEqual(batch.map((entry) => entry.toolCallId), ["inside"], "窗口之前的与别的 server 都不能进批次");
+	cache.forget(["inside"]);
+	assert.deepEqual(cache.since("sorftime", "2026-09-04T10:01:00.000Z"), [], "消费掉就丢弃——溢写文件已被删，留着会读到不存在的路径");
+});
+
+test("缓存按条数与字节双限逐出最旧的", () => {
+	const cache = createMcpPayloadCache({ maxEntries: 3, maxBytes: 10_000_000 });
+	for (let index = 0; index < 5; index += 1) {
+		cache.remember(
+			{ server: "sorftime", tool: "t" },
+			{ toolCallId: `id-${index}`, details: { mode: "call", server: "sorftime", tool: "t", mcpResult: { index } }, content: [], receivedAt: `2026-09-04T10:0${index}:00.000Z` },
+		);
+	}
+	assert.equal(cache.size, 3);
+	assert.deepEqual(cache.since("sorftime", "2026-09-04T00:00:00.000Z").map((entry) => entry.toolCallId), ["id-2", "id-3", "id-4"]);
+
+	// 字节限：单条就超限时至少留一条，别把刚收到的也逐掉
+	const tiny = createMcpPayloadCache({ maxEntries: 10, maxBytes: 10 });
+	tiny.remember({ server: "sorftime", tool: "t" }, { toolCallId: "big", details: { mode: "call", server: "sorftime", tool: "t" }, content: textBlocks(listingPayload(3)), receivedAt: "2026-09-04T10:00:00.000Z" });
+	assert.equal(tiny.size, 1);
+});
+
+test("同一个 toolCallId 重来时挪到队尾，不占着旧的逐出位置", () => {
+	const cache = createMcpPayloadCache({ maxEntries: 2 });
+	const put = (id: string, iso: string) =>
+		cache.remember({ server: "sorftime", tool: "t" }, { toolCallId: id, details: { mode: "call", server: "sorftime", tool: "t", mcpResult: { id } }, content: [], receivedAt: iso });
+	put("a", "2026-09-04T10:00:00.000Z");
+	put("b", "2026-09-04T10:01:00.000Z");
+	put("a", "2026-09-04T10:02:00.000Z");
+	put("c", "2026-09-04T10:03:00.000Z");
+	assert.deepEqual(cache.since("sorftime", "2026-09-04T00:00:00.000Z").map((entry) => entry.toolCallId).sort(), ["a", "c"], "被逐出的应是 b 而不是重来过的 a");
+});
+
+test("缓存下来的文本载荷能直接喂给转换，无需先 parse", async () => {
+	await withRepo(async (repo) => {
+		const cache = createMcpPayloadCache();
+		cache.remember({ server: "sorftime", tool: "category_report" }, { toolCallId: "l", details: { mode: "call", server: "sorftime", tool: "category_report" }, content: textBlocks(listingPayload(3)), receivedAt: "2026-09-04T10:00:00.000Z" });
+		cache.remember({ server: "sorftime", tool: "category_keywords" }, { toolCallId: "k", details: { mode: "call", server: "sorftime", tool: "category_keywords" }, content: textBlocks(keywordPayload(2)), receivedAt: "2026-09-04T10:01:00.000Z" });
+		const result = await convertSorftimePayloads({ repo }, { payloads: cache.since("sorftime", "2026-09-04T09:00:00.000Z"), map: MAP, marketName: "demo market", capturedDate: "2026-09-04" });
+		assert.equal(result.listingRows, 3);
+		assert.equal(result.keywordRows, 2);
 	});
 });

@@ -21,18 +21,153 @@ export interface SorftimeFieldMap {
 	keyword: Record<string, string>;
 }
 
-/** 一份缓存下来的 MCP 载荷。value 与 filePath 二选一：正文被截断时只有溢写文件。 */
+/**
+ * 一份缓存下来的 MCP 载荷。三种取值形态互斥，按可靠性排序：
+ * `value`（已是对象）→ `text`（原始 JSON 正文，延后 parse）→ `filePath`（只有溢写文件）。
+ */
 export interface CachedPayload {
 	server: string;
 	tool: string;
-	/** 内联载荷（未被摘要/截断时可用） */
+	/** 内联对象载荷：details.mcpResult 未被摘要时就是它 */
 	value?: unknown;
-	/** 溢写文件路径。两条链的字段名不同，这里统一成一个路径 + 是否需要二次取 result */
+	/** 内联文本载荷：正文未被截断时的 content 拼接结果。热路径不 parse，留给 convert */
+	text?: string;
+	/** 溢写文件路径。两条链的字段名不同，这里统一成一个路径 + 是否要二次取 result */
 	filePath?: string;
 	/** filePath 指向的是完整 CallToolResult 而不是正文时为真（mcpResult.fullResultPath 那条链） */
 	fileHoldsToolResult?: boolean;
-	/** 读完要删的临时文件；目录随之一并清理 */
+	/** 读完要删的临时文件；其所在目录随之一并清理 */
 	cleanupPaths?: string[];
+}
+
+/** pi-mcp-adapter 的 outputGuard（正文截断链）。字段名以 mcp-output-guard.ts 的类型定义为准。 */
+interface OutputGuardDetails {
+	truncated?: boolean;
+	fullOutputPath?: string;
+	writeError?: string;
+}
+
+/** pi-mcp-adapter 的 mcpResult 摘要（结果溢写链）。`omitted: true` 是「这不是真载荷」的判据。 */
+interface McpResultSummaryShape {
+	omitted?: boolean;
+	fullResultPath?: string;
+	resultWriteError?: string;
+}
+
+/** details.mcpResult ≤16 KiB 时是原对象引用，取不到精确字节数就按这个上界记账。 */
+const DETAILS_MAX_BYTES = 16 * 1024;
+
+/**
+ * 从一次 MCP 工具结果里抽出可用载荷。**纯函数、零 I/O**：溢写文件只记路径不读，
+ * 文本只存不 parse——它跑在 `tool_result` 热路径上。
+ *
+ * 五级链，顺序不能换：
+ *   ① `mcpResult` 且 `omitted !== true` —— 完整对象，最可靠
+ *   ② 正文未被截断 —— content 的 text 块拼接（此时哪怕 mcpResult 是摘要，正文也是全的）
+ *   ③ `mcpResult.fullResultPath` —— 结果溢写，文件里是整个 CallToolResult
+ *   ④ `outputGuard.fullOutputPath` —— 正文溢写，文件里就是正文
+ *   ⑤ 都没有 —— 不缓存
+ *
+ * ②必须排在③④前面：16–50 KiB 那一带 `mcpResult` 是摘要而 content 是**完整的**，
+ * 若照「优先 mcpResult」写，convert 会从摘要里取到 undefined，转出空 CSV 或半张表。
+ */
+export function extractMcpPayload(
+	details: unknown,
+	content: ReadonlyArray<{ type?: string; text?: string }> | undefined,
+): { payload: Omit<CachedPayload, "server" | "tool">; approxBytes: number } | undefined {
+	if (!details || typeof details !== "object") return undefined;
+	const record = details as { mcpResult?: unknown; outputGuard?: OutputGuardDetails };
+	const guard = record.outputGuard;
+	const summary = record.mcpResult as McpResultSummaryShape | undefined;
+	const cleanupPaths = [guard?.fullOutputPath, summary?.fullResultPath].filter((path): path is string => typeof path === "string" && path.length > 0);
+
+	if (record.mcpResult !== undefined && summary?.omitted !== true) {
+		return { payload: { value: record.mcpResult, cleanupPaths }, approxBytes: DETAILS_MAX_BYTES };
+	}
+	const text = (content ?? [])
+		.filter((block) => block?.type === "text" && typeof block.text === "string")
+		.map((block) => block.text as string)
+		.join("\n");
+	if (text && guard?.truncated !== true) {
+		return { payload: { text, cleanupPaths }, approxBytes: text.length };
+	}
+	if (typeof summary?.fullResultPath === "string" && summary.fullResultPath) {
+		return { payload: { filePath: summary.fullResultPath, fileHoldsToolResult: true, cleanupPaths }, approxBytes: 0 };
+	}
+	if (typeof guard?.fullOutputPath === "string" && guard.fullOutputPath) {
+		return { payload: { filePath: guard.fullOutputPath, cleanupPaths }, approxBytes: 0 };
+	}
+	return undefined;
+}
+
+export interface McpPayloadEntry extends CachedPayload {
+	toolCallId: string;
+	receivedAt: string;
+	approxBytes: number;
+}
+
+export interface McpPayloadCache {
+	/** 收下一次 MCP 结果里的载荷；抽不出可用载荷时什么都不做 */
+	remember(sample: { server: string; tool: string }, event: { toolCallId: string; details?: unknown; content?: ReadonlyArray<{ type?: string; text?: string }>; receivedAt?: string }): void;
+	/** 某 server 在给定时刻之后收到的载荷，按到达顺序——ticket 用它界定一个批次 */
+	since(server: string, sinceIso: string): McpPayloadEntry[];
+	/** 转换消费掉之后丢弃：它已把溢写文件删了，留着只会让下次读到不存在的路径 */
+	forget(toolCallIds: readonly string[]): void;
+	readonly size: number;
+}
+
+/**
+ * MCP 载荷的会话内缓存。纯内存、零 I/O——它跑在 `tool_result` 热路径上。
+ *
+ * 生命周期只到 `/reload`：载荷引用本来就随 details 落进了会话文件，这里持同一份不额外增内存，
+ * 但文本副本与溢写路径会真占地方，所以按条数与近似字节双限，逐出最旧的。
+ *
+ * 方法名一律避开 `update`——compass 的 static-invariants 用纯文本正则 `/\.update\s*\(/` 判
+ * 「热路径出现写事务」，缓存里出现 `xxx.update(` 会被误判。
+ */
+export function createMcpPayloadCache(options: { maxEntries?: number; maxBytes?: number } = {}): McpPayloadCache {
+	const maxEntries = options.maxEntries ?? 20;
+	const maxBytes = options.maxBytes ?? 2 * 1_048_576;
+	const entries = new Map<string, McpPayloadEntry>();
+
+	const evict = () => {
+		let bytes = 0;
+		for (const entry of entries.values()) bytes += entry.approxBytes;
+		while (entries.size > maxEntries || (bytes > maxBytes && entries.size > 1)) {
+			const oldest = entries.keys().next();
+			if (oldest.done) break;
+			bytes -= entries.get(oldest.value)?.approxBytes ?? 0;
+			entries.delete(oldest.value);
+		}
+	};
+
+	return {
+		remember(sample, event) {
+			const extracted = extractMcpPayload(event.details, event.content);
+			if (!extracted) return;
+			// 先删再设：同一个 toolCallId 重来时要挪到队尾，否则逐出顺序会认旧位置
+			entries.delete(event.toolCallId);
+			entries.set(event.toolCallId, {
+				...extracted.payload,
+				toolCallId: event.toolCallId,
+				server: sample.server,
+				tool: sample.tool,
+				receivedAt: event.receivedAt ?? new Date().toISOString(),
+				approxBytes: extracted.approxBytes,
+			});
+			evict();
+		},
+		since(server, sinceIso) {
+			const since = Date.parse(sinceIso);
+			return [...entries.values()].filter((entry) => entry.server === server && Date.parse(entry.receivedAt) >= since);
+		},
+		forget(toolCallIds) {
+			for (const id of toolCallIds) entries.delete(id);
+		},
+		get size() {
+			return entries.size;
+		},
+	};
 }
 
 export interface ConvertDeps {
@@ -101,6 +236,8 @@ export function slugForFileName(marketName: string): string {
 
 async function resolvePayload(payload: CachedPayload): Promise<unknown> {
 	if (payload.value !== undefined) return payload.value;
+	// 文本形态在热路径上只存不 parse，到这里才解析
+	if (payload.text !== undefined) return JSON.parse(payload.text) as unknown;
 	if (!payload.filePath) return undefined;
 	const raw = await readFile(payload.filePath, "utf8");
 	const parsed = JSON.parse(raw) as unknown;

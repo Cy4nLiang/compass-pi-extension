@@ -17,6 +17,7 @@ import { Type } from "typebox";
 import { DOMAIN_TOOLS, rankTools, searchTerms } from "./catalog.ts";
 import { compareSnapshotRecencyDesc, snapshotTtlDays } from "./defaults.ts";
 import { estimateProfit, normalizeProfitInput } from "./economics.ts";
+import { createMcpPayloadCache } from "./gapfill-convert.ts";
 import {
 	GAPFILL_MODES,
 	GAP_AUTO_TIERS,
@@ -368,6 +369,12 @@ export default function compassExtension(pi: ExtensionAPI): void {
 		todosByStore.set(store, todos);
 		return todos;
 	}
+
+	// MCP 载荷缓存：把 Sorftime 返回体留在内存里，供 compass_gaps convert 做确定性转换。
+	// 实现在 gapfill-convert.ts（纯内存、零 I/O、可单测）；这里只持一个会话级实例。
+	// 生命周期只到 /reload —— 「引用还在但缓存已空」是正常形态，convert 遇到必须明说
+	// 「请重新调用」，绝不静默产半张 CSV。
+	const mcpPayloads = createMcpPayloadCache();
 
 	// 从状态文件恢复档位与静音。受限会话固定 off 且完全不读文件（那是 owner 的偏好）。
 	// 读失败分两种：文件不存在是常态、静默；解析坏或权限不足要说出来并记下，
@@ -1852,11 +1859,20 @@ export default function compassExtension(pi: ExtensionAPI): void {
 		if (!ctx.isProjectTrusted()) return;
 		if (!event.toolName.startsWith("compass_")) {
 			// MCP 计量：只做内存自增（O(1)、零 I/O），落账在安全点完成；计量绝不影响工具结果
+			let sample: ReturnType<typeof classifyMcpToolResult>;
 			try {
-				const sample = classifyMcpToolResult(event.toolName, event.details);
+				sample = classifyMcpToolResult(event.toolName, event.details);
 				if (sample?.billable) addPendingUsage(sample.server, sample.tool);
 			} catch {
 				return;
+			}
+			// 载荷缓存另起一个 try：它必须排在计量**之后**，且不能与计量共用 catch——
+			// 否则缓存抛错会把计量一起吞掉，变成「花了钱不记账」，那是最坏的方向。
+			// 这里同样零 I/O：溢写文件只记路径不读，文本只存不 parse（热路径纪律）。
+			try {
+				if (sample) mcpPayloads.remember(sample, event);
+			} catch {
+				// 缓存是补数的便利设施，坏了不影响计量与工具结果
 			}
 			return;
 		}

@@ -28,6 +28,25 @@ const ADAPTER_DETAILS = {
 	proxyServerDisabled: { mode: "call", error: "server_disabled", server: "sorftime", tool: "ProductResearch", message: "disabled" },
 	proxyApprovalDenied: { mode: "call", error: "approval_denied", server: "sorftime", tool: "ProductResearch" },
 	proxyToolNotFound: { mode: "call", error: "tool_not_found_after_reconnect", server: "sorftime", requestedTool: "P", suggestions: [] },
+	// 超大返回的三档形态（pi-mcp-adapter 的 mcp-output-guard）。二期的载荷缓存按这三档取值，
+	// 这里先把它们钉进计量口径：无论载荷多大、被搬到哪里，计费判定只看 error。
+	// ① 整个 CallToolResult ≤16 KiB：mcpResult 就是原对象
+	proxySuccessInlineResult: { mode: "call", server: "sorftime", tool: "category_keywords", mcpResult: { content: [{ type: "text", text: "{}" }], isError: false } },
+	// ② >16 KiB 但正文 ≤50 KiB 且 ≤2000 行：mcpResult 被换成摘要，正文仍然是完整的
+	proxySuccessSummarizedResult: {
+		mode: "call",
+		server: "sorftime",
+		tool: "category_keywords",
+		mcpResult: { omitted: true, reason: "result too large", isError: false, contentBlocks: 1, rawResultBytes: 20_480, fullResultPath: "/tmp/pi-mcp-output-a/mcp-result-1.txt" },
+	},
+	// ③ 正文 >50 KiB 或 >2000 行：正文也被截断溢写，两条链各留一个文件
+	proxySuccessTruncatedOutput: {
+		mode: "call",
+		server: "sorftime",
+		tool: "category_report",
+		mcpResult: { omitted: true, reason: "result too large", isError: false, contentBlocks: 1, rawResultBytes: 81_920, fullResultPath: "/tmp/pi-mcp-output-a/mcp-result-1.txt" },
+		outputGuard: { truncated: true, originalBytes: 78_632, returnedBytes: 2_048, fullOutputPath: "/tmp/pi-mcp-output-b/output-1.txt" },
+	},
 } as const;
 
 test("ensureDefaults adds the sorftime metering pool exactly once", () => {
@@ -427,5 +446,20 @@ test("预算「本月」按 UTC 月结算，北京时间 1 日 08:00 整才翻�
 		mock.timers.reset();
 		if (originalTz === undefined) delete process.env.TZ;
 		else process.env.TZ = originalTz;
+	}
+});
+
+test("超大返回的三档形态照常计费：计费只看 error，不看载荷被搬到哪里（G1）", () => {
+	// 二期的载荷缓存要从 mcpResult / outputGuard 里取值，这里先钉住计量侧不受影响：
+	// 摘要与溢写都是 adapter 在 callTool **成功返回之后**做的搬运，钱早就花了。
+	for (const [name, details] of [
+		["inlineResult", ADAPTER_DETAILS.proxySuccessInlineResult],
+		["summarizedResult", ADAPTER_DETAILS.proxySuccessSummarizedResult],
+		["truncatedOutput", ADAPTER_DETAILS.proxySuccessTruncatedOutput],
+	] as const) {
+		const sample = classifyMcpToolResult("mcp", details);
+		assert.equal(sample?.billable, true, `${name} 应计费`);
+		assert.equal(sample?.server, "sorftime", `${name} 的池名要归一到 sorftime`);
+		assert.equal(sample?.tool, details.tool, `${name} 的工具名要取 details.tool`);
 	}
 });

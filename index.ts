@@ -19,6 +19,7 @@ import { compareSnapshotRecencyDesc, snapshotTtlDays } from "./defaults.ts";
 import { estimateProfit, normalizeProfitInput } from "./economics.ts";
 import { convertSorftimePayloads, createMcpPayloadCache, parseSorftimeFieldMap, type McpPayloadEntry, type SorftimeFieldMap } from "./gapfill-convert.ts";
 import {
+	hasEffectiveLimit,
 	GAPFILL_MODES,
 	GAP_AUTO_TIERS,
 	GAP_ORIGINS,
@@ -1498,7 +1499,15 @@ export default function compassExtension(pi: ExtensionAPI): void {
 
 				const confirmGaps = filtered.filter((gap) => gap.autoTier === "A_confirm");
 				if (!confirmGaps.length) {
-					throw new Error(`${market.name} 当前没有需要确认的 A 档缺口；先跑 compass_gaps action=plan market_ref=${market.id} 看还缺什么。`);
+					// 池没有可生效上限时，缺口层会把 A 档整体降级成 manual（gaps.ts 的 limitConfigured），
+					// 于是这里得到的永远是「没有 A 档缺口」而不是「池没配上限」——真正的原因得自己说出来。
+					// 不说的话运营被指去 plan，而 plan 只在来源行里写一句「未配可生效上限」，
+					// 要在几十行里认出那五个字才行。
+					const unlimited = store.budgetPools.filter((pool) => pool.tier === "A" && pool.enabled && !hasEffectiveLimit(pool)).map((pool) => pool.source);
+					const why = unlimited.length
+						? `。${unlimited.join(" / ")} 还没有可生效的上限（只配金额上限而单价缺省时自动计量恒为 0，熔断门空转），A 档在这种状态下不会被提供——先配上限：compass_budget configure source=${unlimited[0]} monthly_call_limit=<次数>`
+						: "";
+					throw new Error(`${market.name} 当前没有需要确认的 A 档缺口${why}；先跑 compass_gaps action=plan market_ref=${market.id} 看还缺什么。`);
 				}
 				// 付费源取自缺口自己给出的 A 档来源，不在这里硬编码池名——两处各写一份迟早分裂成
 				// 「计划里说找 X 补，确认时扣的是 Y 的额度」
@@ -1514,8 +1523,13 @@ export default function compassExtension(pi: ExtensionAPI): void {
 				// 弹窗上就会给运营一个偏小的「本月已用」，而这正是他要据以决定花不花钱的数字
 				const pool = budgetStatus(store, undefined, pending).find((item) => item.source === server);
 				if (!pool) throw new Error(`预算池 ${server} 不存在：先 compass_budget configure source=${server} 建池再确认。`);
-				// 没有可生效上限 = 熔断永远不触发。这种状态下批准自动补数，等于把「花多少」这件事
-				// 交给运气；受限会话的启动器也按同一条规则拒绝启动
+				// 没有可生效上限 = 熔断永远不触发，这种状态下不批准自动补数。
+				// **这段目前到不了**：A_confirm 的判据是 gaps.ts 的 limitConfigured，而
+				// limitConfigured ⇒ state !== "free"（前者要 monthlyCallLimit>0 或
+				// monthlyLimitCny>0 且单价>0，两种都让 state 离开 free），所以上面那条
+				// 「没有 A 档缺口」会先抛。留着是防重排的兜底层，不要为它写用例——那得手工
+				// 拼一个系统自己产生不出来的 store 状态，测的是不存在的东西。真正会被运营
+				// 看到的是上面那条带 configure 指引的报错。
 				if (pool.state === "free") {
 					throw new Error(`${server} 预算池没有可生效的上限（monthly_call_limit 与 monthly_limit_cny 都没配），熔断永远不会触发——这种状态下不批准自动补数。先配上限：compass_budget configure source=${server} monthly_call_limit=<次数>。`);
 				}

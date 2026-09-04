@@ -467,6 +467,19 @@ export function gapRouteKey(field: string): string {
 	return "generic";
 }
 
+/**
+ * 池的上限「是否真的会生效」。只配金额上限而单价缺省时，自动计量的金额恒为 0，
+ * 熔断门空转，等于没配（默认 sorftime 池就是这种情况）。
+ *
+ * 这条被两处共用：`resolveSources` 用它决定 A 档要不要降级成 manual，
+ * `compass_gaps action=approve` 用它解释「为什么这个市场没有 A 档缺口」。
+ * 两边各写一份的话，缺口层降级了而 approve 说不出原因，运营只会看到一句
+ * 「当前没有需要确认的 A 档缺口」，然后去 plan 里找那行小字。
+ */
+export function hasEffectiveLimit(pool: { enabled: boolean; monthlyLimitCny: number; monthlyCallLimit?: number; costPerCallCny?: number } | undefined): boolean {
+	return Boolean(pool?.enabled && ((pool.monthlyCallLimit !== undefined && pool.monthlyCallLimit > 0) || (pool.monthlyLimitCny > 0 && (pool.costPerCallCny ?? 0) > 0)));
+}
+
 // 与 compass_data_route 的 available() 同口径：池启用且未熔断。
 // limitConfigured 另判「上限是否真的会生效」——只配金额上限而单价缺省时自动计量金额恒 0，
 // 熔断门同样空转，等于没配（默认 sorftime 池就是这种情况）。
@@ -474,10 +487,7 @@ function resolveSources(routeKey: string, budgets: readonly GapBudgetPool[], loc
 	const templates = GAP_SOURCE_MATRIX[routeKey] ?? GAP_SOURCE_MATRIX.generic;
 	const options: GapSourceOption[] = templates.map((template) => {
 		const pool = budgets.find((item) => item.source === template.source);
-		const limitConfigured = Boolean(
-			pool?.enabled &&
-				((pool.monthlyCallLimit !== undefined && pool.monthlyCallLimit > 0) || (pool.monthlyLimitCny > 0 && (pool.costPerCallCny ?? 0) > 0)),
-		);
+		const limitConfigured = hasEffectiveLimit(pool);
 		const available =
 			template.tier === "manual" || template.source === "local_history" || template.source === "manual_csv"
 				? true

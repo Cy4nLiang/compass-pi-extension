@@ -10,6 +10,7 @@ import {
 	PROFIT_ASSUMED_DEFAULTS,
 	RISK_CONTEXT_METRICS,
 	deriveGaps,
+	hasEffectiveLimit,
 	diffGaps,
 	gapActionLine,
 	gapLabel,
@@ -777,4 +778,24 @@ test("瞬时缺口不属于任何市场，也不进 deriveGaps", () => {
 
 	const store = fullCoverageStore();
 	assert.equal(derive(store).filter((item) => item.origin === "profit_unpersisted").length, 0);
+});
+
+test("hasEffectiveLimit：只配金额上限而单价缺省 = 等于没配（两个调用点共用这条）", () => {
+	const base = { enabled: true, monthlyLimitCny: 0 };
+	assert.equal(hasEffectiveLimit(undefined), false, "池不存在");
+	assert.equal(hasEffectiveLimit(base), false, "什么都没配");
+	assert.equal(hasEffectiveLimit({ ...base, enabled: false, monthlyCallLimit: 50 }), false, "禁用的池配了上限也不算");
+	assert.equal(hasEffectiveLimit({ ...base, monthlyCallLimit: 50 }), true, "配了次数上限");
+	assert.equal(hasEffectiveLimit({ ...base, monthlyCallLimit: 0 }), false, "次数上限 0 = 清除");
+
+	// 这条是整个函数存在的理由：自动计量按「次数 × 单价」折算金额，单价缺省时金额恒为 0，
+	// 金额上限再高也永远撞不到，熔断门空转。默认 sorftime 池就是这种形状
+	assert.equal(hasEffectiveLimit({ ...base, monthlyLimitCny: 500 }), false, "只配金额、单价缺省 = 熔断空转");
+	assert.equal(hasEffectiveLimit({ ...base, monthlyLimitCny: 500, costPerCallCny: 0 }), false, "单价 0 同理");
+	assert.equal(hasEffectiveLimit({ ...base, monthlyLimitCny: 500, costPerCallCny: 0.5 }), true, "金额 + 单价才算配上了");
+
+	// 与 budgetStatus 的 state 的关系：limitConfigured ⇒ state !== "free"（单向蕴含，不是等价）。
+	// approve 里那段 state === "free" 的拒绝因此不可达——这条断言把那个前提钉住，
+	// 哪天 limitConfigured 放宽到「只看金额上限」，它会先红
+	assert.equal(hasEffectiveLimit({ ...base, monthlyLimitCny: 500 }), false, "金额上限单独成立时 state 已离开 free，但这里必须仍是 false，否则 approve 的 free 分支会变成可达而无人测");
 });

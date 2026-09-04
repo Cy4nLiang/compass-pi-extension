@@ -80,6 +80,13 @@ const NORMALIZED_ALIASES = Object.fromEntries(
 	Object.entries(FIELD_ALIASES).map(([field, aliases]) => [field, new Set(aliases.map(normalizeHeader))]),
 ) as Record<string, Set<string>>;
 
+// 生成 CSV 时该用哪个表头：每组别名的第一个（一律是英文小写形态）。
+// 语义定死在这里而不是让调用方自己去 `FIELD_ALIASES[field][0]`——否则「取第一个」这条规则
+// 会变成外部文件与本表数组顺序之间的隐式契约（补数转换的映射文件用的就是这些字符串做键）。
+export const CSV_ALIAS_HEADERS: Readonly<Record<string, string>> = Object.freeze(
+	Object.fromEntries(Object.entries(FIELD_ALIASES).map(([field, aliases]) => [field, aliases[0]])),
+);
+
 export interface DecodedCsv {
 	text: string;
 	/** 实际采用的编码标签，供告警文案与排查使用 */

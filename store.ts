@@ -303,6 +303,10 @@ async function readStoreHead(path: string): Promise<string> {
 	}
 }
 
+// 运营放置市场 CSV 的入口目录名。原本只是 web/server.ts 的私有常量，补数转换也要往那儿写，
+// 上提到这里做唯一真相源——两处各写一份的话，将来改目录名必然漏一处。
+export const IMPORTS_DIR_NAME = "compass-imports";
+
 function safeBaseName(fileName: string): string {
 	return basename(fileName)
 		.normalize("NFKC")
@@ -364,6 +368,7 @@ export class CompassRepository {
 	readonly reportsDir: string;
 	readonly snapshotDataDir: string;
 	readonly gapfillDir: string;
+	readonly importsDir: string;
 	readonly lockPath: string;
 
 	constructor(projectRoot: string, configDirName = ".pi") {
@@ -378,6 +383,9 @@ export class CompassRepository {
 		this.reportsDir = resolve(this.dataDir, "reports");
 		this.snapshotDataDir = resolve(this.dataDir, "snapshots");
 		this.gapfillDir = resolve(this.dataDir, "gapfill");
+		// 运营放置市场 CSV 的入口目录，也是补数转换写出 CSV 的落点。
+		// 它在**项目根**而不是 .pi/compass/ 下：运营要能直接看见、直接放文件
+		this.importsDir = resolve(this.projectRoot, IMPORTS_DIR_NAME);
 		this.lockPath = `${this.storePath}.lock`;
 	}
 
@@ -714,6 +722,21 @@ export class CompassRepository {
 
 	// backupExisting：上一次读失败时置真。写是整份覆盖，直接盖掉就等于把运营手改坏的那份
 	// （以及里面还认得出的静音清单）永久销毁；先留一份 .bak 再覆盖，代价一次 copy。
+	// 补数转换写出的市场 CSV。落在**运营的入口目录**而不是 .pi/compass/ 下，因为它接下来要被
+	// compass_import_csv 当普通 CSV 导入——回写只走现有入口，不另开第二条导入链路。
+	// 文件名经 safeBaseName 净化并做 pathWithin 复核：名字里的路径分隔符不能把文件写出目录外。
+	async writeImportCsv(fileName: string, csv: string): Promise<string> {
+		const target = canonicalPath(resolve(this.importsDir, safeBaseName(fileName)));
+		if (!pathWithin(this.projectRoot, this.importsDir) || !pathWithin(canonicalPath(this.importsDir), target)) {
+			throw new Error(`导入 CSV 必须写在 ${IMPORTS_DIR_NAME} 目录内`);
+		}
+		// mode 只对新建目录生效；运营已有的目录权限不会被这里改窄
+		await mkdir(this.importsDir, { recursive: true, mode: 0o700 });
+		await this.writeAtomic(target, csv, 0o600);
+		await chmod(target, 0o600).catch(() => undefined);
+		return relative(this.projectRoot, target);
+	}
+
 	async writeGapfillState(state: unknown, options: { backupExisting?: boolean } = {}): Promise<void> {
 		const target = this.gapfillStatePath;
 		await mkdir(dirname(target), { recursive: true, mode: 0o700 });

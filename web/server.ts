@@ -12,7 +12,7 @@ import {
 	reopenTodoResolution,
 	submitTodoResolution,
 } from "../service.ts";
-import { CompassRepository, StoreIoError } from "../store.ts";
+import { CompassRepository, IMPORTS_DIR_NAME, StoreIoError } from "../store.ts";
 import { CANDIDATE_STAGES, DECISION_STATUSES, SNAPSHOT_SOURCES, TODO_RESOLUTION_STATUS_LABELS, type CandidateStage, type CompassStore, type DecisionStatus, type TodoResolution } from "../types.ts";
 import {
 	budgetData,
@@ -33,7 +33,6 @@ const DEFAULT_PORT = 4780;
 const DEFAULT_HOST = "127.0.0.1";
 // Web 写操作统一署名，便于在 decisionLog 里与 pi 会话、自动计量区分来源
 const WEB_ACTOR = "compass-web";
-const IMPORTS_DIR_NAME = "compass-imports";
 const MAX_BODY_BYTES = 1_000_000;
 // 证据条目上限：与 compass_todo 工具面的 maxItems 一致，防单次提交塞入超长列表
 const MAX_EVIDENCE_ITEMS = 20;

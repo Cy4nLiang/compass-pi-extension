@@ -399,8 +399,11 @@ test("毛利 Gate 阈值不得在 economics / service / index 里以字面量比
 		});
 	}
 	assert.deepEqual(offenders, [], "毛利 Gate 阈值只能来自 DEFAULT_GATE_THRESHOLDS / gateThresholds(store)");
+	// 先切到 estimateProfit 的签名行再钉默认参数（只搜标识符会被 CPC 行的同名引用假绿）
 	const economics = await readFile(join(repoRoot, "economics.ts"), "utf8");
-	assert.ok(economics.includes("DEFAULT_GATE_THRESHOLDS"), "economics.ts 必须从 defaults.ts 取毛利 Gate 默认阈值");
+	const signature = economics.split("\n").find((line) => line.startsWith("export function estimateProfit("));
+	assert.ok(signature, "economics.ts 里找不到 export function estimateProfit(");
+	assert.match(signature, /thresholds: ProfitGateThresholds = DEFAULT_GATE_THRESHOLDS\)/u, "estimateProfit 的默认阈值必须是 defaults.ts 的 DEFAULT_GATE_THRESHOLDS，不能是字面量");
 	// 工具层接线钉位置（评审变异核对：把 estimateProfit(input, thresholds) 改回单参，全量测试与 tsc 都不会红）
 	const source = await readFile(join(repoRoot, "index.ts"), "utf8");
 	const body = toolBody(source, "compass_profit_estimate");

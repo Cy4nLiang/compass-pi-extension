@@ -257,6 +257,8 @@ test("normalizeCapturedAt 对 YYYY/MM/DD、点号与中文纯日期按 UTC 零�
 		// 回卷日期必须拒绝，而不是回退到 new Date(原串) 让 V8 进位到下月 1 日再带回本地时区依赖
 		assert.throws(() => normalizeCapturedAt("2026/02/30", now), /captured_at 日期不存在/, `TZ=${tz}`);
 		assert.throws(() => normalizeCapturedAt("2026-4-31", now), /captured_at 日期不存在/, `TZ=${tz}`);
+		// 两位数年份是年份手滑不是「日期不存在」：Date.UTC 会把 0–99 映射成 1900 年代，必须走「过早」而不是回环校验
+		assert.throws(() => normalizeCapturedAt("0026/09/01", now), /captured_at 过早/, `TZ=${tz}`);
 	});
 });
 

@@ -699,7 +699,7 @@ test("内置 YAML 的 Gate 阈值与 DEFAULT_GATE_THRESHOLDS 逐条相等（D-1 
 });
 
 test("ruleThreshold 的数字文法与 tokenize 一致：.35 / 3. / 35e-2 不得回落内置默认（D-1 缺陷组 ② 评审补）", () => {
-	for (const [written, expected] of [[".35", 0.35], ["35e-2", 0.35], ["0.355", 0.355], ["3.", 3]] as const) {
+	for (const [written, expected] of [[".35", 0.35], ["35e-2", 0.35], ["35E-2", 0.35], ["0.355", 0.355], ["3.", 3]] as const) {
 		const definition = parseStrategyYaml(DEFAULT_STRATEGY_YAML.replace("gross_margin >= 0.40", `gross_margin >= ${written}`));
 		assert.equal(ruleThreshold(definition, "gross_margin_gate")?.value, expected, written);
 		assert.deepEqual(gateThresholdsFor(definition).fallbacks, [], written);

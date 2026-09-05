@@ -408,3 +408,15 @@ test("毛利 Gate 阈值不得在 economics / service / index 里以字面量比
 	assert.match(body, /estimateProfit\(input, thresholds\)/u, "compass_profit_estimate 必须把策略阈值传给 estimateProfit");
 	assert.match(body, /status: result\.warnings\.length === 0 \? "success" : "warning"/u, "status 只看 warnings 是否为空（②-2 记录的行为变化）");
 });
+
+// —— D-1 缺陷组 ①：compass_history outcomes header 的四桶字段（2026-09-05）——
+// 四条统计展示链路里只有这条没有行为测试；评审变异核对：删掉 waitlist_anchored 全量仍绿。
+test("compass_history action=outcomes 的 header 带 comparable / strategy_only / waitlist_anchored 三个四桶字段（D-1 缺陷组 ①）", async () => {
+	const source = await readFile(join(repoRoot, "index.ts"), "utf8");
+	const body = toolBody(source, "compass_history");
+	const headerLine = body.split("\n").find((line) => line.includes("const header = `checks=${stats.total}"));
+	assert.ok(headerLine, "compass_history 里找不到 outcomes 的 header 模板行——切片已失效");
+	for (const field of ["comparable=${stats.comparable}", "strategy_only=${stats.strategyOnly}", "waitlist_anchored=${stats.waitlistAnchored}", "rated_markets=${stats.ratedMarkets}"]) {
+		assert.ok(headerLine.includes(` | ${field}`), `header 缺 ${field}`);
+	}
+});

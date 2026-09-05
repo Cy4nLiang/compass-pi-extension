@@ -451,16 +451,24 @@ test("对照条数在四个桶里恰好分完：可判 + 无锚点 + waitlist �
 		check("chk_bare_i", "m3", undefined, "inconclusive"),
 		check("chk_go_i", "m4", "go", "inconclusive"),
 		check("chk_no_v", "m5", "no_go", "validated"),
+		// 评审变异核对补的两条：写路径对 waitlist 恒给 inconclusive，它必须只进 inconclusive 桶（不双计进 waitlistAnchored）；
+		// 同市场更早的一条可判对照让 comparable（去重前）≠ ratedMarkets（去重后），单元层就能分清两数
+		check("chk_wait_i", "m6", "waitlist", "inconclusive"),
+		check("chk_no_v_old", "m5", "no_go", "validated", { createdAt: "2025-12-01T00:00:00.000Z" }),
 	);
 	const stats = outcomeStatistics(store);
-	assert.equal(stats.comparable, 1);
+	assert.equal(stats.comparable, 2);
 	assert.equal(stats.ratedMarkets, 1);
 	assert.equal(stats.strategyOnly, 0);
 	assert.equal(stats.waitlistAnchored, 2);
-	assert.equal(stats.inconclusive, 2);
+	assert.equal(stats.inconclusive, 3);
+	assert.equal(stats.total, 7);
 	assert.equal(stats.comparable + stats.strategyOnly + stats.waitlistAnchored + stats.inconclusive, stats.total);
 	// 可判判据本身不动：waitlist 没有可比的期望结果，desiredOutcomeForCheck 与 backtest 同口径
 	assert.equal(latestComparableChecks(store.outcomeChecks).length, 1);
+	// Web DTO 必须原样透传四桶（评审变异核对：把 data.ts 里任一桶改成 0，此前没有用例会红）
+	const web = retroData(store, "2026-03-01T00:00:00.000Z").stats;
+	assert.deepEqual([web.comparable, web.ratedMarkets, web.strategyOnly, web.waitlistAnchored, web.inconclusive], [2, 1, 0, 2, 3]);
 });
 
 test("无锚点且 inconclusive 的对照只进 inconclusive，不再同时进 strategyOnly（Web 同屏双计）（D-1 缺陷组 ①）", () => {

@@ -368,6 +368,8 @@ export class CompassRepository {
 	readonly reportsDir: string;
 	readonly snapshotDataDir: string;
 	readonly gapfillDir: string;
+	readonly dispatchDir: string;
+	readonly materialsDir: string;
 	readonly importsDir: string;
 	readonly lockPath: string;
 
@@ -383,6 +385,10 @@ export class CompassRepository {
 		this.reportsDir = resolve(this.dataDir, "reports");
 		this.snapshotDataDir = resolve(this.dataDir, "snapshots");
 		this.gapfillDir = resolve(this.dataDir, "gapfill");
+		this.dispatchDir = resolve(this.dataDir, "dispatch");
+		// 差评材料。只给 compass_dispatch 读进内存发给子代理，index.ts 的读守卫把它和
+		// store.json / snapshots 一并拦掉——「材料不进主会话上下文」因此是结构事实而不是约定
+		this.materialsDir = resolve(this.dataDir, "materials");
 		// 运营放置市场 CSV 的入口目录，也是补数转换写出 CSV 的落点。
 		// 它在**项目根**而不是 .pi/compass/ 下：运营要能直接看见、直接放文件
 		this.importsDir = resolve(this.projectRoot, IMPORTS_DIR_NAME);
@@ -749,5 +755,61 @@ export class CompassRepository {
 		}
 		await this.writeAtomic(target, `${JSON.stringify(state, null, "\t")}\n`, 0o600);
 		await chmod(target, 0o600).catch(() => undefined);
+	}
+
+	// 子代理派发配置（模型、超时、次数与并发上限）。与 gapfill 状态完全同形，扩展名必须同样是
+	// .jsonc：叫 config.json 会被 index.ts 的 bash 读守卫拦住，运营连 cat 一眼确认自己改对没有
+	// 都做不到。本期没有改它的命令，就是给人手编辑的。
+	get dispatchConfigPath(): string {
+		const candidate = canonicalPath(resolve(this.dispatchDir, "config.jsonc"));
+		if (!pathWithin(this.dataDir, candidate)) throw new Error("派发配置文件必须位于罗盘数据目录的 dispatch 子目录内");
+		return candidate;
+	}
+
+	// 读侧 fail open，但同样要分清两种失败：文件不存在是没配过（回默认值是对的），解析失败或
+	// 权限不足是手改坏了、环境有问题，必须让调用方能说出来——一律吞掉的话，运营改的超时与上限
+	// 会无声回到默认值，而他看着文件以为生效了。
+	async readDispatchConfig(): Promise<{ value?: unknown; error?: string }> {
+		let raw: string;
+		try {
+			raw = await readFile(this.dispatchConfigPath, "utf8");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") return {};
+			return { error: `读取失败：${error instanceof Error ? error.message : String(error)}` };
+		}
+		try {
+			return { value: JSON.parse(raw) };
+		} catch (error) {
+			return { error: `解析失败：${error instanceof Error ? error.message : String(error)}` };
+		}
+	}
+
+	async writeDispatchConfig(config: unknown, options: { backupExisting?: boolean } = {}): Promise<void> {
+		const target = this.dispatchConfigPath;
+		await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+		if (options.backupExisting) {
+			try {
+				await this.writeAtomic(`${target}.bak`, await readFile(target, "utf8"), 0o600);
+			} catch {
+				// 没有旧文件或读不动：没什么可备份的，继续写新的
+			}
+		}
+		await this.writeAtomic(target, `${JSON.stringify(config, null, "\t")}\n`, 0o600);
+		await chmod(target, 0o600).catch(() => undefined);
+	}
+
+	// 差评材料文件。落在数据目录的 materials 子目录而不是运营的导入入口：它不是要导入的 CSV，
+	// 只会被 compass_dispatch 读进内存发给子代理；运营手工提供的评论文件也复制到这里。
+	// 与 writeImportCsv 同形：safeBaseName 净化 + pathWithin 复核，名字里的路径分隔符不能把
+	// 文件写出目录外。
+	async writeMaterial(fileName: string, payload: unknown): Promise<string> {
+		const target = canonicalPath(resolve(this.materialsDir, safeBaseName(fileName)));
+		if (!pathWithin(this.dataDir, this.materialsDir) || !pathWithin(canonicalPath(this.materialsDir), target)) {
+			throw new Error("差评材料必须写在罗盘数据目录的 materials 子目录内");
+		}
+		await mkdir(this.materialsDir, { recursive: true, mode: 0o700 });
+		await this.writeAtomic(target, `${JSON.stringify(payload)}\n`, 0o600);
+		await chmod(target, 0o600).catch(() => undefined);
+		return relative(this.projectRoot, target);
 	}
 }

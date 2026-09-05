@@ -13,11 +13,13 @@ import { REVIEW_THEME_CATEGORIES, REVIEW_THEME_FIXABILITIES } from "./types.ts";
 // 四条硬纪律，每条都有对应的静态钉子（tests/static-invariants.test.ts）：
 //  1. 零工具：传给 complete 的 Context **没有 tools 键**。DispatchContext 类型里就没有这个字段，
 //     写了是类型错误——这是第一道守卫，比任何文本断言都硬。
-//  2. 零子进程：本文件不出现 child_process / spawn / exec 族。
+//  2. 零子进程：本文件不出现任何起子进程的入口（模块名与 spawn / exec 那一族函数都不许出现）。
+//     静态钉子按裸子串判，所以连这行注释都不能写出那些标识符——负向全称断言不区分代码与注释，
+//     而把断言放宽到「只查 import 行」就等于给自己开了个后门。
 //  3. 零 store 写：本文件不 import store.ts 的写路径，也不落任何文件。子代理输出只回到工具结果里。
 //  4. 零内部口径：prompt 里只放材料正文与通用事实（市场名 / 类目 / 候选标题 / 风险类别 /
-//     缺值字段名），绝不放金额，也绝不放工作区侧 hints.json 的内部 SOP——那些由主会话在
-//     结果下方本地拼接。
+//     缺值字段名），绝不放金额，也绝不放工作区侧的内部提示层（供应商 / 货代 / 报关口径 /
+//     审批角色）——那些由主会话在结果下方本地拼接，本模块连读都不该读到。
 //
 // 失败即结果：runDispatch **永不抛**。所有失败都折成 status "error" + 六种固定 summary 之一，
 // 让注册层原样返回一条 compass-result，follower 的现成分支能接住。
@@ -319,8 +321,8 @@ const JSON_ONLY_RULES = [
 
 /**
  * 三份内置通用模板。它们进公开仓库，因此只含通用措辞与字段说明——具体供应商、货代、HS 编码
- * 口径、审批角色一律不在这里，也不在工作区定义文件里（那份同样会逐字出境），只留在工作区
- * hints.json，由主会话在结果下方本地拼接。
+ * 口径、审批角色一律不在这里，也不在工作区定义文件里（那份同样会逐字出境），只留在工作区的
+ * 内部提示层，由主会话在结果下方本地拼接。
  */
 export const DISPATCH_AGENTS: Readonly<Record<DispatchAgentName, DispatchAgentDefinition>> = {
 	"review-clusterer": {

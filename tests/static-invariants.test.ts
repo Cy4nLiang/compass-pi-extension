@@ -36,6 +36,9 @@ const WRITE_MARKERS: Array<{ label: string; pattern: RegExp }> = [
 	{ label: ".update(", pattern: /\.update\s*\(/u },
 	{ label: "writeReport(", pattern: /\bwriteReport\s*\(/u },
 	{ label: "withFileMutationQueue(", pattern: /\bwithFileMutationQueue\s*\(/u },
+	// 三期起进程内子代理调用也视同写事务标记：它花钱、走网络、可能等上两分钟，
+	// 出现在热路径 hook 里的后果比一次落盘更糟。目前 index.ts 无命中，这是前瞻性负向全称。
+	{ label: "modelRegistry.complete(", pattern: /\bmodelRegistry\s*\.\s*complete\s*\(/u },
 ];
 
 // 热路径 hook：每次 agent 轮次/每次工具调用都会跑，落盘会阻塞用户输入并与写队列抢锁
@@ -175,7 +178,7 @@ test("DOMAIN_TOOLS 与 TOOL_CATALOG 逐条对齐", async () => {
 	const source = await readFile(join(repoRoot, "catalog.ts"), "utf8");
 	const domain = domainToolsFromSource(source);
 	const catalog = catalogToolsFromSource(source);
-	assert.equal(domain.length, 18, `DOMAIN_TOOLS 现在是 ${domain.length} 条；增删工具时请同步本用例与 README 工具表`);
+	assert.equal(domain.length, 19, `DOMAIN_TOOLS 现在是 ${domain.length} 条；增删工具时请同步本用例与 README 工具表`);
 	assert.equal(new Set(domain).size, domain.length, "DOMAIN_TOOLS 有重复项");
 	assert.equal(new Set(catalog).size, catalog.length, "TOOL_CATALOG 有重复的 name");
 	// tsc 只约束 CATALOG→DOMAIN 方向（name 的类型是 DOMAIN_TOOLS[number]），
@@ -422,4 +425,131 @@ test("compass_history action=outcomes 的 header 带 comparable / strategy_only 
 	for (const field of ["comparable=${stats.comparable}", "strategy_only=${stats.strategyOnly}", "waitlist_anchored=${stats.waitlistAnchored}", "rated_markets=${stats.ratedMarkets}"]) {
 		assert.ok(headerLine.includes(` | ${field}`), `header 缺 ${field}`);
 	}
+});
+
+// —— 三期 compass_dispatch：进程内零工具子代理的十条静态钉子（2026-09-06）——
+// 用例名统一以 `compass_dispatch：` 开头，任务书 Proof 表按前缀选行。每条写完都把被钉代码改回
+// 原样跑过一遍，确认真的变红（根 CLAUDE.md「源码切片断言」那条教训）。
+
+test("compass_dispatch：execute 首行受限自拒", async () => {
+	const source = await readFile(join(repoRoot, "index.ts"), "utf8");
+	const body = toolBody(source, "compass_dispatch");
+	// 只搜 lanShared 会被 description 里的措辞满足——钉到真的会拦的那个分支上，连拒绝文案一起钉
+	assert.match(body, /if \(lanShared\) throw new Error\(/u, "compass_dispatch 的 execute 必须自己判一次受限模式（纵深第二层，不依赖工作区 guard）");
+	assert.match(body, /局域网受限会话不可派发子代理/u, "受限拒绝必须给出明确文案");
+});
+
+test("compass_dispatch：注册在所有 pi.on 之前", async () => {
+	const source = await readFile(join(repoRoot, "index.ts"), "utf8");
+	const registerAt = source.indexOf('name: "compass_dispatch"');
+	assert.notEqual(registerAt, -1, "index.ts 里找不到 compass_dispatch 的注册块");
+	const firstHook = source.search(/^\tpi\.on\("/mu);
+	assert.ok(registerAt < firstHook, "compass_dispatch 必须注册在所有 pi.on(...) 之前——否则 hookBodies 会把它整块算进某个 hook 片段，下面两条钉子同时失效");
+});
+
+test("compass_dispatch：材料路径白名单复核在派发之前", async () => {
+	const source = await readFile(join(repoRoot, "index.ts"), "utf8");
+	const body = toolBody(source, "compass_dispatch");
+	// resolveInputPath 只保证「在项目根内」，.env 与受限会话的凭据副本都在项目根内。
+	// 复核必须排在 runDispatch 之前，晚一步就等于已经把文件读进内存发出去了
+	const guardAt = body.indexOf("repo.materialsDir");
+	const dispatchAt = body.indexOf("runDispatch(");
+	assert.notEqual(guardAt, -1, "compass_dispatch 必须把 material 参数复核到罗盘数据目录的材料子目录内");
+	assert.notEqual(dispatchAt, -1, "compass_dispatch 里找不到 runDispatch( 调用——切片已失效");
+	assert.ok(guardAt < dispatchAt, "白名单复核必须排在 runDispatch 之前");
+	assert.match(body, /const store = await readStore\(ctx\)/u, "派发只读 store：readStoreFlushingUsage 在有未落盘计量时会真开一次写事务");
+});
+
+test("compass_dispatch：dispatch.ts 的 Context 构造块键集只有 systemPrompt 与 messages", async () => {
+	const source = await readFile(join(repoRoot, "dispatch.ts"), "utf8");
+	// 抓构造点而不是调用行：Context 被提成变量时，按调用行抓会恒真（评审变异核对过）
+	const blocks = [...source.matchAll(/(?:const|let)\s+\w*[Cc]ontext\w*\s*(?::\s*\w+)?\s*=\s*\{([\s\S]*?)\n\t*\};/gu)];
+	assert.ok(blocks.length > 0, "dispatch.ts 里抓不到任何 Context 构造块——正则已失效，本条断言等于没有");
+	for (const block of blocks) {
+		const keys = [...block[1].matchAll(/^\t+(\w+):/gmu)].map((match) => match[1]);
+		assert.deepEqual([...keys].sort(), ["messages", "systemPrompt"], `传给 complete 的 Context 只能有 systemPrompt 与 messages，实得：${keys.join(" / ")}`);
+	}
+});
+
+test("compass_dispatch：dispatch.ts 无子进程入口", async () => {
+	const source = await readFile(join(repoRoot, "dispatch.ts"), "utf8");
+	// child_process 那条是承重项：它同时盖住 node: 前缀、无前缀、require 与动态 import，
+	// 也盖住 namespace 导入后的 cp.exec(）。不得删、不得降级成只认 node:child_process。
+	// 下面几条一律带 (?<![.\w]) 边界——裸 exec( 会被 RegExp.prototype.exec 误伤（csv.ts 与 strategy.ts 都在用）
+	const forbidden: Array<{ label: string; pattern: RegExp }> = [
+		{ label: "child_process", pattern: /child_process/u },
+		{ label: "spawn(", pattern: /(?<![.\w])spawn\s*\(/u },
+		{ label: "spawnSync(", pattern: /(?<![.\w])spawnSync\s*\(/u },
+		{ label: "exec(", pattern: /(?<![.\w])exec\s*\(/u },
+		{ label: "execFile(", pattern: /(?<![.\w])execFile\s*\(/u },
+		{ label: "execFileSync(", pattern: /(?<![.\w])execFileSync\s*\(/u },
+		{ label: "execSync(", pattern: /(?<![.\w])execSync\s*\(/u },
+	];
+	for (const item of forbidden) {
+		assert.equal(item.pattern.test(source), false, `dispatch.ts 出现子进程入口 ${item.label}：进程内子代理不得起子进程`);
+	}
+});
+
+test("compass_dispatch：热路径 hook 不出现派发调用", async () => {
+	const source = await readFile(join(repoRoot, "index.ts"), "utf8");
+	const bodies = hookBodies(source);
+	// 只禁调用与 import，不禁文案——guardReason 里点名 compass_dispatch 是要给运营看的，
+	// 所以标识符必须紧跟 `(` 才算命中，字符串字面量 "compass_dispatch") 不会被判。
+	// 前缀 [A-Za-z_$]* 不能省：写成 /\bdispatch\w*\(/ 时 runDispatch( 里的 Dispatch 前面没有词边界，
+	// 真在热路径里调 runDispatch(...) 会被整条放过——变异核对时实测到过这个假绿。
+	const pattern = /[A-Za-z_$][A-Za-z0-9_$]*[Dd]ispatch[A-Za-z0-9_$]*\s*\(|from "\.\/dispatch\.(?:ts|js)"|modelRegistry/u;
+	// 自证：正则对真正的违规写法必须命中，对文案必须不命中
+	assert.equal(pattern.test("await runDispatch({ registry }, input);"), true, "正则必须能抓到 runDispatch( 调用");
+	assert.equal(pattern.test('renderCallLabel("compass_dispatch")'), false, "正则不该把工具名文案判成调用");
+	for (const name of HOT_PATH_HOOKS) {
+		const body = bodies.get(name);
+		assert.ok(body, `index.ts 里找不到 pi.on("${name}")——切片正则或 hook 注册点已变`);
+		assert.equal(pattern.test(body), false, `热路径 hook ${name} 出现派发调用：进程内子代理只能从工具 execute 发起`);
+	}
+});
+
+test("compass_dispatch：session_start 清零派发计数", async () => {
+	const source = await readFile(join(repoRoot, "index.ts"), "utf8");
+	const body = hookBodies(source).get("session_start");
+	assert.ok(body, 'index.ts 里找不到 pi.on("session_start")——切片器已失效');
+	assert.ok(body.length > 120, `session_start 切出的片段只有 ${body.length} 字符，切片正则很可能已失效`);
+	// /reload 会以 reason "reload" 重发 session_start，所以这一行就是「会话上限每会话重置」的全部接线；
+	// 删掉它，40 次上限会变成跨会话累积拒绝，而且不会有任何测试变红
+	assert.match(body, /resetDispatchCounters\(\)/u, "session_start 必须清零派发计数");
+});
+
+test("compass_dispatch：dispatch.ts 不值导入 pi 包", async () => {
+	const source = await readFile(join(repoRoot, "dispatch.ts"), "utf8");
+	// pi 系列包在 compass 是 devDependencies，装到用户机器上根本不存在；
+	// 运行期 import 会让整个扩展加载失败，而 tsc 在本机是绿的（IDE 有那些包）
+	const offenders = source
+		.split("\n")
+		.filter((line) => /from "@earendil-works\//u.test(line))
+		.filter((line) => !line.trimStart().startsWith("import type"));
+	assert.deepEqual(offenders, [], "dispatch.ts 对 pi 包只能 import type");
+});
+
+test("compass_dispatch：materials 目录进了读守卫且 guardReason 点名", async () => {
+	const source = await readFile(join(repoRoot, "index.ts"), "utf8");
+	const start = source.indexOf("function pathIsHistoryStore");
+	const end = source.indexOf("function bashReadsHistoryStore");
+	assert.ok(start !== -1 && end > start, "index.ts 里切不出 pathIsHistoryStore——切片已失效");
+	const body = source.slice(start, end);
+	assert.match(body, /const materialsRoot = resolve\(compassRoot, "materials"\)/u, "差评材料目录必须进读守卫");
+	const returnLine = body.split("\n").find((line) => line.trimStart().startsWith("return absolute === storePath"));
+	assert.ok(returnLine, "pathIsHistoryStore 的 return 行找不到了");
+	assert.match(returnLine, /withinMaterials/u, "materials 判据必须真的参与 return——只声明不用等于没拦");
+	assert.match(source.slice(0, start), /差评材料只能交给 compass_dispatch/u, "guardReason 必须点名 compass_dispatch，且声明在 pathIsHistoryStore 之前（早于第一个 pi.on）");
+});
+
+test("compass_dispatch：hints 只在结果侧拼接", async () => {
+	const dispatchSource = await readFile(join(repoRoot, "dispatch.ts"), "utf8");
+	// owner 拍板：内部口径不进 prompt。运行器连读都不该读到它
+	assert.equal(/loadGapHints|hints\.json/u.test(dispatchSource), false, "dispatch.ts 不得接触 hints：内部口径不进 prompt");
+	const source = await readFile(join(repoRoot, "index.ts"), "utf8");
+	const body = toolBody(source, "compass_dispatch");
+	const hintsAt = body.indexOf("loadGapHints(");
+	const dispatchAt = body.indexOf("runDispatch(");
+	assert.notEqual(hintsAt, -1, "compass_dispatch 必须在结果下方本地拼接 hints 的 how");
+	assert.ok(hintsAt > dispatchAt, "hints 只能在 runDispatch 返回之后读——早于它就有被传进 prompt 的可能");
 });

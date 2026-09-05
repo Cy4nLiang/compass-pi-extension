@@ -16,6 +16,20 @@ import { Box, Markdown, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { DOMAIN_TOOLS, rankTools, searchTerms } from "./catalog.ts";
 import { compareSnapshotRecencyDesc, snapshotTtlDays } from "./defaults.ts";
+import {
+	DEFAULT_DISPATCH_CONFIG,
+	DISPATCH_AGENT_NAMES,
+	DISPATCH_FAILURE_SUMMARIES,
+	RISK_QUERY_CATEGORIES,
+	loadAgentDefinition,
+	normalizeDispatchConfig,
+	resetDispatchCounters,
+	runDispatch,
+	type DispatchAgentName,
+	type DispatchConfig,
+	type DispatchMaterialInfo,
+	type DispatchRegistryLike,
+} from "./dispatch.ts";
 import { estimateProfit, normalizeProfitInput } from "./economics.ts";
 import { capturedAtForBatch, convertSorftimePayloads, createMcpPayloadCache, parseSorftimeFieldMap, type McpPayloadEntry, type SorftimeFieldMap } from "./gapfill-convert.ts";
 import {
@@ -92,6 +106,7 @@ import {
 	saveStrategyVersion,
 	scanMarkets,
 	decisionHistoryNote,
+	dispatchFactsFor,
 	performRetroCheck,
 	strategyHistoryNote,
 } from "./service.ts";
@@ -140,6 +155,12 @@ function resultData(input: CompassResultData): CompassResultData {
 	return input;
 }
 
+// 读守卫的拒绝理由。是模块级常量而不是 tool_call hook 里的局部 const，位置必须早于第一个
+// pi.on(...)——tests/static-invariants.test.ts 的 hookBodies 从第一个 pi.on 起把后续一切都归进
+// 某个 hook 片段，而另一条钉子禁止热路径片段出现派发相关标识符。留在 hook 里这两条会直接互撞。
+const guardReason =
+	"store 原文过大且快照明细外置（lazy 指针），直接读会污染上下文；请用 compass_history / compass_asin_history / compass_keyword_metrics 查询。差评材料只能交给 compass_dispatch（agent=review-clusterer），不要直接读进上下文。";
+
 function pathIsHistoryStore(cwd: string, rawPath: string): boolean {
 	const cleaned = rawPath.replace(/^@/u, "");
 	const unresolved = resolve(isAbsolute(cleaned) ? cleaned : resolve(cwd, cleaned));
@@ -157,8 +178,13 @@ function pathIsHistoryStore(cwd: string, rawPath: string): boolean {
 	}
 	const storePath = resolve(compassRoot, "store.json");
 	const snapshotsRoot = resolve(compassRoot, "snapshots");
+	// 差评材料同样拦读：一份 100 条评论的材料整段进上下文，正是 compass_dispatch 要省掉的那部分
+	const materialsRoot = resolve(compassRoot, "materials");
 	const rel = relative(snapshotsRoot, absolute);
-	return absolute === storePath || absolute === snapshotsRoot || (rel !== "" && !rel.startsWith("..") && !isAbsolute(rel)) || absolute === compassRoot;
+	const relMaterials = relative(materialsRoot, absolute);
+	const withinSnapshots = rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
+	const withinMaterials = relMaterials !== "" && !relMaterials.startsWith("..") && !isAbsolute(relMaterials);
+	return absolute === storePath || absolute === snapshotsRoot || absolute === materialsRoot || withinSnapshots || withinMaterials || absolute === compassRoot;
 }
 
 function bashReadsHistoryStore(cwd: string, command: string): boolean {
@@ -232,6 +258,18 @@ export default function compassExtension(pi: ExtensionAPI): void {
 	// 唯一写入点是 /compass-fill 命令 handler（命令不是热路径 hook，是天然安全点）
 	let fillMode: GapfillMode = lanShared ? "off" : "guided";
 	let mutedGaps: MutedGap[] = [];
+	// 派发配置：session_start 只读恢复一次，受限会话不读文件（那条会话根本不许派发）。
+	// 本期没有改它的命令，运营手编辑 dispatch/config.jsonc 后 /reload 生效
+	let dispatchConfig: DispatchConfig = { ...DEFAULT_DISPATCH_CONFIG };
+
+	// ctx.modelRegistry 与 DispatchRegistryLike 结构上兼容、类型上互不可赋：DispatchContext 故意
+	// 不含 tools 且 messages 用的是结构子集，正因为如此它不是宿主 Context 的子类型——那是「零工具」
+	// 守卫本身，不是要修的类型错。这一处强转就是那道接缝，配一次运行期形状检查（照工作区 intent.ts）。
+	function dispatchRegistry(ctx: ExtensionContext): DispatchRegistryLike | undefined {
+		const registry = (ctx as unknown as { modelRegistry?: unknown }).modelRegistry as DispatchRegistryLike | undefined;
+		if (!registry) return undefined;
+		return typeof registry.find === "function" && typeof registry.hasConfiguredAuth === "function" && typeof registry.complete === "function" ? registry : undefined;
+	}
 	// 本会话读状态文件失败过（解析坏 / 权限）：下一次写之前先备份，别把旧内容永久盖掉
 	let gapfillStateUnreadable = false;
 	// 已在本会话展示过的缺口指纹：尾注只列「新增」，避免每次写事务重复刷同一批
@@ -1760,6 +1798,115 @@ export default function compassExtension(pi: ExtensionAPI): void {
 		renderResult: renderCompassResult,
 	});
 
+	// 位置承重，不是排版：必须留在所有 pi.on(...) 之前，且紧邻上一个 registerTool。
+	// tests/static-invariants.test.ts 的 toolBody 从 `name: "<tool>"` 切到**下一个** registerTool，
+	// hookBodies 又从第一个 pi.on 起把后续一切归进某个 hook 片段——挪到 pi.on 之后，
+	// 「注册在所有 pi.on 之前」与「热路径不出现派发调用」两条钉子会同时失效。
+	pi.registerTool({
+		name: "compass_dispatch",
+		label: "Compass Dispatch",
+		description: [
+			"把一段材料或几条 store 事实交给一个零工具子代理，拿回结构化 JSON。进程内直连模型，不起子进程、不调 MCP、不写库。",
+			"review-clusterer：把差评材料聚成主题（需要 material=，通常来自 compass_gaps convert 的产物）。",
+			"risk-query-builder：按待查风险类别给出检索式与核对清单，不给结论、不给链接。",
+			"supplier-inquiry：起草询价函与要问的字段清单，正文零金额。",
+			"三者都**不写回**：结果要运营看过之后，再由你调 compass_reviews_record / compass_risk_check / compass_profit_estimate。",
+			"模型费用不计入 compass_budget（那是 MCP 次数的面）；受限会话不可用。",
+		].join("\n"),
+		parameters: Type.Object({
+			agent: StringEnum(DISPATCH_AGENT_NAMES),
+			market_ref: Type.String({ description: "market_id 或唯一市场名" }),
+			material: Type.Optional(Type.String({ description: "材料文件路径，必须位于罗盘数据目录的 materials 子目录内；review-clusterer 必填" })),
+			asins: Type.Optional(Type.Array(Type.String({ pattern: "^[A-Z0-9]{10}$" }), { minItems: 1, maxItems: 5 })),
+			model: Type.Optional(Type.String({ description: "provider/id 覆盖本次使用的模型" })),
+			fields: Type.Optional(Type.Array(Type.String(), { description: "supplier-inquiry：只问这些取了假设值的成本字段" })),
+			categories: Type.Optional(Type.Array(StringEnum(RISK_QUERY_CATEGORIES), { description: "risk-query-builder：只查这些风险类别" })),
+		}),
+		async execute(_id, params, signal, onUpdate, ctx) {
+			// 纵深第二层（第一层在工作区 guard 的工具名单）：受限会话一律不派发。
+			// 这里 throw 而不是回 status error，与 compass_gaps 同形——受限拒绝要让宿主标红
+			if (lanShared) throw new Error(`局域网受限会话不可派发子代理（compass_dispatch）：${DISPATCH_FAILURE_SUMMARIES.lanShared}`);
+			const repo = repository(ctx);
+			let materialText: string | undefined;
+			let material: DispatchMaterialInfo | undefined;
+			if (params.material) {
+				// resolveInputPath 只保证「在项目根内」，而 .env 与受限会话的凭据副本都在项目根内。
+				// 白名单复核不是可选项：少了它，一条注入就能把任意项目内文件整段发给模型供应商
+				const target = repo.resolveInputPath(params.material);
+				const withinMaterials = relative(repo.materialsDir, target);
+				if (withinMaterials === "" || withinMaterials.startsWith("..") || isAbsolute(withinMaterials)) {
+					throw new Error(`材料文件必须位于罗盘数据目录的 materials 子目录内：${params.material}`);
+				}
+				materialText = await readFile(target, "utf8");
+				let parsed: { asins?: unknown; review_type?: unknown; sample_cap?: unknown } = {};
+				try {
+					parsed = JSON.parse(materialText) as typeof parsed;
+				} catch {
+					// 运营手工提供的材料不一定是 convert 产物：解析不出就只带路径与字节数，
+					// 子代理照样能读正文，只是 source_asins 那条校验退化成「必须在参数给的 asins 里」
+				}
+				const fromFile = Array.isArray(parsed.asins) ? parsed.asins.filter((item): item is string => typeof item === "string") : [];
+				material = {
+					path: params.material,
+					bytes: Buffer.byteLength(materialText, "utf8"),
+					asins: params.asins ?? fromFile,
+					review_type: typeof parsed.review_type === "string" ? parsed.review_type : undefined,
+					sample_cap: typeof parsed.sample_cap === "number" ? parsed.sample_cap : undefined,
+				};
+			}
+			if (params.agent === "review-clusterer" && !materialText) throw new Error("review-clusterer 需要 material=<材料文件路径>；材料通常来自 compass_gaps action=convert");
+			// 只读 store：readStoreFlushingUsage 在有未落盘计量时会真开一次写事务，
+			// 而派发这条链路的不变式是零 store 写
+			const store = await readStore(ctx);
+			const facts = dispatchFactsFor(store, params.market_ref, params.agent as DispatchAgentName, { fields: params.fields, categories: params.categories });
+			const overrideText = await readFile(repo.resolveInputPath(`.pi/agents/${params.agent}.md`), "utf8").catch(() => undefined);
+			const loaded = loadAgentDefinition(params.agent as DispatchAgentName, overrideText);
+			onUpdate?.({
+				content: [{ type: "text", text: "子代理运行中…" }],
+				details: details({ title: "子代理派发", status: "info", summary: `${params.agent} · ${materialText ? `材料 ${Math.round((material?.bytes ?? 0) / 1024)} KB` : "零材料"}` }),
+			});
+			const result = await runDispatch(
+				{ registry: dispatchRegistry(ctx) },
+				{ agent: params.agent as DispatchAgentName, definition: loaded.definition, definitionNotes: loaded.notes, materialText, material, facts, config: dispatchConfig, modelOverride: params.model, hostModel: ctx.model },
+				{ signal },
+			);
+			const lines = [...result.lines];
+			if (params.agent === "supplier-inquiry" && result.status === "success") {
+				// Concern 6(b) 的另一半：内部口径不进 prompt，但结果下方由主会话本地拼接。
+				// hints 只在这里读、只往 lines 里拼，绝不回传给运行器
+				const hints = await loadGapHints(ctx);
+				for (const field of params.fields ?? []) {
+					const how = hints[field]?.how;
+					if (how) lines.push(`内部提示：${field} — ${how}`);
+				}
+			}
+			const text = [
+				`子代理 ${params.agent} · 模型 ${result.payload.model} · ${result.payload.ms} ms`,
+				result.summary,
+				"",
+				"**未写回**：确认结果后再执行 compass_reviews_record / compass_risk_check / compass_profit_estimate。",
+				"费用为目录表价名义值；中止的调用费用记不到。",
+			].join("\n");
+			try {
+				pi.events.emit("compass:dispatch", { agent: params.agent, status: result.status, ms: result.payload.ms, usage: result.usage });
+			} catch {
+				// 事件总线不可用不该让一次已经算完的派发变成工具错误
+			}
+			return {
+				...textResult(text, details({
+					title: "子代理派发",
+					status: result.status,
+					summary: result.summary,
+					lines: lines.slice(0, 12),
+					data: resultData({ payload: result.payload }),
+				})),
+				usage: result.usage,
+			};
+		},
+		renderCall: renderCallLabel("compass_dispatch"),
+		renderResult: renderCompassResult,
+	});
+
 	pi.registerTool({
 		name: "compass_tools",
 		label: "Compass Tools",
@@ -2238,7 +2385,6 @@ export default function compassExtension(pi: ExtensionAPI): void {
 
 	pi.on("tool_call", async (event, ctx) => {
 		if (!ctx.isProjectTrusted()) return;
-		const guardReason = "store 原文过大且快照明细外置（lazy 指针），直接读会污染上下文；请用 compass_history / compass_asin_history / compass_keyword_metrics 查询。";
 		try {
 			// MCP 熔断拦截：廉价名称预过滤命中后才 repo.load()（只读，不开写事务）；判定失败即放行。
 			// 空缓存 = 从未成功读库（ensureDefaults 后池恒非空），兜底 load 一次自愈，避免
@@ -2312,6 +2458,9 @@ export default function compassExtension(pi: ExtensionAPI): void {
 		sessionLedger.length = 0;
 		dueNotified = false;
 		seenGapFingerprints.clear();
+		// 派发计数清零。/reload 会以 reason "reload" 重发 session_start，所以新会话与 /reload 都覆盖到；
+		// 「会话上限 40 次」因此是真的每会话重置，而不是跨会话累积
+		resetDispatchCounters();
 		const repo = repository(ctx);
 		// 补数档位与静音：纯读、无锁，放在下面的写事务之外；受限会话固定 off 且不读文件
 		fillMode = lanShared ? "off" : "guided";
@@ -2324,6 +2473,21 @@ export default function compassExtension(pi: ExtensionAPI): void {
 		} catch (error) {
 			gapfillStateUnreadable = true;
 			if (ctx.hasUI) ctx.ui.notify(`罗盘补数设置读取失败，本会话按默认 guided：${error instanceof Error ? error.message : String(error)}`, "warning");
+		}
+		// 派发配置同样是纯读、无锁、先赋默认再尝试覆盖；受限会话不读（那条会话根本不许派发）。
+		// 读不到或读坏了只提示一次，绝不拦住会话启动
+		dispatchConfig = { ...DEFAULT_DISPATCH_CONFIG };
+		if (!lanShared) {
+			try {
+				const raw = await repo.readDispatchConfig();
+				if (raw.error) {
+					if (ctx.hasUI) ctx.ui.notify(`罗盘派发配置读取失败，本会话按内置默认：${raw.error}`, "warning");
+				} else if (raw.value !== undefined) {
+					dispatchConfig = normalizeDispatchConfig(raw.value);
+				}
+			} catch (error) {
+				if (ctx.hasUI) ctx.ui.notify(`罗盘派发配置读取失败，本会话按内置默认：${error instanceof Error ? error.message : String(error)}`, "warning");
+			}
 		}
 		try {
 			await withFileMutationQueue(repo.storePath, async () => {

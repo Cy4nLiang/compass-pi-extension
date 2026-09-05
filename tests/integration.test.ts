@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { parseMarketCsv } from "../csv.ts";
+import { DEFAULT_DISPATCH_CONFIG, normalizeDispatchConfig } from "../dispatch.ts";
 import { outcomeStatistics } from "../history.ts";
 import { DEFAULT_STRATEGY_ID, DEFAULT_STRATEGY_YAML } from "../defaults.ts";
 import { estimateProfit, normalizeProfitInput } from "../economics.ts";
@@ -1831,6 +1832,51 @@ test("补数状态文件：不存在静默、坏内容要说出来，覆盖前�
 		const backup = await readFile(`${repo.gapfillStatePath}.bak`, "utf8");
 		assert.match(backup, /"mode": "strict"/u, "备份里应保留运营手改前的内容");
 		assert.equal((await repo.readGapfillState()).error, undefined, "覆盖后的新文件必须能正常解析");
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+// 三期派发配置：与补数状态文件同形，理由也一样——它是给人手编辑的 .jsonc，
+// 「没配过」与「配坏了」必须分得开，否则运营改的超时与上限会无声回到默认值。
+test("派发配置文件：不存在静默、坏内容要说出来，覆盖前先留备份，非法值回默认", async () => {
+	const root = await mkdtemp(join(tmpdir(), "compass-dispatch-config-"));
+	try {
+		const repo = new CompassRepository(root);
+
+		// 第一次使用：文件不存在是常态，静默回默认
+		assert.deepEqual(await repo.readDispatchConfig(), {});
+
+		await repo.writeDispatchConfig({ version: 1, model: "deepseek/deepseek-v4-flash", timeout_ms: 90_000, session_cap: 12, concurrency: 1, max_material_bytes: 32_768 });
+		const saved = await repo.readDispatchConfig();
+		assert.equal(saved.error, undefined);
+		assert.equal((saved.value as { session_cap?: number }).session_cap, 12);
+		const mode = await stat(repo.dispatchConfigPath);
+		assert.equal(mode.mode & 0o777, 0o600, "派发配置必须是 0600");
+
+		// 运营手改坏了：必须报出来，不能静默把超时与上限退回默认
+		await writeFile(repo.dispatchConfigPath, '{ "version": 1, "session_cap": 12, }\n', "utf8");
+		const broken = await repo.readDispatchConfig();
+		assert.equal(broken.value, undefined);
+		assert.match(broken.error ?? "", /解析失败/u, "解析失败必须与「文件不存在」区分开");
+
+		// 覆盖前留备份：别把还认得出的旧内容永久销毁
+		await repo.writeDispatchConfig({ version: 1, session_cap: 40 }, { backupExisting: true });
+		const backup = await readFile(`${repo.dispatchConfigPath}.bak`, "utf8");
+		assert.match(backup, /"session_cap": 12/u, "备份里应保留运营手改前的内容");
+		assert.equal((await repo.readDispatchConfig()).error, undefined, "覆盖后的新文件必须能正常解析");
+
+		// 归一化有两种语义，别混为一谈：**不是数字**回默认值，**超出范围**夹到边界。
+		// 对上限类字段夹取才是安全方向——session_cap 写成 -5 夹成 0 是「一次都不许派」，
+		// 若回落成默认 40，运营想收紧反而放开了
+		const normalized = normalizeDispatchConfig({ model: "没有斜杠", timeout_ms: "很久", session_cap: -5, concurrency: 99, max_material_bytes: 1, 未知键: true });
+		assert.deepEqual(
+			normalized,
+			{ ...DEFAULT_DISPATCH_CONFIG, session_cap: 0, concurrency: 8, max_material_bytes: 1_024 },
+			"model 非 provider/id 与 timeout_ms 非数字回默认；session_cap / concurrency / max_material_bytes 超界夹到边界；未知键不进结果",
+		);
+		assert.deepEqual(normalizeDispatchConfig(null), { ...DEFAULT_DISPATCH_CONFIG }, "null 也要回默认而不是抛");
+		assert.deepEqual(normalizeDispatchConfig([1, 2]), { ...DEFAULT_DISPATCH_CONFIG }, "数组同样回默认：typeof [] === object 会骗过粗糙的判定");
 	} finally {
 		await rm(root, { recursive: true, force: true });
 	}

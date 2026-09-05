@@ -19,6 +19,7 @@ export const DOMAIN_TOOLS = [
 	"compass_keyword_metrics",
 	"compass_data_route",
 	"compass_gaps",
+	"compass_dispatch",
 	"compass_history",
 	"compass_retro",
 ] as const;
@@ -50,7 +51,8 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
 	{ name: "compass_asin_history", keywords: "asin history bsr price 历史 价格 评论", description: "读取同一 ASIN 跨快照历史" },
 	{ name: "compass_keyword_metrics", keywords: "keyword search volume cpc 关键词 搜索量", description: "读取关键词跨快照指标" },
 	{ name: "compass_data_route", keywords: "route source freshness cost 数据 路由 新鲜度 补数", description: "按阶段、字段、新鲜度和预算规划数据源" },
-	{ name: "compass_gaps", keywords: "gap fill missing 缺口 缺数据 补数 缺失 字段 计划 清单 引导 数据 approve convert 确认 授权 转换 sorftime 付费 抓数", description: "汇总选品数据缺口并给出按成本档分组的补数计划；确认后授权付费补数并把返回体转成可导入的 CSV" },
+	{ name: "compass_gaps", keywords: "gap fill missing 缺口 缺数据 补数 缺失 字段 计划 清单 引导 数据 approve convert 确认 授权 转换 sorftime 付费 抓数 差评 评论 reviews 材料 asin", description: "汇总选品数据缺口并给出按成本档分组的补数计划；确认后授权付费补数并把返回体转成可导入的 CSV" },
+	{ name: "compass_dispatch", keywords: "dispatch subagent 子代理 派发 聚类 差评 检索式 询价 供应商 模板 材料", description: "把只读子代理派发去做差评聚类、检索式生成与供应商询价模板" },
 	{ name: "compass_history", keywords: "history retro 历史 复盘 相似 经验 教训 回看 验证 timeline outcome lesson", description: "统一查询时间线、决策检索、相似市场、复盘台账与经验卡" },
 	{ name: "compass_retro", keywords: "retro outcome actuals backtest lesson 复盘 实绩 回测 经验 验证 错杀", description: "执行到期复盘、快照对照、实绩录入、策略回测与经验管理" },
 ];

@@ -21,6 +21,7 @@ const GOLDEN: Array<{ query: string; expected: DomainToolName }> = [
 	{ query: "编辑策略YAML版本", expected: "compass_strategy_manage" },
 	{ query: "查专利商标认证风险", expected: "compass_risk_check" },
 	{ query: "差评痛点聚类分析", expected: "compass_reviews_record" },
+	{ query: "派子代理把差评聚类", expected: "compass_dispatch" },
 	{ query: "预算配额还剩多少", expected: "compass_budget" },
 	{ query: "这个ASIN的历史价格走势", expected: "compass_asin_history" },
 	{ query: "关键词搜索量趋势", expected: "compass_keyword_metrics" },

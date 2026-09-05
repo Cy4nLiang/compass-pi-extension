@@ -70,6 +70,7 @@ A 档补数（`compass_gaps approve` / `convert` + `gapfill-convert.ts`）另有
 - 策略 veto 规则命中即整体否决，优先于 Score（红海条件为真时 veto 胜出）。
 - percentile 归一化只在同批 scan 的比较组内做；单市场运行保留策略引擎的有界基准分。
 - 策略表达式由 `strategy.ts` 自研 tokenizer/parser 求值（missing 值会沿表达式传播）；禁止引入 eval / new Function。
+- **Gate 阈值单一事实来源**（D-1 缺陷组 ②）：毛利 / CPC / 新品占比 / QRD 的数字只有两处来源——`defaults.ts` 的 `DEFAULT_GATE_THRESHOLDS`（内置 YAML 由它插值生成，逐字节与手写版相同）与运行期 `service.ts` 的 `gateThresholds(store)`（从最新**默认策略**的规则表达式经 `strategy.ts` `ruleThreshold` 读出，只认 `<metric> <op> <number>` 与 `<fn>(<number>) <op> <number>` 两种形状、数字文法与 tokenize 一致，解析不出回落常量并把字段记进 `fallbacks`，文案标「（内置默认）」）。economics / service / index 不得再以字面量比较（`tests/static-invariants.test.ts` 负向全称断言）；decisionLog `type=profit` 只中性留痕不写达标结论；`compass_profit_estimate` 无 `market_ref` 也读一次 store 取阈值。CPC 0.60 / 0.80 三条警告文案被 `gaps.ts` 与工作区 follower 逐字匹配，本批只把比较改读常量、不随策略走，改文案先补存在性断言。
 - 候选卡移动强制填 reason 并写入 decisionLog；否决品保留、不删除。
 - 候选池措辞统一为「七个工作阶段 + archived 归档」（CANDIDATE_STAGES 共 8 个值），不要写成「八阶段」。
 - 利润输入中大于 1 的百分比一律拒绝（`economics.ts`）。

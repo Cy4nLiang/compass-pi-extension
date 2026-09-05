@@ -1,8 +1,42 @@
 import type { BudgetPool } from "./types.ts";
 
-// 口径缺省值：策略 meta 未声明时全系统统一按这两个数走（DEFAULT_STRATEGY_YAML 里的字面量与此保持一致）
+// 口径缺省值：策略 meta 未声明时全系统统一按这两个数走（DEFAULT_STRATEGY_YAML 由下面的常量插值生成，不再各写一份字面量）
 export const DEFAULT_TARGET_MONTHLY_UNITS = 300;
 export const DEFAULT_TARGET_DAILY_UNITS = 10;
+
+// Gate 阈值的单一事实来源（D-1 缺陷组 ②）。运行期生效的阈值来自最新默认策略的规则表达式
+// （strategy.ts 的 gateThresholdsFor），这里只是「策略里解析不出时」的回落值与内置 YAML 的插值源：
+// 利润测算的警告、decisionLog 留痕、总览的默认 Gate 文案都不得再各自写死 0.4 / 0.6 / 0.8 / 0.15 / 20。
+export interface GateThresholds {
+	grossMargin: number;
+	cpcReview: number;
+	cpcHard: number;
+	newListingShare: number;
+	qrdTargetUnits: number;
+	qrdMinDepth: number;
+}
+export const DEFAULT_GATE_THRESHOLDS: Readonly<GateThresholds> = Object.freeze({
+	grossMargin: 0.4,
+	cpcReview: 0.6,
+	cpcHard: 0.8,
+	newListingShare: 0.15,
+	qrdTargetUnits: DEFAULT_TARGET_MONTHLY_UNITS,
+	qrdMinDepth: 20,
+});
+
+// 内置 YAML 里的数字全部由常量插值：小数固定两位（"0.40"），百分比取整（"40%"），
+// 与此前手写的字面量逐字节相同——tests/strategy.test.ts 用 .replace("gross_margin >= 0.40", …) 之类的
+// 精确替换构造变体，格式一变那些用例就会静默失去替换目标。
+const gate = DEFAULT_GATE_THRESHOLDS;
+const twoDecimals = (value: number): string => value.toFixed(2);
+
+// Gate 阈值的百分比文案：整数百分点不带小数（"40%"），否则保留一位（"37.5%"）——
+// 判定按原值、文案按同一口径取整，总览行、测算警告与内置 YAML label 三处共用，别各写一份取整。
+export function formatGatePercent(value: number): string {
+	const tenths = Math.round(value * 1000) / 10;
+	return `${Number.isInteger(tenths) ? tenths : tenths.toFixed(1)}%`;
+}
+const percent = formatGatePercent;
 
 export const DEFAULT_STRATEGY_YAML = `# 罗盘内置策略：精铺 · 日均10单
 # 内置默认口径；CPC 规则被展开为“≤0.60 通过、0.60–0.80 复核、>0.80 否决”，避免边界语义歧义。
@@ -10,8 +44,8 @@ meta:
   name: jingpu-daily10
   display_name: 精铺 · 日均10单
   owner: compass
-  target_daily_units: 10
-  monthly_units_q: 300
+  target_daily_units: ${DEFAULT_TARGET_DAILY_UNITS}
+  monthly_units_q: ${DEFAULT_TARGET_MONTHLY_UNITS}
   margin_scope: no_ads_no_returns
   retro_go_days: 30
   retro_testing_stale_days: 60
@@ -27,28 +61,28 @@ stages:
         action: veto
         label: 红海市场（AMZ占比>30% 且 CR3>60%）
       - id: high_activity_entry
-        when: "new_listing_share_12m >= 0.15"
+        when: "new_listing_share_12m >= ${twoDecimals(gate.newListingShare)}"
         action: require
-        label: 新品占比≥15%，市场仍接纳新品
+        label: 新品占比≥${percent(gate.newListingShare)}，市场仍接纳新品
       - id: volume_feasibility
-        when: "qualify_rank_depth(300) >= 20"
+        when: "qualify_rank_depth(${gate.qrdTargetUnits}) >= ${gate.qrdMinDepth}"
         action: require
-        label: 月销≥300 的坑位至少20个
+        label: 月销≥${gate.qrdTargetUnits} 的坑位至少${gate.qrdMinDepth}个
 
   - stage: unit_economics
     rules:
       - id: gross_margin_gate
-        when: "gross_margin >= 0.40"
+        when: "gross_margin >= ${twoDecimals(gate.grossMargin)}"
         action: require
-        label: 不含广告与退货毛利率≥40%
+        label: 不含广告与退货毛利率≥${percent(gate.grossMargin)}
       - id: cpc_hard_ceiling
-        when: "cpc_ratio <= 0.80"
+        when: "cpc_ratio <= ${twoDecimals(gate.cpcHard)}"
         action: require
-        label: CPC承受度不得高于0.80
+        label: CPC承受度不得高于${twoDecimals(gate.cpcHard)}
       - id: cpc_affordability
-        when: "cpc_ratio <= 0.60"
+        when: "cpc_ratio <= ${twoDecimals(gate.cpcReview)}"
         action: review_if_fail
-        label: CPC承受度0.60–0.80需人工复核词结构
+        label: CPC承受度${twoDecimals(gate.cpcReview)}–${twoDecimals(gate.cpcHard)}需人工复核词结构
       - id: capital_concentration
         when: "capital_share <= 0.20"
         action: review_if_fail

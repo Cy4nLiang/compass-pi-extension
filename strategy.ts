@@ -1,5 +1,5 @@
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
-import { DEFAULT_TARGET_DAILY_UNITS, DEFAULT_TARGET_MONTHLY_UNITS } from "./defaults.ts";
+import { DEFAULT_GATE_THRESHOLDS, DEFAULT_TARGET_DAILY_UNITS, DEFAULT_TARGET_MONTHLY_UNITS, type GateThresholds } from "./defaults.ts";
 import { qualifyRankDepth } from "./metrics.ts";
 import type {
 	ListingRecord,
@@ -82,6 +82,70 @@ export function strategyTargetMonthlyUnits(definition?: StrategyDefinition): num
 // 日均目标单量的唯一读取口径，回落规则同上。
 export function strategyTargetDailyUnits(definition?: StrategyDefinition): number {
 	return positiveMetaNumber(definition?.meta?.target_daily_units) ?? DEFAULT_TARGET_DAILY_UNITS;
+}
+
+// —— Gate 阈值从规则表达式读出（D-1 缺陷组 ②）——
+// 只认两种简单形状：`<metric> <op> <number>` 与 `<fn>(<number>) <op> <number>`；
+// 带 && / || 的复合表达式、不存在的规则、存量 store 里未经新版校验的脏 definition 一律返回 undefined，
+// 让调用方回落内置默认并标注，而不是猜一个数。绝不把「规则可解析出阈值」放进 assertStore。
+export interface RuleThreshold {
+	metric: string;
+	operator: ">=" | "<=" | ">" | "<" | "==";
+	value: number;
+	argument?: number;
+}
+// 数字子模式与 tokenize 的 number 文法逐字一致（".35"、"3."、"35e-2" 都是 DSL 合法写法）：
+// 文法一旦比 DSL 窄，策略按 .35 放行、这里却回落 0.40，本批要消的双阈值分叉就在合法输入下复现。
+const DSL_NUMBER = String.raw`-?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?`;
+const SIMPLE_THRESHOLD = new RegExp(String.raw`^\s*([a-z_][a-z0-9_]*)\s*(>=|<=|>|<|==)\s*(${DSL_NUMBER})\s*$`, "u");
+const FUNCTION_THRESHOLD = new RegExp(String.raw`^\s*([a-z_][a-z0-9_]*)\(\s*(${DSL_NUMBER})\s*\)\s*(>=|<=|>|<|==)\s*(${DSL_NUMBER})\s*$`, "u");
+
+export function ruleThreshold(definition: StrategyDefinition | undefined, ruleId: string): RuleThreshold | undefined {
+	try {
+		const rule = definition?.stages?.flatMap((stage) => stage?.rules ?? []).find((candidate) => candidate?.id === ruleId);
+		if (!rule || typeof rule.when !== "string") return undefined;
+		const simple = SIMPLE_THRESHOLD.exec(rule.when);
+		if (simple) return { metric: simple[1], operator: simple[2] as RuleThreshold["operator"], value: Number(simple[3]) };
+		const call = FUNCTION_THRESHOLD.exec(rule.when);
+		if (call) return { metric: call[1], argument: Number(call[2]), operator: call[3] as RuleThreshold["operator"], value: Number(call[4]) };
+		return undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+// 五个 Gate 阈值的运行期取值：能从规则表达式读出且形状对得上就用规则里的数，否则回落
+// DEFAULT_GATE_THRESHOLDS 并把字段名记进 fallbacks，让文案能标「（内置默认）」。
+export interface ResolvedGateThresholds extends GateThresholds {
+	fallbacks: Array<keyof GateThresholds>;
+}
+
+export function gateThresholdsFor(definition?: StrategyDefinition): ResolvedGateThresholds {
+	const fallbacks: Array<keyof GateThresholds> = [];
+	const pick = (key: keyof GateThresholds, ruleId: string, metric: string, operator: RuleThreshold["operator"]): number => {
+		const threshold = ruleThreshold(definition, ruleId);
+		if (threshold && threshold.metric === metric && threshold.operator === operator && threshold.argument === undefined && Number.isFinite(threshold.value)) {
+			return threshold.value;
+		}
+		fallbacks.push(key);
+		return DEFAULT_GATE_THRESHOLDS[key];
+	};
+	const grossMargin = pick("grossMargin", "gross_margin_gate", "gross_margin", ">=");
+	const cpcReview = pick("cpcReview", "cpc_affordability", "cpc_ratio", "<=");
+	const cpcHard = pick("cpcHard", "cpc_hard_ceiling", "cpc_ratio", "<=");
+	const newListingShare = pick("newListingShare", "high_activity_entry", "new_listing_share_12m", ">=");
+	// QRD 的 q 与坑位数来自同一条规则：qualify_rank_depth(q) >= N。q 取自规则而不是 meta.q，
+	// 文案才能与判定一致（meta.q 只管指标重算与 Score 归一，M15 收敛后刻意保留的形状）。
+	const volume = ruleThreshold(definition, "volume_feasibility");
+	let qrdTargetUnits = DEFAULT_GATE_THRESHOLDS.qrdTargetUnits;
+	let qrdMinDepth = DEFAULT_GATE_THRESHOLDS.qrdMinDepth;
+	if (volume && volume.metric === "qualify_rank_depth" && volume.argument !== undefined && volume.operator === ">=" && volume.argument > 0 && Number.isFinite(volume.value)) {
+		qrdTargetUnits = volume.argument;
+		qrdMinDepth = volume.value;
+	} else {
+		fallbacks.push("qrdTargetUnits", "qrdMinDepth");
+	}
+	return { grossMargin, cpcReview, cpcHard, newListingShare, qrdTargetUnits, qrdMinDepth, fallbacks };
 }
 
 function rankedTop100(listings: ListingRecord[]): ListingRecord[] {

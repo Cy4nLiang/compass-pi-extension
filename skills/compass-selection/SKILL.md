@@ -56,7 +56,7 @@ description: Amazon US 中小卖家精铺选品工作流。用于市场 CSV 导�
 - CPC 承受度 = `主词 CPC / BE-CPC`；
 - 净利率情景 ≈ `毛利率 - TACOS - 退货损失率`。
 
-默认：毛利率 ≥40%；CPC 承受度 ≤0.60 通过，0.60–0.80 复核，>0.80 否决。若已关联市场且未传 CPC，工具会尝试复用关键词快照里的主词 CPC。
+默认策略口径：毛利率 ≥ 默认策略 `gross_margin_gate` 的阈值（内置 40%；给默认策略另存新版本即同步，测算警告回显当前阈值；另存为其他 id 的策略不影响此处）；CPC 承受度 ≤0.60 通过，0.60–0.80 复核，>0.80 否决。若已关联市场且未传 CPC，工具会尝试复用关键词快照里的主词 CPC。
 
 需要补数时先调用 `compass_data_route`，不要无节制调用付费源。ASIN/关键词窄历史可用 `compass_asin_history` 与 `compass_keyword_metrics`；全局时间线、相似市场、决策检索、复盘台账和经验卡统一用 `compass_history`。这些工具只读取本地快照，不会联网，也不要绕过它们直接读取 `.pi/compass/store.json`。
 

@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { compareSnapshotRecency, compareSnapshotRecencyDesc, DEFAULT_BUDGET_POOLS, DEFAULT_STRATEGY_ID, DEFAULT_STRATEGY_YAML, isNewerSnapshot } from "./defaults.ts";
+import { compareSnapshotRecency, compareSnapshotRecencyDesc, DEFAULT_BUDGET_POOLS, DEFAULT_GATE_THRESHOLDS, DEFAULT_STRATEGY_ID, DEFAULT_STRATEGY_YAML, formatGatePercent, type GateThresholds, isNewerSnapshot } from "./defaults.ts";
 import { profitMetrics } from "./economics.ts";
 import {
 	calculateMetricDeltas,
@@ -28,7 +28,7 @@ import {
 } from "./history.ts";
 import { calculateMarketMetrics, targetDependentMetrics, TARGET_DEPENDENT_METRIC_NAMES } from "./metrics.ts";
 import { renderMarketReport, type GeneratedReport, type MarketReportData } from "./report.ts";
-import { evaluateStrategy, parseStrategyYaml, slugify, strategyTargetDailyUnits, strategyTargetMonthlyUnits, strategyToYaml, type StrategyContext } from "./strategy.ts";
+import { evaluateStrategy, gateThresholdsFor, parseStrategyYaml, slugify, strategyTargetDailyUnits, strategyTargetMonthlyUnits, strategyToYaml, type ResolvedGateThresholds, type StrategyContext } from "./strategy.ts";
 import { deriveTodos, divergenceWatermarks, isResolvableTodoKind, missingDeepResearchFields, stageEntryTimes } from "./todo.ts";
 import { TODO_RESOLUTION_STATUS_LABELS } from "./types.ts";
 import type {
@@ -507,7 +507,9 @@ export function recordProfitEstimate(
 			candidateId,
 			marketId,
 			type: "profit",
-			conclusion: result.grossMargin >= 0.4 ? "毛利 Gate 达标" : "毛利 Gate 未达标",
+			// 中性留痕（D-1 缺陷组 ② 拍板 ②-1）：decisionLog 是历史，策略改版后旧结论不该被重新解释；
+			// 达标与否由当时生效策略的 gross_margin_gate 规则在 runStrategy 里判，不在这里写死阈值。
+			conclusion: `利润测算：毛利 ${(result.grossMargin * 100).toFixed(1)}%`,
 			reason: `毛利率 ${(result.grossMargin * 100).toFixed(1)}%，CPC承受度 ${result.cpcRatio?.toFixed(2) ?? "缺数据"}`,
 			snapshotId: latestSnapshotIfPresent(store, marketId)?.id,
 			actor,
@@ -902,9 +904,26 @@ export function targetMonthlyUnits(store: CompassStore): number {
 	return strategyTargetMonthlyUnits(latestStrategyIfPresent(store)?.definition);
 }
 
-// TUI 总览与 Web 总览共用同一行默认 Gate 文案，避免阈值调整时两处静默漂移
+// 运行期生效的 Gate 阈值：跟最新默认策略的规则表达式走，解析不出的字段回落内置默认并记在 fallbacks。
+// 利润测算警告（index.ts）与总览文案共用这一份，改策略即同步（D-1 缺陷组 ②）。
+export function gateThresholds(store: CompassStore): ResolvedGateThresholds {
+	return gateThresholdsFor(latestStrategyIfPresent(store)?.definition);
+}
+
+// TUI 总览与 Web 总览共用同一行默认 Gate 文案，避免阈值调整时两处静默漂移。
+// 每个数字都取自规则表达式（QRD 的 q 与坑位数来自 volume_feasibility，不来自 meta.q），
+// 规则改成复杂表达式或被删时回落内置数字并标「（内置默认）」，不猜。
 export function gateDefaultsLine(store: CompassStore): string {
-	return `默认 Gate：QRD(${targetMonthlyUnits(store)})≥20 · 新品占比≥15% · 毛利≥40% · CPC承受度≤0.60 · 风险非红`;
+	const thresholds = gateThresholds(store);
+	const mark = (key: keyof GateThresholds): string => (thresholds.fallbacks.includes(key) ? "（内置默认）" : "");
+	return [
+		`默认 Gate：QRD(${thresholds.qrdTargetUnits})≥${thresholds.qrdMinDepth}${mark("qrdMinDepth")}`,
+		`新品占比≥${formatGatePercent(thresholds.newListingShare)}${mark("newListingShare")}`,
+		`毛利≥${formatGatePercent(thresholds.grossMargin)}${mark("grossMargin")}`,
+		// CPC 本批不随策略走（②-5）：测算警告仍按内置 0.60 / 0.80 判，这里显示同一个数，别让总览先于警告变
+		`CPC承受度≤${DEFAULT_GATE_THRESHOLDS.cpcReview.toFixed(2)}`,
+		"风险非红",
+	].join(" · ");
 }
 
 export function moveCandidate(

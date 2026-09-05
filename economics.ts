@@ -1,4 +1,11 @@
+import { DEFAULT_GATE_THRESHOLDS, formatGatePercent, type GateThresholds } from "./defaults.ts";
 import type { MetricMap, ProfitInput, ProfitResult } from "./types.ts";
+
+// 利润测算只消费毛利 Gate 阈值；CPC 的 0.60 / 0.80 本批仍按内置常量比较、文案不变
+// （D-1 缺陷组 ② 拍板 ②-5：CPC 三条警告的字面量被 gaps.ts 与工作区 follower 逐字钉住，另立专题再参数化）。
+// fallbacks 由 service.ts 的 gateThresholds 带来：毛利阈值是从规则表达式读出的还是回落的内置默认，
+// 警告文案要说实话——回落时不能冒充「策略 Gate」。
+export type ProfitGateThresholds = Pick<GateThresholds, "grossMargin"> & { fallbacks?: ReadonlyArray<keyof GateThresholds> };
 
 function round(value: number, digits = 4): number {
 	const factor = 10 ** digits;
@@ -65,7 +72,8 @@ export function normalizeProfitInput(input: Partial<ProfitInput> & Pick<ProfitIn
 	return normalized;
 }
 
-export function estimateProfit(input: ProfitInput): ProfitResult {
+// thresholds 由调用方从最新默认策略读出（service.ts gateThresholds），脱离 store 的纯函数调用用内置默认。
+export function estimateProfit(input: ProfitInput, thresholds: ProfitGateThresholds = DEFAULT_GATE_THRESHOLDS): ProfitResult {
 	const landedCost = input.purchaseCost + input.firstMileCost + input.tariffCost;
 	const referralFee = input.salePrice * input.referralRate;
 	const grossProfit = input.salePrice - referralFee - input.fbaFee - landedCost;
@@ -96,7 +104,10 @@ export function estimateProfit(input: ProfitInput): ProfitResult {
 	}));
 
 	const warnings: string[] = [];
-	if (grossMargin < 0.4) warnings.push("毛利率低于默认 Gate 40%");
+	if (grossMargin < thresholds.grossMargin) {
+		const label = thresholds.fallbacks?.includes("grossMargin") ? "内置默认 Gate" : "策略 Gate";
+		warnings.push(`毛利率低于${label} ${formatGatePercent(thresholds.grossMargin)}${thresholds.fallbacks?.includes("grossMargin") ? "（默认策略的 gross_margin_gate 未能解析为简单阈值）" : ""}`);
+	}
 	if (cpcRatio === undefined) {
 		warnings.push(
 			input.cpc === undefined
@@ -106,8 +117,8 @@ export function estimateProfit(input: ProfitInput): ProfitResult {
 					: "毛利不足以形成正向盈亏平衡 CPC，CPC 承受度 Gate 保持待复核",
 		);
 	}
-	if (cpcRatio !== undefined && cpcRatio > 0.8) warnings.push("CPC 承受度高于 0.80，超过默认硬上限");
-	else if (cpcRatio !== undefined && cpcRatio > 0.6) warnings.push("CPC 承受度位于 0.60–0.80，需人工复核");
+	if (cpcRatio !== undefined && cpcRatio > DEFAULT_GATE_THRESHOLDS.cpcHard) warnings.push("CPC 承受度高于 0.80，超过默认硬上限");
+	else if (cpcRatio !== undefined && cpcRatio > DEFAULT_GATE_THRESHOLDS.cpcReview) warnings.push("CPC 承受度位于 0.60–0.80，需人工复核");
 	if (netMarginScenarios.every((scenario) => scenario.netMargin <= 0)) warnings.push("所有 TACOS 情景均为非正净利率");
 	if (input.portfolioCapital && startupCapital / input.portfolioCapital > 0.2) {
 		warnings.push("单 SKU 启动资金超过组合资金的 20%");

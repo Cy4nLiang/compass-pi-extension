@@ -55,6 +55,7 @@ import {
 	findCandidate,
 	findDuplicateImport,
 	findMarket,
+	gateThresholds,
 	findStrategyVersion,
 	generateRetroReport,
 	historyLessons,
@@ -753,8 +754,10 @@ export default function compassExtension(pi: ExtensionAPI): void {
 		async execute(_id, params, _signal, _update, ctx) {
 			let marketId: string | undefined;
 			let cpc = params.cpc;
+			// 毛利 Gate 阈值跟最新默认策略走：没有 market_ref 也读一次 store（拍板 ②-3：口径一致优先于零 I/O）
+			const store = await readStore(ctx);
+			const thresholds = gateThresholds(store);
 			if (params.market_ref) {
-				const store = await readStore(ctx);
 				const market = findMarket(store, params.market_ref);
 				marketId = market.id;
 				cpc = resolveProfitCpc(store, market.id, cpc);
@@ -780,7 +783,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 				tacosScenarios: params.tacos_scenarios,
 				currency: params.currency,
 			});
-			const result = estimateProfit(input);
+			const result = estimateProfit(input, thresholds);
 			let estimateId: string | undefined;
 			let gapNote: string[] = [];
 			if (marketId) {
@@ -795,7 +798,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			}
 			const scenarios = result.netMarginScenarios.map((scenario, index) => `TACOS ${(scenario.tacos * 100).toFixed(0)}% => 净利率 ${(scenario.netMargin * 100).toFixed(1)}%，月净利 ${result.monthlyNetProfitScenarios[index].monthlyNetProfit.toFixed(2)}，回本 ${result.paybackMonthsScenarios[index].paybackMonths ?? "不可"} 月`);
 			const summary = `毛利 ${(result.grossMargin * 100).toFixed(1)}% · BE-CPC ${result.breakEvenCpc.toFixed(2)} · CPC承受度 ${result.cpcRatio?.toFixed(2) ?? "缺数据"} · 启动资金 ${result.startupCapital.toFixed(2)}`;
-			return textResult([summary, ...scenarios, ...result.warnings.map((warning) => `警告：${warning}`), estimateId ? `estimate_id=${estimateId}` : "未关联市场，未持久化"].join("\n"), details({ title: "利润测算", status: result.grossMargin >= 0.4 && result.cpcRatio !== undefined && result.cpcRatio <= 0.8 ? "success" : "warning", summary, lines: [...scenarios, ...result.warnings], data: resultData({ gapNote }) }));
+			return textResult([summary, ...scenarios, ...result.warnings.map((warning) => `警告：${warning}`), estimateId ? `estimate_id=${estimateId}` : "未关联市场，未持久化"].join("\n"), details({ title: "利润测算", status: result.warnings.length === 0 ? "success" : "warning", summary, lines: [...scenarios, ...result.warnings], data: resultData({ gapNote }) }));
 		},
 		renderCall: renderCallLabel("compass_profit_estimate"),
 		renderResult: renderCompassResult,

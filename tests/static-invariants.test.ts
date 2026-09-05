@@ -387,3 +387,18 @@ test("确认门：不花钱的网关形态不预扣、convert 只收确认单批
 	// 窗口内同一 server 别的调用（keyword_list 之类）返回体同样是带 keyword 列的 data[]，不按工具名过滤就混进快照
 	assert.match(convert, /mcpPayloads\.since\(ticket\.server, ticket\.issuedAt\)\.filter\(\(entry\) => ticket\.tools\.includes\(entry\.tool\)\)/u, "convert 只收确认单批的工具的返回");
 });
+
+// —— D-1 缺陷组 ②：毛利 Gate 阈值不得在三处以字面量比较（2026-09-05）——
+// 负向全称断言：命中行数必须为 0，而不是「≥N」。写完后把 economics.ts 那处临时改回 `< 0.4` 跑一遍确认真红。
+test("毛利 Gate 阈值不得在 economics / service / index 里以字面量比较（D-1 缺陷组 ②）", async () => {
+	const offenders: string[] = [];
+	for (const file of ["economics.ts", "service.ts", "index.ts"]) {
+		const source = await readFile(join(repoRoot, file), "utf8");
+		source.split("\n").forEach((line, index) => {
+			if (/grossMargin\s*[<>]=?\s*0\.4\d*\b/u.test(line)) offenders.push(`${file}:${index + 1}`);
+		});
+	}
+	assert.deepEqual(offenders, [], "毛利 Gate 阈值只能来自 DEFAULT_GATE_THRESHOLDS / gateThresholds(store)");
+	const economics = await readFile(join(repoRoot, "economics.ts"), "utf8");
+	assert.ok(economics.includes("DEFAULT_GATE_THRESHOLDS"), "economics.ts 必须从 defaults.ts 取毛利 Gate 默认阈值");
+});

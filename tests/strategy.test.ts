@@ -4,10 +4,10 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { parseMarketCsv } from "../csv.ts";
-import { DEFAULT_STRATEGY_ID, DEFAULT_STRATEGY_YAML } from "../defaults.ts";
+import { DEFAULT_GATE_THRESHOLDS, DEFAULT_STRATEGY_ID, DEFAULT_STRATEGY_YAML, DEFAULT_TARGET_MONTHLY_UNITS } from "../defaults.ts";
 import { estimateProfit, normalizeProfitInput, profitMetrics } from "../economics.ts";
 import { calculateMarketMetrics } from "../metrics.ts";
-import { evaluateExpression, evaluateStrategy, parseStrategyYaml, slugify, strategyTargetDailyUnits, strategyTargetMonthlyUnits } from "../strategy.ts";
+import { evaluateExpression, evaluateStrategy, parseStrategyYaml, ruleThreshold, slugify, strategyTargetDailyUnits, strategyTargetMonthlyUnits } from "../strategy.ts";
 import type { StrategyContext } from "../strategy.ts";
 import type { MetricEvidence, MetricMap, MetricScalar } from "../types.ts";
 
@@ -681,5 +681,20 @@ test("derived 证据的底座走 readMetric：原型链上的同名属性不算�
 	const context: StrategyContext = { metrics, listings: [] };
 	const derived = evaluateExpression("qualify_rank_depth(300) >= 1", context).derived?.qualify_rank_depth;
 	assert.equal(derived, undefined, "原型链上的同名属性不该产出 derived 证据");
+});
+
+
+// —— D-1 缺陷组 ②：内置 YAML 的 Gate 阈值与常量同源（2026-09-05）——
+// 阈值一旦在 defaults.ts 常量与内置 YAML 字面量里各漂各的，利润测算与策略规则就又会分叉。
+test("内置 YAML 的 Gate 阈值与 DEFAULT_GATE_THRESHOLDS 逐条相等（D-1 缺陷组 ②）", () => {
+	const definition = parseStrategyYaml(DEFAULT_STRATEGY_YAML);
+	assert.deepEqual(ruleThreshold(definition, "gross_margin_gate"), { metric: "gross_margin", operator: ">=", value: DEFAULT_GATE_THRESHOLDS.grossMargin });
+	assert.deepEqual(ruleThreshold(definition, "cpc_hard_ceiling"), { metric: "cpc_ratio", operator: "<=", value: DEFAULT_GATE_THRESHOLDS.cpcHard });
+	assert.deepEqual(ruleThreshold(definition, "cpc_affordability"), { metric: "cpc_ratio", operator: "<=", value: DEFAULT_GATE_THRESHOLDS.cpcReview });
+	assert.deepEqual(ruleThreshold(definition, "high_activity_entry"), { metric: "new_listing_share_12m", operator: ">=", value: DEFAULT_GATE_THRESHOLDS.newListingShare });
+	assert.deepEqual(ruleThreshold(definition, "volume_feasibility"), { metric: "qualify_rank_depth", argument: DEFAULT_TARGET_MONTHLY_UNITS, operator: ">=", value: DEFAULT_GATE_THRESHOLDS.qrdMinDepth });
+	// 复杂表达式与不存在的规则一律 undefined，不猜
+	assert.equal(ruleThreshold(definition, "red_sea_veto"), undefined);
+	assert.equal(ruleThreshold(definition, "no_such_rule"), undefined);
 });
 

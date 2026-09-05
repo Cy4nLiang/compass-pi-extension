@@ -19,6 +19,7 @@ import {
 	evaluateMarketWithoutPersisting,
 	findStrategyVersion,
 	gateDefaultsLine,
+	gateThresholds,
 	generateMarketReport,
 	generateRetroReport,
 	importMarketAndScreen,
@@ -1833,4 +1834,46 @@ test("补数状态文件：不存在静默、坏内容要说出来，覆盖前�
 	} finally {
 		await rm(root, { recursive: true, force: true });
 	}
+});
+
+
+// —— D-1 缺陷组 ②：毛利 Gate 单一事实来源（2026-09-05）——
+test("recordProfitEstimate 的 decisionLog 结论不得与生效策略的 gross_margin_gate 打架（D-1 缺陷组 ②）", async () => {
+	const csv = await readFile(join(here, "../examples/demo-market.csv"), "utf8");
+	const parsed = parseMarketCsv(csv, { source: "sellersprite", capturedAt: "2026-08-22T00:00:00.000Z" });
+	const store = createEmptyStore();
+	ensureDefaults(store, "tester");
+	const imported = importParsedMarket(store, { marketName: "margin gate market", parsed, capturedAt: "2026-08-22T00:00:00.000Z", actor: "tester" });
+	// 运营把默认策略另存新版：毛利 Gate 放宽到 35%
+	saveStrategyVersion(store, { yaml: DEFAULT_STRATEGY_YAML.replace("gross_margin >= 0.40", "gross_margin >= 0.35").replace("毛利率≥40%", "毛利率≥35%"), actor: "tester" });
+	const input = normalizeProfitInput({ marketId: imported.market.id, salePrice: 20, purchaseCost: 4.6, fbaFee: 5, referralRate: 0.15, cvr: 0.12, cpc: 0.5 });
+	const result = estimateProfit(input, gateThresholds(store));
+	assert.ok(Math.abs(result.grossMargin - 0.37) < 0.001);
+	recordProfitEstimate(store, input, result, "tester");
+	const full = runStrategy(store, { marketRef: imported.market.id, mode: "full", actor: "tester" });
+	assert.equal(full.result.rules.find((rule) => rule.id === "gross_margin_gate")?.status, "pass");
+	// 同一个数、同一时刻：策略说通过，利润测算的警告与 decisionLog 结论都不能再说「未达标」
+	assert.equal(result.warnings.some((warning) => warning.includes("毛利率低于")), false, JSON.stringify(result.warnings));
+	const conclusion = store.decisionLog.filter((entry) => entry.type === "profit").at(-1)?.conclusion ?? "";
+	assert.equal(conclusion.includes("未达标"), false, conclusion);
+});
+
+test("gateDefaultsLine 的每个数字都来自最新策略的规则表达式，不来自 meta.q 也不来自字面量（D-1 缺陷组 ②）", () => {
+	const store = createEmptyStore();
+	ensureDefaults(store, "tester");
+	assert.match(gateDefaultsLine(store), /QRD\(300\)≥20/);
+	// ① 只改 meta.q：规则仍是 qualify_rank_depth(300) >= 20，文案必须跟规则走而不是跟 meta.q
+	saveStrategyVersion(store, { yaml: DEFAULT_STRATEGY_YAML.replace("monthly_units_q: 300", "monthly_units_q: 500"), actor: "tester" });
+	assert.match(gateDefaultsLine(store), /QRD\(300\)≥20/);
+	assert.doesNotMatch(gateDefaultsLine(store), /QRD\(500\)/);
+	// ② 改规则本身
+	saveStrategyVersion(store, { yaml: DEFAULT_STRATEGY_YAML.replace("qualify_rank_depth(300) >= 20", "qualify_rank_depth(500) >= 25"), actor: "tester" });
+	assert.match(gateDefaultsLine(store), /QRD\(500\)≥25/);
+	// ③ 改毛利与新品占比阈值
+	saveStrategyVersion(store, { yaml: DEFAULT_STRATEGY_YAML.replace("gross_margin >= 0.40", "gross_margin >= 0.35").replace("new_listing_share_12m >= 0.15", "new_listing_share_12m >= 0.10"), actor: "tester" });
+	assert.match(gateDefaultsLine(store), /毛利≥35%/);
+	assert.match(gateDefaultsLine(store), /新品占比≥10%/);
+	// ④ 规则改成复杂表达式：解析不出阈值时回落内置数字并标注，不猜
+	saveStrategyVersion(store, { yaml: DEFAULT_STRATEGY_YAML.replace("gross_margin >= 0.40", "gross_margin >= 0.40 && cr3 < 0.9"), actor: "tester" });
+	assert.match(gateDefaultsLine(store), /毛利≥40%（内置默认）/);
 });

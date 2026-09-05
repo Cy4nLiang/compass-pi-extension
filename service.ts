@@ -1,6 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import { compareSnapshotRecency, compareSnapshotRecencyDesc, DEFAULT_BUDGET_POOLS, DEFAULT_GATE_THRESHOLDS, DEFAULT_STRATEGY_ID, DEFAULT_STRATEGY_YAML, formatGatePercent, type GateThresholds, isNewerSnapshot } from "./defaults.ts";
+import type { DispatchAgentName, DispatchFacts } from "./dispatch.ts";
 import { profitMetrics } from "./economics.ts";
+import { PROFIT_ASSUMED_DEFAULTS } from "./gaps.ts";
 import {
 	calculateMetricDeltas,
 	dueRetroItems,
@@ -1100,6 +1102,69 @@ export function marketAmazonLinks(
 			monthlySales: Number.isFinite(listing.monthlySales) ? listing.monthlySales : undefined,
 		}));
 	return { searches, topListings };
+}
+
+// 给 compass_dispatch 的子代理装配 store 事实。
+//
+// 只产出**通用信息**：市场名、类目、代表商品标题、待查风险类别、缺可点击证据的类别、取了假设值的
+// 成本字段名。绝不产出金额——defaultedFields 是字段名而不是值，正是为了让这一条在类型层就成立。
+// 内部口径（找谁、HS 编码、审批角色）不在这里，也不进 prompt：它们只在工作区 hints.json，由主
+// 会话在结果下方本地拼接。
+//
+// 注意它不是严格零磁盘：candidateTitle 取自最新快照的 listings，而 listings 是懒 getter，第一次
+// 读会触发 sidecar 的 readFileSync。所以只在需要标题的两个子代理上求它，risk-query-builder 不求。
+// 其余四项只读 snapshot.metrics 与 store 顶层集合，不碰懒读。
+export function dispatchFactsFor(
+	store: CompassStore,
+	marketRef: string,
+	agent: DispatchAgentName,
+	options: { fields?: readonly string[]; categories?: readonly string[] } = {},
+): DispatchFacts {
+	// findMarket 会抛（引用不唯一 / 找不到），这是本函数唯一允许抛的地方；其余一律软降级，
+	// 否则「这个市场还没建候选卡」就会让整次派发失败，而子代理本来就不需要候选卡
+	const market = findMarket(store, marketRef);
+	const facts: DispatchFacts = {
+		marketName: market.name,
+		category: market.category,
+		riskCategories: [],
+		evidenceWithoutUrl: [],
+		defaultedFields: [],
+	};
+	if (agent !== "risk-query-builder") {
+		facts.candidateTitle = marketAmazonLinks(store, market.id, { topN: 1 }).topListings[0]?.title;
+	}
+	const risk = latestForMarket(store.riskRecords, market.id);
+	if (risk) {
+		// 「待查」= review 或 unknown。season / policy 的正常值是 clear 而不是 pass，
+		// 所以只能逐字段列举两个待查值，不能写成 !== "pass"
+		const pending: Array<[string, string]> = [
+			["cert", risk.certStatus],
+			["ip", risk.ipRiskLevel],
+			["season", risk.seasonFlag],
+			["policy", risk.policyFlag],
+			["logistics", risk.logisticsRisk],
+		];
+		facts.riskCategories = pending.filter(([, value]) => value === "review" || value === "unknown").map(([name]) => name);
+		if (!risk.evidence.some((item) => Boolean(item.url?.trim()))) {
+			facts.evidenceWithoutUrl = facts.riskCategories.length > 0 ? [...facts.riskCategories] : ["overall"];
+		}
+	}
+	const profit = latestForMarket(store.profitEstimates, market.id);
+	if (profit) {
+		// 口径与缺口派生同源：值等于系统默认即视为「取了假设值」。这是启发式——落库后区分不了
+		// 「运营显式填了 0」与「系统默认成 0」，所以对外一律说「假设值」，不说「未填」
+		facts.defaultedFields = PROFIT_ASSUMED_DEFAULTS.filter((item) => profit.input[item.field] === item.value).map((item) => item.field);
+	}
+	if (options.categories && options.categories.length > 0) {
+		const wanted = new Set(options.categories);
+		facts.riskCategories = facts.riskCategories.filter((item) => wanted.has(item));
+		facts.evidenceWithoutUrl = facts.evidenceWithoutUrl.filter((item) => wanted.has(item));
+	}
+	if (options.fields && options.fields.length > 0) {
+		const wanted = new Set(options.fields);
+		facts.defaultedFields = facts.defaultedFields.filter((item) => wanted.has(item));
+	}
+	return facts;
 }
 
 // 预算结算月 = **UTC 月**（`YYYY-MM`）。budgetStatus / 熔断拦截 / 待办抑制水位 / Web 总览 /

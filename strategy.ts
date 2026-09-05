@@ -97,8 +97,9 @@ export interface RuleThreshold {
 // 数字子模式与 tokenize 的 number 文法逐字一致（".35"、"3."、"35e-2" 都是 DSL 合法写法）：
 // 文法一旦比 DSL 窄，策略按 .35 放行、这里却回落 0.40，本批要消的双阈值分叉就在合法输入下复现。
 const DSL_NUMBER = String.raw`-?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?`;
-const SIMPLE_THRESHOLD = new RegExp(String.raw`^\s*([a-z_][a-z0-9_]*)\s*(>=|<=|>|<|==)\s*(${DSL_NUMBER})\s*$`, "u");
-const FUNCTION_THRESHOLD = new RegExp(String.raw`^\s*([a-z_][a-z0-9_]*)\(\s*(${DSL_NUMBER})\s*\)\s*(>=|<=|>|<|==)\s*(${DSL_NUMBER})\s*$`, "u");
+// tokenize 的 number 正则带 i 标志（"35E-2" 也合法），这里同样不区分大小写，否则又是一处比 DSL 窄的文法
+const SIMPLE_THRESHOLD = new RegExp(String.raw`^\s*([a-z_][a-z0-9_]*)\s*(>=|<=|>|<|==)\s*(${DSL_NUMBER})\s*$`, "iu");
+const FUNCTION_THRESHOLD = new RegExp(String.raw`^\s*([a-z_][a-z0-9_]*)\(\s*(${DSL_NUMBER})\s*\)\s*(>=|<=|>|<|==)\s*(${DSL_NUMBER})\s*$`, "iu");
 
 export function ruleThreshold(definition: StrategyDefinition | undefined, ruleId: string): RuleThreshold | undefined {
 	try {

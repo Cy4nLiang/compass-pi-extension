@@ -408,8 +408,12 @@ export function calendarDateUtcMs(value: string): number | undefined {
 	const year = Number(match[1]);
 	const month = Number(match[2]);
 	const day = Number(match[3]);
-	const ms = Date.UTC(year, month - 1, day);
-	const date = new Date(ms);
+	// 不用 Date.UTC(year, …)：它把 0–99 映射成 1900 年代，"0026/09/01" 这种年份手滑会被回环校验误判成「日期不存在」，
+	// 而不是走年份闸门（parseDate 的 1990–2100 / captured_at 的 2000 起）；setUTCFullYear 按字面年份算，回卷检测照旧。
+	const date = new Date(0);
+	date.setUTCFullYear(year, month - 1, day);
+	date.setUTCHours(0, 0, 0, 0);
+	const ms = date.getTime();
 	if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day) return Number.NaN;
 	return ms;
 }

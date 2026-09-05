@@ -2451,8 +2451,9 @@ function bindImportSubmit(content, state, isCurrent) {
 			errorEl.hidden = false;
 			return;
 		}
-		// 前端拦一次给即时反馈，措辞与后端 normalizeCapturedAt 的中文错误一致；
-		// 后端的 [2000-01-01, now+36h] 区间校验仍是唯一权威边界。
+		// 前端有意只收 YYYY-MM-DD（比后端 normalizeCapturedAt 接受的纯日期形态窄，是刻意的收窄）；
+		// 后端的 [2000-01-01, now+36h] 区间校验与「日期不存在」（2 月 30 日）校验仍是唯一权威边界，
+		// 这里不预检回卷日期，被拒时会看到后端的中文报错。
 		if (capturedAt && !/^\d{4}-\d{2}-\d{2}$/.test(capturedAt)) {
 			errorEl.textContent = "日期格式需为 YYYY-MM-DD";
 			errorEl.hidden = false;

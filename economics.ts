@@ -105,8 +105,12 @@ export function estimateProfit(input: ProfitInput, thresholds: ProfitGateThresho
 
 	const warnings: string[] = [];
 	if (grossMargin < thresholds.grossMargin) {
-		const label = thresholds.fallbacks?.includes("grossMargin") ? "内置默认 Gate" : "策略 Gate";
-		warnings.push(`毛利率低于${label} ${formatGatePercent(thresholds.grossMargin)}${thresholds.fallbacks?.includes("grossMargin") ? "（默认策略的 gross_margin_gate 未能解析为简单阈值）" : ""}`);
+		// 三种来源要说实话：没读 store（fallbacks 缺席）= 内置默认；读了但规则回落 = 内置默认 + 原因；读到规则 = 策略 Gate
+		const fromRule = thresholds.fallbacks !== undefined && !thresholds.fallbacks.includes("grossMargin");
+		const fellBack = thresholds.fallbacks?.includes("grossMargin") === true;
+		warnings.push(
+			`毛利率低于${fromRule ? "策略 Gate" : "内置默认 Gate"} ${formatGatePercent(thresholds.grossMargin)}${fellBack ? "（默认策略的 gross_margin_gate 未按 gross_margin >= 阈值 的形状声明）" : ""}`,
+		);
 	}
 	if (cpcRatio === undefined) {
 		warnings.push(
@@ -117,8 +121,12 @@ export function estimateProfit(input: ProfitInput, thresholds: ProfitGateThresho
 					: "毛利不足以形成正向盈亏平衡 CPC，CPC 承受度 Gate 保持待复核",
 		);
 	}
-	if (cpcRatio !== undefined && cpcRatio > DEFAULT_GATE_THRESHOLDS.cpcHard) warnings.push("CPC 承受度高于 0.80，超过默认硬上限");
-	else if (cpcRatio !== undefined && cpcRatio > DEFAULT_GATE_THRESHOLDS.cpcReview) warnings.push("CPC 承受度位于 0.60–0.80，需人工复核");
+	// 数字与文案同源插值（渲染结果与此前字面量逐字相同；gaps.ts 与工作区 follower 钉的是「超过默认硬上限」「需人工复核」子串）
+	if (cpcRatio !== undefined && cpcRatio > DEFAULT_GATE_THRESHOLDS.cpcHard) {
+		warnings.push(`CPC 承受度高于 ${DEFAULT_GATE_THRESHOLDS.cpcHard.toFixed(2)}，超过默认硬上限`);
+	} else if (cpcRatio !== undefined && cpcRatio > DEFAULT_GATE_THRESHOLDS.cpcReview) {
+		warnings.push(`CPC 承受度位于 ${DEFAULT_GATE_THRESHOLDS.cpcReview.toFixed(2)}–${DEFAULT_GATE_THRESHOLDS.cpcHard.toFixed(2)}，需人工复核`);
+	}
 	if (netMarginScenarios.every((scenario) => scenario.netMargin <= 0)) warnings.push("所有 TACOS 情景均为非正净利率");
 	if (input.portfolioCapital && startupCapital / input.portfolioCapital > 0.2) {
 		warnings.push("单 SKU 启动资金超过组合资金的 20%");

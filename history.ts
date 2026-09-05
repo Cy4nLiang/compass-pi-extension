@@ -666,6 +666,28 @@ export function latestComparableChecks(checks: readonly OutcomeCheck[]): Outcome
 	return [...latest.values()];
 }
 
+export type DisclosureBucket = "comparable" | "strategyOnly" | "waitlistAnchored" | "inconclusive";
+
+// 披露四桶的唯一分类器：inconclusive 先归桶，其余按锚点分。switch 穷尽 DecisionStatus——
+// 将来加第四个决策状态时 default 分支的 never 赋值会在 tsc 层报错，而不是像 D-1 缺陷组 ① 修前那样
+// 让新状态的对照静默两头落空。comparable 桶与 isComparableCheck 同口径（四率 / backtest 共用判据）。
+export function disclosureBucket(check: OutcomeCheck): DisclosureBucket {
+	if (check.verdict === "inconclusive") return "inconclusive";
+	const status = check.decisionStatus;
+	if (status === undefined) return "strategyOnly";
+	switch (status) {
+		case "go":
+		case "no_go":
+			return "comparable";
+		case "waitlist":
+			return "waitlistAnchored";
+		default: {
+			const exhaustive: never = status;
+			throw new Error(`未知的决策状态：${String(exhaustive)}`);
+		}
+	}
+}
+
 export function outcomeStatistics(store: CompassStore, checks = store.outcomeChecks): OutcomeStats {
 	const validated = checks.filter((check) => check.verdict === "validated").length;
 	const challenged = checks.filter((check) => check.verdict === "challenged").length;
@@ -683,10 +705,10 @@ export function outcomeStatistics(store: CompassStore, checks = store.outcomeChe
 		group[check.verdict]++;
 		groups.set(strategy, group);
 	}
-	// 披露四桶互斥：inconclusive 先归 inconclusive 桶，其余按锚点分——无锚点 / waitlist / 可判（go、no_go）
-	const comparable = checks.filter(isComparableCheck).length;
-	const strategyOnly = checks.filter((check) => check.verdict !== "inconclusive" && check.decisionStatus === undefined).length;
-	const waitlistAnchored = checks.filter((check) => check.verdict !== "inconclusive" && check.decisionStatus === "waitlist").length;
+	// 披露四桶由唯一分类器 disclosureBucket 决定，恒等式靠「每条恰好归一桶」成立，而不是三条独立 filter 碰巧不重不漏
+	const buckets: Record<DisclosureBucket, number> = { comparable: 0, strategyOnly: 0, waitlistAnchored: 0, inconclusive: 0 };
+	for (const check of checks) buckets[disclosureBucket(check)]++;
+	const { comparable, strategyOnly, waitlistAnchored } = buckets;
 	return {
 		total: checks.length,
 		conclusive,

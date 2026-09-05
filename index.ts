@@ -31,7 +31,7 @@ import {
 	type DispatchRegistryLike,
 } from "./dispatch.ts";
 import { estimateProfit, normalizeProfitInput } from "./economics.ts";
-import { capturedAtForBatch, convertSorftimePayloads, createMcpPayloadCache, parseSorftimeFieldMap, type McpPayloadEntry, type SorftimeFieldMap } from "./gapfill-convert.ts";
+import { capturedAtForBatch, convertSorftimePayloads, createMcpPayloadCache, materializeReviewPayloads, parseSorftimeFieldMap, requestParamsOf, type McpPayloadEntry, type SorftimeFieldMap } from "./gapfill-convert.ts";
 import {
 	hasEffectiveLimit,
 	GAPFILL_MODES,
@@ -486,6 +486,12 @@ export default function compassExtension(pi: ExtensionAPI): void {
 		marketId: string;
 		marketName: string;
 		issuedAt: string;
+		/** snapshot = 转成市场 CSV 走导入；material = 转成差评材料交给 compass_dispatch */
+		kind: "snapshot" | "material";
+		/** material 单批准的 ASIN。strict 档据此拦「拿着确认单去抓没批准的 ASIN」 */
+		asins: readonly string[];
+		/** 映射表声明的固定参数（如 review_type）。门禁是同步的、读不到映射表，只能从这里复核 */
+		fixedParams?: Readonly<Record<string, string>>;
 	}
 	const TICKET_TTL_MS = 10 * 60_000;
 	let gapfillTicket: GapfillTicket | undefined;
@@ -551,6 +557,25 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			const tool = mcpCallToolName(covered.server, call);
 			if (tool && !covered.tools.includes(tool)) {
 				return `${covered.server} 补数确认单不覆盖 ${tool}（strict 档）。这张单批的是 ${covered.tools.join(" / ")}——要调别的接口请重新跑 compass_gaps action=approve。`;
+			}
+			// 差评单是逐 ASIN 批准的：确认单上写着哪几个 ASIN，就只能抓那几个。
+			// 两个字段必须从**同一个**参数对象读（直连是 input、网关套在 args 里），
+			// 跨对象拼会在网关形态下把合规调用误拦；整个对象都解析不出时不判，与 mcpCallToolName 同口径
+			if (covered.kind === "material") {
+				const params = requestParamsOf(call.input);
+				const asin = params && typeof params.asin === "string" ? params.asin : undefined;
+				if (params && asin) {
+					if (!covered.asins.includes(asin)) {
+						return `${covered.server} 补数确认单不覆盖 ASIN ${asin}（strict 档）。这张单批的是 ${covered.asins.join(" / ")}——要抓别的 ASIN 请重新跑 compass_gaps action=approve。`;
+					}
+					for (const [key, expected] of Object.entries(covered.fixedParams ?? {})) {
+						if (params[key] !== expected) {
+							// 漏传不是「参数可选」：服务端会按默认值返回全量评论并照样计费，
+							// 而运营在弹窗上确认的是「只抓差评」
+							return `${covered.server} 补数确认单要求固定 ${key}=${expected}（strict 档），本次传的是 ${params[key] === undefined ? "（未传）" : String(params[key])}。漏传会按服务端默认值返回全量评论并照样计费——请按确认单上的步骤重发。`;
+						}
+					}
+				}
 			}
 		}
 		// 预扣必须发生在 tool_call。宿主同一轮的工具批次是「先把每个调用的 tool_call 判定跑完，
@@ -1532,6 +1557,10 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			origin: Type.Optional(StringEnum(GAP_ORIGINS)),
 			tier: Type.Optional(StringEnum(GAP_AUTO_TIERS)),
 			limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
+			// 只用于差评补数（origin=review_evidence）：那条链按 ASIN 逐个调用。
+			// maxItems 是字面量 5——参数表在同步工厂体内求值，读不到运行期才载入的映射表；
+			// 映射表的 asins_per_ticket_max 只能在 execute 里把上限**收紧**，不能放宽
+			asins: Type.Optional(Type.Array(Type.String({ pattern: "^[A-Z0-9]{10}$" }), { minItems: 1, maxItems: 5, description: "差评补数要抓的 ASIN（每个 1 次调用）" })),
 		}),
 		// approve 会弹窗等运营按键、convert 会写文件并删临时文件：都不能与别的工具调用并发，
 		// 否则两次 approve 会抢同一张确认单、两次 convert 会互相删对方还没读的溢写文件
@@ -1563,9 +1592,6 @@ export default function compassExtension(pi: ExtensionAPI): void {
 
 				// 映射表先校验：3 次调用花出去之后才发现映射表坏了，点数是要不回来的
 				const map = await loadSorftimeFieldMap(ctx);
-				const chain = map.chain ?? [];
-				if (!chain.length) throw new Error(`补数映射表（${GAPFILL_MAP_PATH}）没有声明 chain：不知道按什么顺序调几次，无法确认。`);
-				const calls = chain.length;
 
 				const confirmGaps = filtered.filter((gap) => gap.autoTier === "A_confirm");
 				if (!confirmGaps.length) {
@@ -1593,6 +1619,38 @@ export default function compassExtension(pi: ExtensionAPI): void {
 				}
 				const server = paidSources[0];
 
+				// 两条 A 档链路都叫 sorftime，上面按 source 去重的那道检查放得过去，但它们的产物完全
+				// 不同（一份市场 CSV vs 一份差评材料），一张确认单覆盖不了两种。按 writeBack 再判一次
+				const paidWriteBacks = [...new Set(confirmGaps.flatMap((gap) => gap.sources.filter((option) => option.tier === "A").map((option) => option.writeBack)))];
+				if (paidWriteBacks.length !== 1) {
+					throw new Error(`这批缺口的 A 档产物不唯一（${paidWriteBacks.join("、")}）：快照补数与差评补数的调用方式和产物都不同，一张确认单覆盖不了；请用 origin= 缩小到同一类再确认。`);
+				}
+				const isMaterial = paidWriteBacks[0] === "reviews_record";
+
+				// 差评链按 ASIN 逐个调，次数 = ASIN 个数；快照链是固定几步的链路，次数 = 链长
+				const chain = isMaterial ? map.reviews?.chain ?? [] : map.chain ?? [];
+				if (!chain.length) {
+					throw new Error(
+						isMaterial
+							? `补数映射表（${GAPFILL_MAP_PATH}）没有声明 reviews 链：差评补数需要它才能把返回体映射成材料，无法确认。`
+							: `补数映射表（${GAPFILL_MAP_PATH}）没有声明 chain：不知道按什么顺序调几次，无法确认。`,
+					);
+				}
+				const asins = [...new Set(params.asins ?? [])];
+				if (isMaterial) {
+					if (!asins.length) throw new Error("差评补数需要 asins=<ASIN…>：这条链按 ASIN 逐个调用，不给 ASIN 就不知道要抓谁的差评（一张单最多 5 个）。");
+					// 运行期复核映射表声明的上限。schema 里的 maxItems 只能是字面量（参数表在同步工厂体内
+					// 求值，读不到运行期才载入的映射表），所以映射表只能把上限**收紧**、不能放宽。
+					// 位置必须在弹窗与扣次数之前——钱花完才发现超限，点数是要不回来的
+					const perTicketMax = map.reviews?.asinsPerTicketMax ?? 5;
+					if (asins.length > perTicketMax) {
+						throw new Error(`一张确认单最多批 ${perTicketMax} 个 ASIN（${GAPFILL_MAP_PATH} 的 reviews.asins_per_ticket_max），本次传了 ${asins.length} 个：请分批确认。`);
+					}
+				} else if (asins.length) {
+					throw new Error("asins= 只用于差评补数（origin=review_evidence）；快照补数不按 ASIN 调用，请去掉这个参数。");
+				}
+				const calls = isMaterial ? asins.length : chain.length;
+
 				const pending = pendingCallCounts();
 				// 弹窗与预检共用同一份**含 pending** 的池状态（P3）：readStoreFlushingUsage 已尽力把
 				// pending 落账，但它失败时会静默退回只读——那时 budgetStatus(store) 少算本会话的调用，
@@ -1617,13 +1675,19 @@ export default function compassExtension(pi: ExtensionAPI): void {
 				if (blocked) throw new Error(`补数确认被拒绝：这批要 ${calls} 次调用，做不完就会熔断。${blocked.reason}`);
 
 				const limitText = pool.monthlyCallLimit !== undefined ? `限 ${pool.monthlyCallLimit} 次` : `限 ¥${pool.monthlyLimitCny}`;
-				const steps = chain.map((item) => `${item.step}. ${item.tool}${item.required?.length ? `（需要 ${item.required.join(" / ")}）` : ""}`);
+				// 固定参数要打进步骤行：漏传 review_type 时服务端按 Both 返回全量评论、照样计费，
+				// 而运营从「需要 asin / amz_site」这几个字里看不出还有个必填的固定值
+				const steps = chain.map(
+					(item) =>
+						`${item.step}. ${item.tool}${item.required?.length ? `（需要 ${item.required.join(" / ")}` : ""}${item.fixed ? `${item.required?.length ? "；" : "（"}固定 ${Object.entries(item.fixed).map(([key, value]) => `${key}=${value}`).join(" / ")}` : ""}${item.required?.length || item.fixed ? "）" : ""}`,
+				);
 				const confirmOption = `确认：现在调用 ${calls} 次`;
 				const explainOption = `先看这 ${calls} 次分别做什么（不调用）`;
+				const scopeText = isMaterial ? `每 ASIN 1 次：${asins.join("、")}` : `${chain.length} 步链路`;
 				// 弹窗只回显次数与上限，**不回显池的 note**——note 是自由文本，实测会漂移（写着
 				// 「设为 1」而上限早就是 10），拿它当口径会让运营照着一个假数字做决定
 				const choice = await ctx.ui.select(
-					`补数确认：${market.name} · 将调用 ${server} ${calls} 次（本月已用 ${pool.callCount} / ${limitText}）`,
+					`补数确认：${market.name} · 将调用 ${server} ${calls} 次（${scopeText}；本月已用 ${pool.callCount} / ${limitText}）`,
 					[confirmOption, explainOption, "取消"],
 					{ timeout: 60_000 },
 				);
@@ -1647,6 +1711,11 @@ export default function compassExtension(pi: ExtensionAPI): void {
 					marketId: market.id,
 					marketName: market.name,
 					issuedAt: new Date().toISOString(),
+					kind: isMaterial ? "material" : "snapshot",
+					asins,
+					// 固定参数存进确认单而不是让门禁去读映射表：门禁是同步函数、跑在 tool_call 热路径上，
+					// 而映射表要 await readFile。运营确认的就是这一组固定值，存下来复核最贴近原意
+					fixedParams: chain[0]?.fixed,
 				};
 				const lines = [
 					`已批准：${server} ${calls} 次调用，确认单 10 分钟内有效。`,
@@ -1692,6 +1761,41 @@ export default function compassExtension(pi: ExtensionAPI): void {
 				// 文件名仍按 mcp-<日期>-<slug>-<source>.csv 的约定只带日期。
 				const capturedAt = capturedAtForBatch(entries);
 				const capturedDate = capturedAt.slice(0, 10);
+				if (ticket.kind === "material") {
+					// 差评单转的是材料文件，不是 CSV，也不进导入入口——完整快照原则对它不适用：
+					// 每个 ASIN 的差评是彼此独立的证据，缺一个不会让另一个的聚类失真，
+					// 缺的点名进 missing_asins 让运营决定要不要补调
+					let made: Awaited<ReturnType<typeof materializeReviewPayloads>>;
+					try {
+						made = await materializeReviewPayloads(
+							{ repo: repository(ctx) },
+							{ payloads: entries, map, marketName: ticket.marketName, asins: ticket.asins, capturedAt, source: ticket.server },
+						);
+					} catch (error) {
+						// 与快照路径同约定：转换失败**不清单不清缓存**，运营补调后还能接着转
+						throw new Error(error instanceof Error ? error.message : String(error));
+					}
+					mcpPayloads.forget(entries.map((entry) => entry.toolCallId));
+					gapfillTicket = undefined;
+					const materialLines = [
+						`差评材料已生成：${made.reviewsTotal} 条 · ${made.perAsin.map((item) => `${item.asin} ${item.rows} 条`).join(" / ")}`,
+						`下一步：compass_dispatch agent=review-clusterer market_ref=${ticket.marketId} material=${made.materialPath}`,
+						"聚类结果不会自动写回——看过之后再执行 compass_reviews_record 录入。",
+					];
+					if (made.missingAsins.length) {
+						materialLines.push(`这几个 ASIN 没有拿到评论：${made.missingAsins.join("、")}（已计费的调用不退；要补就重新 approve 只批这几个）。`);
+					}
+					if (made.droppedAsins.length) {
+						materialLines.push(`丢弃了确认单之外的 ${made.droppedAsins.length} 个 ASIN 的返回：${made.droppedAsins.join("、")}。`);
+					}
+					return textResult(materialLines.join("\n"), details({
+						title: "补数转换",
+						status: made.missingAsins.length ? "warning" : "success",
+						summary: `差评材料 ${made.reviewsTotal} 条 · ${ticket.marketName}`,
+						lines: materialLines,
+						data: resultData({ payload: { material: made.materialPath, reviewsTotal: made.reviewsTotal, perAsin: made.perAsin, missingAsins: made.missingAsins } }),
+					}));
+				}
 				let result: Awaited<ReturnType<typeof convertSorftimePayloads>>;
 				try {
 					result = await convertSorftimePayloads(
@@ -1738,7 +1842,8 @@ export default function compassExtension(pi: ExtensionAPI): void {
 					const hint = hints[gap.field];
 					lines.push(`${gap.label}（${gap.field} · P${gap.priority} · ${gap.autoTier}）：${gap.reason}`);
 					for (const option of gap.sources) {
-						const calls = option.estimatedCalls ? `预计 ${option.estimatedCalls} 次` : "不计次";
+						// perAsin 的次数是「每个 ASIN」而不是整批：写成「预计 1 次」会让运营以为批 5 个 ASIN 也只花 1 次
+					const calls = option.estimatedCalls ? (option.perAsin ? `每 ASIN ${option.estimatedCalls} 次` : `预计 ${option.estimatedCalls} 次`) : "不计次";
 						const pool = option.tier === "A" ? `${option.available ? "可用" : "不可用"}／${option.limitConfigured ? "已配上限" : "未配可生效上限"}` : "免费";
 						// hints.json 写的是**人工怎么补**（找谁要报价、后台在哪张报表），只覆盖人工那一档。
 						// 按 field 无差别覆盖会把这段内部话术印到「C 档 重导 CSV」和「A 档 sorftime」行下面

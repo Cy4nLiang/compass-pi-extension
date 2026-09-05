@@ -656,6 +656,28 @@ test("A 档缺口的尾注给出可照做的 approve 命令（带 market_ref）"
 	assert.ok(note.every((line) => !line.includes("二期上线")), "功能已上线，尾注不得再说「二期上线」");
 });
 
+test("A 档差评缺口的尾注给出带 origin 与 asins 的 approve 命令", () => {
+	const store = baseStore();
+	addMarket(store, "mkt_demo_rev", "demo rev");
+	addCandidate(store, "cand_demo_rev", "mkt_demo_rev", "deep_research");
+	addSnapshot(store, "snap_rev", "mkt_demo_rev", "2026-09-01T00:00:00.000Z");
+	const gaps = derive(store, { budgets: [SORFTIME_CONFIGURED] }).filter((gap) => gap.origin === "review_evidence" && gap.autoTier === "A_confirm");
+	assert.ok(gaps.length > 0, "配了上限的 sorftime 池下，差评缺口应升到 A 档");
+	const line = gapActionLine(gaps[0]);
+	// 差评那条链按 ASIN 逐个调：只钉 action=approve 会被快照类那行顺带喂饱，
+	// 必须把 origin= 与 asins= 一起钉进同一个正则——少任一个，运营复制过去都执行不了
+	assert.match(line, /compass_gaps action=approve market_ref=\S+ origin=review_evidence asins=/u, `差评 A 档动作行要能直接照做，实得：${line}`);
+	assert.match(line, /每 ASIN 1 次/u, "要说清它是按 ASIN 计费的，不是一次批完");
+
+	// 预估星级同属 review_evidence 这个 origin，但只能由人给：不得被打成「可花钱补」
+	const rating = derive(store, { budgets: [SORFTIME_CONFIGURED] }).find((gap) => gap.field === "estimated_rating");
+	if (rating) assert.doesNotMatch(gapActionLine(rating), /action=approve/u, "预估星级只能由人给，不该出现 approve 命令");
+
+	// 没配可生效上限时这条链根本不该出现在 A 档
+	const unconfigured = derive(store, { budgets: [SORFTIME_UNCONFIGURED] }).filter((gap) => gap.origin === "review_evidence" && gap.autoTier === "A_confirm");
+	assert.deepEqual(unconfigured, [], "池没配可生效上限时，差评缺口不该升到 A 档");
+});
+
 // ── 路由表与公开仓库卫生 ──────────────────────────────────────────────────────
 
 test("GAP_SOURCE_MATRIX 只用预算池已有的来源名，且不含内部 SOP 线索", () => {

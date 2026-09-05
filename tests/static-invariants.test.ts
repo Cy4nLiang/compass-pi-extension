@@ -553,3 +553,67 @@ test("compass_dispatch：hints 只在结果侧拼接", async () => {
 	assert.notEqual(hintsAt, -1, "compass_dispatch 必须在结果下方本地拼接 hints 的 how");
 	assert.ok(hintsAt > dispatchAt, "hints 只能在 runDispatch 返回之后读——早于它就有被传进 prompt 的可能");
 });
+
+// —— 三期差评材料链的两条静态钉子（2026-09-06）——
+// 用例名同以 `reviews 链：` 开头，与 gaps-convert.test.ts 那十条区分在文件而不在名字。
+
+test("reviews 链：convert 的 material 分支不出现 writeImportCsv 或 compass_import_csv", async () => {
+	const source = await readFile(join(repoRoot, "index.ts"), "utf8");
+	const body = toolBody(source, "compass_gaps");
+	const start = body.indexOf('if (action === "convert")');
+	const end = body.indexOf('if (action === "plan")', start);
+	assert.ok(start > 0 && end > start, "抽不到 convert 分支——切片已失效");
+	const convert = body.slice(start, end);
+	const materialStart = convert.indexOf('if (ticket.kind === "material")');
+	assert.notEqual(materialStart, -1, "convert 里找不到 material 分支");
+	// 边界取快照分支的首行而不是 `convertSorftimePayloads(`：后者的第一次出现是那行 `let result:`
+	// 的类型标注，切过去会把快照分支的第一行也算进 material 片段，负向断言随即假红
+	const snapshotStart = convert.indexOf("let result:", materialStart);
+	assert.ok(snapshotStart > materialStart, "material 分支必须早返回，排在快照分支之前");
+	const material = convert.slice(materialStart, snapshotStart);
+	// 材料不是要导入的 CSV：走导入入口就等于把差评原文塞进市场快照链路
+	assert.equal(/writeImportCsv|compass_import_csv|convertSorftimePayloads/u.test(material), false, "material 分支不得触碰 CSV 导入链路");
+	assert.match(material, /materializeReviewPayloads\(/u, "material 分支必须走材料转换");
+	// 早返回会绕过快照分支末尾的清理，两行必须在分支内重写一遍——否则确认单与载荷缓存永远留着
+	assert.match(material, /mcpPayloads\.forget\(/u, "material 分支要自己清载荷缓存");
+	assert.match(material, /gapfillTicket = undefined;/u, "material 分支要自己清确认单");
+	assert.match(material, /capturedAt/u, "材料的 captured_at 用完整时间戳");
+});
+
+test("reviews 链：approve 的 asins 带字面量 maxItems 5 且运行期复核在映射表读入之后弹窗之前", async () => {
+	const source = await readFile(join(repoRoot, "index.ts"), "utf8");
+	const body = toolBody(source, "compass_gaps");
+	// schema 在同步工厂体内求值，读不到运行期才载入的映射表——上限只能是字面量
+	const asinsLine = body.split("\n").find((line) => line.includes("asins: Type.Optional(Type.Array("));
+	assert.ok(asinsLine, "compass_gaps 的参数表里找不到 asins");
+	assert.match(asinsLine, /minItems: 1, maxItems: 5/u, "asins 的上限必须是字面量 5");
+	const approveStart = body.indexOf('if (action === "approve")');
+	const approveEnd = body.indexOf('if (action === "convert")', approveStart);
+	assert.ok(approveStart > 0 && approveEnd > approveStart, "抽不到 approve 分支——切片已失效");
+	const approve = body.slice(approveStart, approveEnd);
+	const mapAt = approve.indexOf("await loadSorftimeFieldMap(ctx)");
+	const checkAt = approve.indexOf("asinsPerTicketMax");
+	const promptAt = approve.indexOf("await ctx.ui.select(");
+	assert.ok(mapAt > 0 && checkAt > 0 && promptAt > 0, "approve 分支里找不到映射表读入 / 上限复核 / 弹窗三处锚点");
+	assert.ok(checkAt > mapAt, "上限复核要在映射表读入之后");
+	// 放到弹窗之后就成了「钱花完才发现超限」，而点数要不回来
+	assert.ok(checkAt < promptAt, "上限复核必须在弹窗与扣次数之前");
+});
+
+test("reviews 链：strict 档按确认单的 ASIN 与固定参数复核，且拒绝发生在扣额度之前", async () => {
+	const source = await readFile(join(repoRoot, "index.ts"), "utf8");
+	const gateStart = source.indexOf("function gapfillTicketGate(");
+	const gateEnd = source.indexOf("function refundTicketCall(");
+	assert.ok(gateStart > 0 && gateEnd > gateStart, "抽不到 gapfillTicketGate 的函数体——切片已失效");
+	const gate = source.slice(gateStart, gateEnd);
+	assert.match(gate, /covered\.kind === "material"/u, "差评单要按 kind 走自己的复核分支");
+	assert.match(gate, /covered\.asins\.includes\(asin\)/u, "确认单是逐 ASIN 批准的，只能抓批准过的那几个");
+	assert.match(gate, /covered\.fixedParams/u, "固定参数从确认单复核——门禁是同步函数，读不到映射表");
+	// 两个字段必须从同一个参数对象读：跨对象拼会在网关形态下把合规调用误拦
+	assert.match(gate, /const params = requestParamsOf\(call\.input\);/u, "asin 与固定参数要从同一个参数对象取");
+	// 拒绝必须早于预扣。写到 strict 块之外会变成「拒绝了还扣一次额度」，
+	// 而被拒的调用不会产生 tool_result，那笔预扣永远退不回来
+	const asinCheckAt = gate.indexOf("covered.asins.includes(asin)");
+	const deductAt = gate.indexOf("covered.remainingCalls -= 1;");
+	assert.ok(asinCheckAt > 0 && deductAt > asinCheckAt, "ASIN 复核必须排在额度预扣之前");
+});

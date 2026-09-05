@@ -22,6 +22,8 @@ export interface SorftimeFieldMap {
 	keyword: Record<string, string>;
 	/** 调用链：approve 用它算这批要几次调用、以及 ticket 的工具白名单。缺省表示映射表没声明链路 */
 	chain?: SorftimeChainStep[];
+	/** 差评材料链。缺省表示映射表没声明它，material 单一律拒绝而不是降级 */
+	reviews?: SorftimeReviewsMap;
 }
 
 /** 映射表 `chain` 数组里的一步。工具名只在映射表里出现，compass 源码不硬编码第三方工具名。 */
@@ -29,7 +31,33 @@ export interface SorftimeChainStep {
 	step: number;
 	tool: string;
 	required?: string[];
+	/** "asin" 表示这一步按 ASIN 逐个调用，approve 据此把次数算成 asins.length */
+	per?: "batch" | "asin";
+	/** 必须固定传的参数（如评论类型）。approve 把它存进确认单，strict 档据此复核实际调用 */
+	fixed?: Record<string, string>;
 }
+
+/**
+ * 差评材料链：与 CSV 那条路子并列的第二种产物。
+ *
+ * 形状与 CSV 段刻意不同，别照抄校验分支：`rows` 是**一个字符串**（评论行数组的点路径），
+ * 不是 `{ listing, keyword }` 对象；`fields` 的键是材料文件里的字段名，不是 CSV 列名——
+ * 所以它们绝不能并进 parseSorftimeFieldMap 末尾那个 headerFor 循环，body / variant 不在
+ * csv.ts 的别名表里，并进去会把整张已冻结的映射表判死。
+ */
+export interface SorftimeReviewsMap {
+	chain: SorftimeChainStep[];
+	rows: string;
+	fields: Record<string, string>;
+	sampleCap?: number;
+	asinsPerTicketMax?: number;
+}
+
+/**
+ * `fields.asin` 的哨兵值：评论行里没有 ASIN，只能取自当次调用的请求参数。
+ * 它不是点路径——`pickPath(row, "$request.asin")` 恒返回 undefined，会让所有行的 asin 静默变空。
+ */
+export const REQUEST_ASIN_SENTINEL = "$request.asin";
 
 /**
  * 校验映射表并归一成 SorftimeFieldMap。缺字段一律抛错、**不降级**：
@@ -54,6 +82,22 @@ export function parseSorftimeFieldMap(raw: unknown): SorftimeFieldMap {
 		return out;
 	};
 
+	// 两条链共用的一步解析。per / fixed 是差评链引入的，快照链没有这两个键、解析后仍是 undefined
+	const chainStep = (step: Record<string, unknown>, index: number): SorftimeChainStep => {
+		if (typeof step.tool !== "string" || !step.tool) throw new Error(`chain[${index}].tool 必须是非空字符串`);
+		const fixed: Record<string, string> = {};
+		for (const [key, value] of Object.entries(step.fixed && typeof step.fixed === "object" && !Array.isArray(step.fixed) ? (step.fixed as Record<string, unknown>) : {})) {
+			if (typeof value === "string" && value) fixed[key] = value;
+		}
+		return {
+			step: typeof step.step === "number" ? step.step : index + 1,
+			tool: step.tool,
+			required: Array.isArray(step.required) ? step.required.filter((value): value is string => typeof value === "string") : undefined,
+			per: step.per === "asin" || step.per === "batch" ? step.per : undefined,
+			fixed: Object.keys(fixed).length ? fixed : undefined,
+		};
+	};
+
 	const root = asRecord(raw, "映射表");
 	const rows = asRecord(root.rows, "rows");
 	if (typeof rows.listing !== "string" || !rows.listing) throw new Error("rows.listing 必须是非空点路径");
@@ -67,15 +111,31 @@ export function parseSorftimeFieldMap(raw: unknown): SorftimeFieldMap {
 
 	if (root.chain !== undefined) {
 		if (!Array.isArray(root.chain) || !root.chain.length) throw new Error("chain 必须是非空数组");
-		map.chain = root.chain.map((item, index) => {
-			const step = asRecord(item, `chain[${index}]`);
-			if (typeof step.tool !== "string" || !step.tool) throw new Error(`chain[${index}].tool 必须是非空字符串`);
-			return {
-				step: typeof step.step === "number" ? step.step : index + 1,
-				tool: step.tool,
-				required: Array.isArray(step.required) ? step.required.filter((value): value is string => typeof value === "string") : undefined,
-			};
-		});
+		map.chain = root.chain.map((item, index) => chainStep(asRecord(item, `chain[${index}]`), index));
+	}
+
+	// reviews 段缺省时**不能带这个键**：调用方按键集判「映射表声明了哪几条链路」，
+	// 带一个值为 undefined 的键会让「没声明」看起来像「声明了但是空的」
+	if (root.reviews !== undefined) {
+		const reviews = asRecord(root.reviews, "reviews");
+		if (!Array.isArray(reviews.chain) || !reviews.chain.length) throw new Error("reviews.chain 必须是非空数组");
+		if (typeof reviews.rows !== "string" || !reviews.rows) throw new Error("reviews.rows 必须是非空点路径");
+		const fields = asPathMap(reviews.fields, "reviews.fields");
+		// 身份列与正文列缺一不可：没有 asin 就归不了组（评论行里没有 ASIN，只能取请求参数），
+		// 没有 body 就没有可聚类的内容，两种情况写出来的材料都是废的
+		if (!fields.asin) throw new Error("reviews.fields 必须映射 asin：评论行里没有 ASIN，只能取自请求参数");
+		if (!fields.body) throw new Error("reviews.fields 必须映射 body：没有正文就没有可聚类的内容");
+		map.reviews = {
+			chain: reviews.chain.map((item, index) => chainStep(asRecord(item, `reviews.chain[${index}]`), index)),
+			rows: reviews.rows,
+			fields,
+			sampleCap: typeof reviews.sample_cap === "number" && reviews.sample_cap > 0 ? Math.floor(reviews.sample_cap) : undefined,
+			asinsPerTicketMax:
+				typeof reviews.asins_per_ticket_max === "number" && Number.isInteger(reviews.asins_per_ticket_max) && reviews.asins_per_ticket_max > 0
+					? reviews.asins_per_ticket_max
+					: undefined,
+		};
+		if (map.reviews.asinsPerTicketMax === undefined) throw new Error("reviews.asins_per_ticket_max 必须是正整数：approve 靠它复核一张单最多批几个 ASIN");
 	}
 
 	// 身份列必须映射：convert 靠 asin / keyword 判断一行到底属于哪一类（与 csv.ts 同口径）。
@@ -214,11 +274,19 @@ export interface McpPayloadEntry extends CachedPayload {
 	toolCallId: string;
 	receivedAt: string;
 	approxBytes: number;
+	/**
+	 * 这次调用请求参数里的 ASIN。差评链唯一的归组依据——评论行里既没有 ASIN 也没有评论 id，
+	 * 一张单 2–5 个 ASIN 的返回体形状完全相同、并行到达顺序也不定，不记下来就没法把行分回去。
+	 *
+	 * 只存这一个字符串，不存整个 input：热路径要保持零 I/O、O(1)，而原始参数已经随 details
+	 * 落进会话文件了，这里再持一份只是白占内存。
+	 */
+	requestAsin?: string;
 }
 
 export interface McpPayloadCache {
 	/** 收下一次 MCP 结果里的载荷；抽不出可用载荷时什么都不做 */
-	remember(sample: { server: string; tool: string }, event: { toolCallId: string; details?: unknown; content?: ReadonlyArray<{ type?: string; text?: string }>; receivedAt?: string }): void;
+	remember(sample: { server: string; tool: string }, event: { toolCallId: string; details?: unknown; content?: ReadonlyArray<{ type?: string; text?: string }>; receivedAt?: string; input?: Record<string, unknown> }): void;
 	/** 某 server 在给定时刻之后收到的载荷，按到达顺序——ticket 用它界定一个批次 */
 	since(server: string, sinceIso: string): McpPayloadEntry[];
 	/** 转换消费掉之后丢弃：它已把溢写文件删了，留着只会让下次读到不存在的路径 */
@@ -235,6 +303,25 @@ export interface McpPayloadCache {
  * 方法名一律避开 `update`——compass 的 static-invariants 用纯文本正则 `/\.update\s*\(/` 判
  * 「热路径出现写事务」，缓存里出现 `xxx.update(` 会被误判。
  */
+/**
+ * 从调用参数里取 ASIN。两种形态：直连是 `input.asin`，网关把参数套在 `input.args` 里。
+ *
+ * 两个字段必须从**同一个对象**读——门禁那边还要在同一个对象里读 review_type，跨对象拼会在
+ * 网关形态下把合规调用误拦。这里只认字符串、不 parse、不递归，热路径经得起。
+ */
+export function requestParamsOf(input: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+	if (!input) return undefined;
+	if (typeof input.asin === "string") return input;
+	const args = input.args;
+	if (args && typeof args === "object" && !Array.isArray(args) && typeof (args as Record<string, unknown>).asin === "string") return args as Record<string, unknown>;
+	return undefined;
+}
+
+function requestAsinOf(input: Record<string, unknown> | undefined): string | undefined {
+	const asin = requestParamsOf(input)?.asin;
+	return typeof asin === "string" && asin ? asin : undefined;
+}
+
 export function createMcpPayloadCache(options: { maxEntries?: number; maxBytes?: number } = {}): McpPayloadCache {
 	const maxEntries = options.maxEntries ?? 20;
 	const maxBytes = options.maxBytes ?? 2 * 1_048_576;
@@ -264,6 +351,7 @@ export function createMcpPayloadCache(options: { maxEntries?: number; maxBytes?:
 				tool: sample.tool,
 				receivedAt: event.receivedAt ?? new Date().toISOString(),
 				approxBytes: extracted.approxBytes,
+				requestAsin: requestAsinOf(event.input),
 			});
 			evict();
 		},
@@ -512,16 +600,32 @@ export async function convertSorftimePayloads(deps: ConvertDeps, input: ConvertI
 	const fileName = `mcp-${input.capturedDate}-${slugForFileName(input.marketName)}-${source}.csv`;
 	const csvPath = await deps.repo.writeImportCsv(fileName, `${lines.join("\n")}\n`);
 
-	// 原始 JSON 归档：CSV 是派生物，出了问题要能回到载荷本身核对
+	const { archivedRaw, cleaned } = await archiveAndClean(deps, resolved, fileName.replace(/\.csv$/u, ""));
+
+	return { csvPath, listingRows: listingRows.length, keywordRows: keywordRows.length, coverage, unmappedFields: [...unmapped].sort(), archivedRaw, cleaned };
+}
+
+/**
+ * 原始 JSON 归档 + 溢写清理。CSV 与差评材料两条产物路径共用。
+ *
+ * `baseName` 必须是**去掉扩展名**的前缀：CSV 那边传 `xxx`（不是 `xxx.csv`），材料那边传
+ * `yyy`（不是 `yyy.json`）。把带扩展名的传进来会得到 `yyy.json-payload-1.json` 这种名字。
+ * 入参收 resolved 而不是 payloads：归档要的是解析后的 body，清理要的是原 payload 的 cleanupPaths。
+ */
+async function archiveAndClean(
+	deps: ConvertDeps,
+	resolved: ReadonlyArray<{ payload: CachedPayload; body: unknown }>,
+	baseName: string,
+): Promise<{ archivedRaw: string[]; cleaned: string[] }> {
+	// 原始 JSON 归档：产物是派生物，出了问题要能回到载荷本身核对
 	const archivedRaw: string[] = [];
 	for (const [index, { body }] of resolved.entries()) {
 		if (body === undefined) continue;
-		const archiveName = `${fileName.replace(/\.csv$/u, "")}-payload-${index + 1}.json`;
-		archivedRaw.push(await deps.repo.archiveRaw(archiveName, Buffer.from(JSON.stringify(body), "utf8"), new Date().toISOString()));
+		archivedRaw.push(await deps.repo.archiveRaw(`${baseName}-payload-${index + 1}.json`, Buffer.from(JSON.stringify(body), "utf8"), new Date().toISOString()));
 	}
 
 	// 溢写文件与其目录都要删——经营数据不留在 /tmp。两条链各自 mkdtemp 过一个目录，
-	// 所以文件和目录都要清，且失败不能影响已经写好的 CSV
+	// 所以文件和目录都要清，且失败不能影响已经写好的产物
 	const cleaned: string[] = [];
 	for (const { payload } of resolved) {
 		for (const path of payload.cleanupPaths ?? []) {
@@ -540,6 +644,124 @@ export async function convertSorftimePayloads(deps: ConvertDeps, input: ConvertI
 			}
 		}
 	}
+	return { archivedRaw, cleaned };
+}
 
-	return { csvPath, listingRows: listingRows.length, keywordRows: keywordRows.length, coverage, unmappedFields: [...unmapped].sort(), archivedRaw, cleaned };
+export interface ReviewMaterialInput {
+	/** 必须是带 requestAsin 的缓存条目，不是裸 CachedPayload：归组全靠那个字段 */
+	payloads: McpPayloadEntry[];
+	map: SorftimeFieldMap;
+	marketName: string;
+	/** 确认单批准的 ASIN；只收这几个，多出来的载荷丢弃 */
+	asins: readonly string[];
+	/** 完整 ISO 时间戳，与 CSV 路径同口径 */
+	capturedAt: string;
+	source?: string;
+}
+
+export interface ReviewMaterialResult {
+	materialPath: string;
+	reviewsTotal: number;
+	perAsin: Array<{ asin: string; rows: number }>;
+	missingAsins: string[];
+	droppedAsins: string[];
+	archivedRaw: string[];
+	cleaned: string[];
+}
+
+/**
+ * 把 product_reviews 的返回体转成一份差评材料文件。
+ *
+ * 与 CSV 路径的三条关键差异：
+ *  1. **完整快照原则不适用**。材料的「完整」= 每个批准的 ASIN 都有载荷；缺的点名进 missing_asins
+ *     而不是整批拒绝——差评是逐 ASIN 独立的证据，少一个 ASIN 不会让另一个的聚类失真。
+ *  2. **归组只能靠 requestAsin**。评论行里没有 ASIN、没有评论 id，且 rows 路径 `data` 与快照链
+ *     关键词行的点路径撞形，身份列那套过滤在这里完全用不上。
+ *  3. **产物不是 CSV、不进导入入口**。材料只给 compass_dispatch 读，落在数据目录的 materials 子目录。
+ */
+export async function materializeReviewPayloads(deps: ConvertDeps, input: ReviewMaterialInput): Promise<ReviewMaterialResult> {
+	const reviews = input.map.reviews;
+	if (!reviews) throw new Error("补数映射表没有声明 reviews 链：差评补数需要它才能把返回体映射成材料，请先在工作区补上再试。");
+
+	const resolved: Array<{ payload: McpPayloadEntry } & ResolvedPayload> = [];
+	for (const payload of input.payloads) {
+		resolved.push({ payload, ...(await resolvePayload(payload)) });
+	}
+
+	const allowed = new Set(input.asins);
+	const seenAsins = new Set<string>();
+	const droppedAsins = new Set<string>();
+	const fingerprints = new Set<string>();
+	const rows: Array<Record<string, unknown>> = [];
+	const perAsinCount = new Map<string, number>();
+	for (const { payload, body } of resolved) {
+		const asin = payload.requestAsin;
+		// 解析不出 ASIN 的载荷不进材料：宁可让那个 ASIN 落进 missing_asins 让运营重调，
+		// 也不能把来路不明的评论安到某个 ASIN 头上
+		if (!asin) continue;
+		if (!allowed.has(asin)) {
+			droppedAsins.add(asin);
+			continue;
+		}
+		const list = pickPath(body, reviews.rows);
+		if (!Array.isArray(list)) continue;
+		seenAsins.add(asin);
+		for (const raw of list as Array<Record<string, unknown>>) {
+			const row: Record<string, unknown> = {};
+			for (const [field, path] of Object.entries(reviews.fields)) {
+				row[field] = path === REQUEST_ASIN_SENTINEL ? asin : pickPath(raw, path);
+			}
+			// 行内没有 id，去重只能按内容指纹。同一个 ASIN 被调两次时这道去重也挡住重复行
+			const fingerprint = `${asin} ${String(row.date ?? "")} ${String(row.title ?? "")} ${String(row.body ?? "")}`;
+			if (fingerprints.has(fingerprint)) continue;
+			fingerprints.add(fingerprint);
+			rows.push(row);
+			perAsinCount.set(asin, (perAsinCount.get(asin) ?? 0) + 1);
+		}
+	}
+
+	const missingAsins = input.asins.filter((asin) => !seenAsins.has(asin));
+	if (!rows.length) {
+		// 一条评论都没有就没什么可聚类的，写出去只会让运营对着空材料派一次子代理。
+		// 载荷不可恢复的那几次要单独说：它们已经调过、已经扣过钱，重试同一步同样会失败
+		const lost = input.payloads.filter((payload) => payload.unavailable);
+		if (lost.length) {
+			const reasons = [...new Set(lost.map((payload) => payload.unavailable as string))].join("；");
+			throw new Error(
+				`差评材料转换被拒绝：这一批有 ${lost.length} 次调用的返回体**已经拿不回来了**（${reasons}）。` +
+					`这几次的钱已经花了，但正文被截断且溢写文件没写成，**重试同一步不会变好**——` +
+					`先解决溢写失败（多半是磁盘满或临时目录不可写），再重新 approve。`,
+			);
+		}
+		const skipped = resolved.filter((item) => item.skipped !== undefined).map((item) => item.skipped as string);
+		const skippedNote = skipped.length ? `另有 ${skipped.length} 条返回体不是 JSON、已跳过：${skipped.join("、")}。` : "";
+		throw new Error(`差评材料转换被拒绝：这一批一条评论都没有（批准的 ASIN：${input.asins.join("、") || "无"}）。请确认调用真的发出去了再转换。${skippedNote}`);
+	}
+
+	const source = input.source ?? "sorftime";
+	const fixed = reviews.chain[0]?.fixed ?? {};
+	const base = `mcp-${input.capturedAt.slice(0, 10)}-${slugForFileName(input.marketName)}-reviews`;
+	const materialPath = await deps.repo.writeMaterial(`${base}.json`, {
+		kind: "review_material",
+		version: 1,
+		market: input.marketName,
+		source,
+		tool: reviews.chain[0]?.tool ?? "",
+		captured_at: input.capturedAt,
+		review_type: fixed.review_type,
+		sample_cap: reviews.sampleCap,
+		asins: input.asins.filter((asin) => seenAsins.has(asin)),
+		missing_asins: missingAsins,
+		reviews: rows,
+	});
+	const { archivedRaw, cleaned } = await archiveAndClean(deps, resolved, base);
+	return {
+		materialPath,
+		reviewsTotal: rows.length,
+		perAsin: [...perAsinCount.entries()].map(([asin, count]) => ({ asin, rows: count })),
+		missingAsins,
+		droppedAsins: [...droppedAsins],
+		archivedRaw,
+		cleaned,
+	};
 }

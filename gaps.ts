@@ -73,6 +73,8 @@ export interface GapSourceTemplate {
 	tier: "C" | "A" | "manual";
 	auto: "yes" | "partial" | "no";
 	estimatedCalls?: number;
+	/** 这条来源按 ASIN 逐个调用：estimatedCalls 是**每个 ASIN** 的次数，不是整批的 */
+	perAsin?: boolean;
 	writeBack: GapWriteBack;
 	how: string;
 	template?: string;
@@ -217,6 +219,15 @@ export const GAP_SOURCE_MATRIX: Record<string, readonly GapSourceTemplate[]> = {
 		},
 	],
 	review_evidence: [
+		{
+			source: "sorftime",
+			tier: "A",
+			auto: "partial",
+			estimatedCalls: 1,
+			perAsin: true,
+			writeBack: "reviews_record",
+			how: "Sorftime 拉取运营指定 ASIN 的差评原文生成材料文件（每 ASIN 1 次），再派子代理聚类；预估星级仍由人给",
+		},
 		{
 			source: "manual",
 			tier: "manual",
@@ -803,6 +814,12 @@ export function gapActionLine(gap: GapRecord): string {
 	// 但也要说清它会花钱，别让人以为和 C 档一样点了就完事
 	if (gap.autoTier === "A_confirm") {
 		const paid = gap.sources.find((option) => option.tier === "A" && option.available && option.limitConfigured);
+		// 差评那条 A 档链按 ASIN 逐个调：命令里不带 origin= 与 asins= 就执行不了，运营复制过去
+		// 只会得到「差评补数需要 asins=」。判据用 writeBack 而不是 gap.origin——estimated_rating
+		// 与 review_evidence 同属一个 origin，而预估星级只能由人给，不该被打成「可花钱补」
+		if (paid?.writeBack === "reviews_record") {
+			return `A 档 ${paid.source} 可补（会花钱，每 ASIN 1 次）：compass_gaps action=approve market_ref=${gap.marketId} origin=review_evidence asins=<ASIN…> 当面确认后抓差评原文`;
+		}
 		return `A 档 ${paid?.source ?? "sorftime"} 可补（会花钱）：compass_gaps action=approve market_ref=${gap.marketId} 当面确认后自动补齐`;
 	}
 	const manual = gap.sources.find((option) => option.tier === "manual") ?? gap.sources[0];

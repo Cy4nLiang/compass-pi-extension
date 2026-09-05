@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { CSV_ALIAS_HEADERS, parseMarketCsv } from "../csv.ts";
-import { capturedAtForBatch, convertSorftimePayloads, createMcpPayloadCache, extractMcpPayload, isAdapterSpillPath, parseSorftimeFieldMap, pickPath, slugForFileName, type CachedPayload, type SorftimeFieldMap } from "../gapfill-convert.ts";
+import { capturedAtForBatch, convertSorftimePayloads, createMcpPayloadCache, extractMcpPayload, isAdapterSpillPath, materializeReviewPayloads, parseSorftimeFieldMap, pickPath, slugForFileName, type CachedPayload, type McpPayloadEntry, type SorftimeFieldMap } from "../gapfill-convert.ts";
 import { calculateMarketMetrics } from "../metrics.ts";
 import { CompassRepository, IMPORTS_DIR_NAME } from "../store.ts";
 
@@ -657,5 +657,217 @@ test("缓存里混进失败调用的报错文本：不崩、能转；缺行时�
 				return true;
 			},
 		);
+	});
+});
+
+// —— 三期差评材料链（2026-09-06）——
+// 用例名统一以 `reviews 链：` 开头，任务书 Proof 表按前缀选行。夹具全部虚构：ASIN 一律 B0DEMO
+// 前缀、评论正文是编造英文短句——compass 是公开仓库且带公开 CI，断言失败的输出会进公网日志。
+
+const REVIEWS_RAW = {
+	rows: { listing: "data.top100_products", keyword: "data" },
+	listing: { asin: "asin", title: "title" },
+	keyword: { keyword: "keyword" },
+	reviews: {
+		chain: [{ step: 1, tool: "product_reviews", required: ["asin", "amz_site"], per: "asin", fixed: { review_type: "Negative" } }],
+		rows: "data",
+		fields: { asin: "$request.asin", rating: "star_rating", title: "title", body: "content", date: "review_date", variant: "variant_attribute" },
+		sample_cap: 100,
+		asins_per_ticket_max: 5,
+	},
+};
+
+const REVIEWS_MAP: SorftimeFieldMap = parseSorftimeFieldMap(REVIEWS_RAW);
+
+const reviewRow = (seed: number, overrides: Record<string, unknown> = {}) => ({
+	star_rating: 2,
+	title: `demo title ${seed}`,
+	content: `demo body ${seed}`,
+	review_date: "20260801",
+	variant_attribute: "Color=Black;Size=M",
+	...overrides,
+});
+
+const reviewEntry = (asin: string, rows: Array<Record<string, unknown>>, extra: Partial<McpPayloadEntry> = {}): McpPayloadEntry => ({
+	server: "sorftime",
+	tool: "product_reviews",
+	toolCallId: `call-${asin}`,
+	receivedAt: "2026-09-06T00:00:00.000Z",
+	approxBytes: 2_048,
+	requestAsin: asin,
+	// 返回体根下的 doc 是字段说明块，rows 只取 data——不丢掉它就会把说明当评论
+	value: { doc: { star_rating: "评分", content: "正文" }, data: rows },
+	...extra,
+});
+
+const CAPTURED_AT = "2026-09-06T02:30:00.000Z";
+
+test("reviews 链：reviews 段缺失则 material 单抛错", async () => {
+	// 段缺失时**不能带这个键**：调用方按键集判「映射表声明了哪几条链路」
+	const withoutReviews = parseSorftimeFieldMap({ rows: REVIEWS_RAW.rows, listing: REVIEWS_RAW.listing, keyword: REVIEWS_RAW.keyword });
+	assert.equal(Object.hasOwn(withoutReviews, "reviews"), false, "没声明 reviews 时不该出现这个键");
+	await withRepo(async (repo) => {
+		await assert.rejects(
+			() => materializeReviewPayloads({ repo }, { payloads: [reviewEntry("B0DEMO0001", [reviewRow(1)])], map: withoutReviews, marketName: "demo market", asins: ["B0DEMO0001"], capturedAt: CAPTURED_AT }),
+			/没有声明 reviews 链/u,
+		);
+	});
+});
+
+test("reviews 链：结构不全抛错", () => {
+	// 一律抛错不降级：降级会写出一份缺 asin 或缺正文的材料，而子代理对空字段零告警
+	assert.throws(() => parseSorftimeFieldMap({ ...REVIEWS_RAW, reviews: { ...REVIEWS_RAW.reviews, chain: [] } }), /reviews\.chain 必须是非空数组/u);
+	assert.throws(() => parseSorftimeFieldMap({ ...REVIEWS_RAW, reviews: { ...REVIEWS_RAW.reviews, rows: 42 } }), /reviews\.rows 必须是非空点路径/u);
+	assert.throws(() => parseSorftimeFieldMap({ ...REVIEWS_RAW, reviews: { ...REVIEWS_RAW.reviews, fields: { body: "content" } } }), /reviews\.fields 必须映射 asin/u);
+	assert.throws(() => parseSorftimeFieldMap({ ...REVIEWS_RAW, reviews: { ...REVIEWS_RAW.reviews, fields: { asin: "$request.asin" } } }), /reviews\.fields 必须映射 body/u);
+	assert.throws(() => parseSorftimeFieldMap({ ...REVIEWS_RAW, reviews: { ...REVIEWS_RAW.reviews, asins_per_ticket_max: 0 } }), /asins_per_ticket_max 必须是正整数/u);
+	// reviews.fields 的键绝不能并进 CSV 列名校验：body / variant 不在 csv.ts 的别名表里
+	assert.equal(REVIEWS_MAP.reviews?.fields.body, "content");
+	assert.equal(REVIEWS_MAP.reviews?.chain[0].fixed?.review_type, "Negative");
+	assert.equal(REVIEWS_MAP.reviews?.chain[0].per, "asin");
+});
+
+test("reviews 链：只收确认单内 ASIN", async () => {
+	await withRepo(async (repo, root) => {
+		const made = await materializeReviewPayloads(
+			{ repo },
+			{
+				payloads: [reviewEntry("B0DEMO0001", [reviewRow(1)]), reviewEntry("B0DEMO0002", [reviewRow(2)])],
+				map: REVIEWS_MAP,
+				marketName: "demo market",
+				asins: ["B0DEMO0001"],
+				capturedAt: CAPTURED_AT,
+			},
+		);
+		assert.equal(made.reviewsTotal, 1, "确认单之外的 ASIN 的返回必须丢弃");
+		assert.deepEqual(made.droppedAsins, ["B0DEMO0002"]);
+		const material = JSON.parse(await readFile(join(root, made.materialPath), "utf8")) as { reviews: Array<{ asin: string }>; asins: string[] };
+		assert.deepEqual([...new Set(material.reviews.map((row) => row.asin))], ["B0DEMO0001"]);
+		assert.deepEqual(material.asins, ["B0DEMO0001"]);
+	});
+});
+
+test("reviews 链：missing_asins 点名", async () => {
+	await withRepo(async (repo, root) => {
+		// 已计费但零载荷是正常形态（超时 / 中断都计费）：仍写出材料，缺的点名，不整批拒绝——
+		// 差评是逐 ASIN 独立的证据，少一个不会让另一个的聚类失真
+		const made = await materializeReviewPayloads(
+			{ repo },
+			{ payloads: [reviewEntry("B0DEMO0001", [reviewRow(1)])], map: REVIEWS_MAP, marketName: "demo market", asins: ["B0DEMO0001", "B0DEMO0009"], capturedAt: CAPTURED_AT },
+		);
+		assert.deepEqual(made.missingAsins, ["B0DEMO0009"]);
+		const material = JSON.parse(await readFile(join(root, made.materialPath), "utf8")) as { missing_asins: string[]; asins: string[] };
+		assert.deepEqual(material.missing_asins, ["B0DEMO0009"]);
+		assert.deepEqual(material.asins, ["B0DEMO0001"], "asins 只列真的拿到评论的那几个");
+	});
+});
+
+test("reviews 链：两条载荷的 requestAsin 互换后仍各归各", async () => {
+	await withRepo(async (repo, root) => {
+		// 评论行里没有 ASIN，两批返回体形状完全相同、并行到达顺序也不定——归组只认 requestAsin。
+		// 把两条载荷的 requestAsin 对调，行就必须跟着换归属；跟不上说明归组用错了依据
+		const first = reviewEntry("B0DEMO0001", [reviewRow(1)]);
+		const second = reviewEntry("B0DEMO0002", [reviewRow(2)]);
+		const swapped = [
+			{ ...first, requestAsin: "B0DEMO0002" },
+			{ ...second, requestAsin: "B0DEMO0001" },
+		];
+		const made = await materializeReviewPayloads({ repo }, { payloads: swapped, map: REVIEWS_MAP, marketName: "demo market", asins: ["B0DEMO0001", "B0DEMO0002"], capturedAt: CAPTURED_AT });
+		const material = JSON.parse(await readFile(join(root, made.materialPath), "utf8")) as { reviews: Array<{ asin: string; body: string }> };
+		const byAsin = new Map(material.reviews.map((row) => [row.asin, row.body]));
+		assert.equal(byAsin.get("B0DEMO0002"), "demo body 1", "第一条载荷的行要跟着它的 requestAsin 走");
+		assert.equal(byAsin.get("B0DEMO0001"), "demo body 2");
+
+		// 解析不出 ASIN 的载荷不进材料：宁可让那个 ASIN 落进 missing_asins，也不能把来路不明的评论安到别人头上
+		const anonymous = await materializeReviewPayloads(
+			{ repo },
+			{ payloads: [reviewEntry("B0DEMO0001", [reviewRow(1)]), { ...reviewEntry("B0DEMO0002", [reviewRow(2)]), requestAsin: undefined }], map: REVIEWS_MAP, marketName: "demo market", asins: ["B0DEMO0001", "B0DEMO0002"], capturedAt: CAPTURED_AT },
+		);
+		assert.deepEqual(anonymous.missingAsins, ["B0DEMO0002"]);
+		assert.equal(anonymous.reviewsTotal, 1);
+	});
+});
+
+test("reviews 链：unavailable 措辞", async () => {
+	await withRepo(async (repo) => {
+		// 这几次已经调过、已经扣过钱，重试同一步同样会失败——不说清楚就是在诱导运营继续烧配额
+		await assert.rejects(
+			() =>
+				materializeReviewPayloads(
+					{ repo },
+					{ payloads: [{ ...reviewEntry("B0DEMO0001", []), value: undefined, unavailable: "溢写文件没写成（磁盘满）" }], map: REVIEWS_MAP, marketName: "demo market", asins: ["B0DEMO0001"], capturedAt: CAPTURED_AT },
+				),
+			/重试同一步不会变好/u,
+		);
+	});
+});
+
+test("reviews 链：材料 0600 且落在 materials 目录", async () => {
+	await withRepo(async (repo, root) => {
+		const made = await materializeReviewPayloads({ repo }, { payloads: [reviewEntry("B0DEMO0001", [reviewRow(1)])], map: REVIEWS_MAP, marketName: "demo market", asins: ["B0DEMO0001"], capturedAt: CAPTURED_AT });
+		const absolute = join(root, made.materialPath);
+		assert.equal((await stat(absolute)).mode & 0o777, 0o600, "材料含差评原文，必须是 0600");
+		assert.equal(made.materialPath.startsWith(".pi/"), true, `材料必须落在罗盘数据目录内，实得 ${made.materialPath}`);
+		assert.match(made.materialPath, /materials\//u);
+		// 它不是要导入的 CSV：绝不能落进运营的导入入口
+		await assert.rejects(() => stat(join(root, IMPORTS_DIR_NAME)), /ENOENT/u, "差评材料不进导入入口目录");
+		const material = JSON.parse(await readFile(absolute, "utf8")) as { kind: string; captured_at: string; review_type: string; sample_cap: number; tool: string };
+		assert.equal(material.kind, "review_material");
+		assert.equal(material.captured_at, CAPTURED_AT, "captured_at 必须是完整时间戳，不是纯日期");
+		assert.equal(material.review_type, "Negative", "固定参数要写进材料，子代理据此说明 share 的分母");
+		assert.equal(material.sample_cap, 100);
+		assert.equal(material.tool, "product_reviews");
+	});
+});
+
+test("reviews 链：raw 归档", async () => {
+	await withRepo(async (repo, root) => {
+		const made = await materializeReviewPayloads({ repo }, { payloads: [reviewEntry("B0DEMO0001", [reviewRow(1)])], map: REVIEWS_MAP, marketName: "demo market", asins: ["B0DEMO0001"], capturedAt: CAPTURED_AT });
+		assert.equal(made.archivedRaw.length, 1, "材料是派生物，原始返回体要能回查");
+		const archived = JSON.parse(await readFile(join(root, made.archivedRaw[0]), "utf8")) as { doc?: unknown; data?: unknown[] };
+		assert.ok(archived.doc, "归档的是原始返回体，doc 说明块要保留");
+		assert.equal(Array.isArray(archived.data), true);
+		// 归档名不能带双扩展名：共用函数收的是去掉扩展名的前缀
+		assert.doesNotMatch(made.archivedRaw[0], /\.json-payload/u);
+	});
+});
+
+test("reviews 链：溢写文件与目录清理", async () => {
+	await withRepo(async (repo) => {
+		const dir = await mkdtemp(join(tmpdir(), "pi-mcp-output-"));
+		const file = join(dir, "output-abcdef12.txt");
+		await writeFile(file, JSON.stringify({ doc: {}, data: [reviewRow(1)] }), "utf8");
+		const made = await materializeReviewPayloads(
+			{ repo },
+			{ payloads: [{ ...reviewEntry("B0DEMO0001", []), value: undefined, filePath: file, cleanupPaths: [file] }], map: REVIEWS_MAP, marketName: "demo market", asins: ["B0DEMO0001"], capturedAt: CAPTURED_AT },
+		);
+		assert.equal(made.reviewsTotal, 1);
+		assert.deepEqual(made.cleaned, [file]);
+		// 经营数据不留在临时区：文件与它所在的目录都要走
+		await assert.rejects(() => stat(file), /ENOENT/u);
+		await assert.rejects(() => stat(dir), /ENOENT/u, "溢写目录也要删——rmdir 而不是 rm，rm 对目录会抛 EISDIR 被 catch 吞掉");
+	});
+});
+
+test("reviews 链：doc 块丢弃且按指纹去重", async () => {
+	await withRepo(async (repo, root) => {
+		// 同一个 ASIN 被调两次（重试）时，两批返回里重复的行只应留一份；行内没有 id，只能按内容指纹去重
+		const rows = [reviewRow(1), reviewRow(1), reviewRow(2)];
+		const made = await materializeReviewPayloads(
+			{ repo },
+			{
+				payloads: [reviewEntry("B0DEMO0001", rows), { ...reviewEntry("B0DEMO0001", [reviewRow(1)]), toolCallId: "call-retry" }],
+				map: REVIEWS_MAP,
+				marketName: "demo market",
+				asins: ["B0DEMO0001"],
+				capturedAt: CAPTURED_AT,
+			},
+		);
+		assert.equal(made.reviewsTotal, 2, "重复行按 date + title + body 指纹去重");
+		const material = JSON.parse(await readFile(join(root, made.materialPath), "utf8")) as { reviews: Array<Record<string, unknown>> };
+		assert.deepEqual(material.reviews.map((row) => row.body).sort(), ["demo body 1", "demo body 2"]);
+		// doc 块是字段说明，不是评论：rows 只取 data，取错了会把「评分」「正文」这种说明当成评论
+		assert.equal(material.reviews.some((row) => row.body === "正文"), false);
+		assert.deepEqual(Object.keys(material.reviews[0]).sort(), ["asin", "body", "date", "rating", "title", "variant"]);
 	});
 });

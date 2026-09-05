@@ -10,6 +10,7 @@ import { normalizeCapturedAt, performCsvImport, type CsvImportDeps } from "../im
 import { ensureDefaults, generateMarketReport, latestSnapshotIfPresent, scanMarkets } from "../service.ts";
 import { CompassRepository } from "../store.ts";
 import { marketDossierData } from "../web/data.ts";
+import { withTimeZone, withTimeZones } from "./helpers/time-zones.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -237,4 +238,40 @@ test("同一 UTC 日先手工导入，再以 convert 给的完整时间戳导入
 	} finally {
 		await rm(root, { recursive: true, force: true });
 	}
+});
+
+
+// —— D-1 缺陷组 ③：captured_at=YYYY/MM/DD 按本机本地零点解析（2026-09-05）——
+// `new Date("2026/09/01")` 走 V8 旧版解析器、按本地零点：UTC+8 下落到 2026-08-31T16:00Z，
+// 会被前一日晚间导入的快照压成「旧快照」（与二期 A12 同形）、归档名错一天、月龄少一。
+test("normalizeCapturedAt 对 YYYY/MM/DD、点号与中文纯日期按 UTC 零点解释，四时区一致（D-1 缺陷组 ③）", () => {
+	const now = Date.parse("2026-09-01T00:00:00.000Z");
+	withTimeZones("2026-09-01T00:00:00", (tz) => {
+		for (const value of ["2026/09/01", "2026/9/1", "2026.09.01", "2026年9月1日", "2026-09-01"]) {
+			assert.equal(normalizeCapturedAt(value, now), "2026-09-01T00:00:00.000Z", `TZ=${tz} value=${value}`);
+		}
+		// 只改纯日期路径：带时区的 ISO 与 [2000, now+36h] 闸门原样
+		assert.equal(normalizeCapturedAt("2026-09-01T10:00:00+08:00", now), "2026-09-01T02:00:00.000Z", `TZ=${tz}`);
+		assert.throws(() => normalizeCapturedAt("2062/09/01", now), /captured_at 不能晚于当前时间 36 小时/, `TZ=${tz}`);
+		assert.throws(() => normalizeCapturedAt("1026/08/22", now), /captured_at 过早/, `TZ=${tz}`);
+	});
+});
+
+test("captured_at=YYYY/MM/DD 的导入在 UTC+8 机器上不会被前一日晚间的快照压成旧快照（D-1 缺陷组 ③）", async () => {
+	await withTimeZone("Asia/Shanghai", "2026-09-01T00:00:00", async () => {
+		const { root, deps, csvPath } = await setupProject();
+		try {
+			const earlier = await performCsvImport(deps, { path: csvPath, marketName: "demo slash date", source: "sorftime", capturedAt: "2026-08-31T20:00:00.000Z", actor: "tester", runScreen: false });
+			const base = await readFile(csvPath, "utf8");
+			const laterPath = join(root, "later.csv");
+			await writeFile(laterPath, `${base}B0DEMO8888,Later Row,26,11.99,4.0,10,40,Extra,Third Party,3,Sports & Outdoors,later kw,100,0.5\n`);
+			const later = await performCsvImport(deps, { path: laterPath, marketName: "demo slash date", source: "sorftime", capturedAt: "2026/09/01", actor: "tester", runScreen: false });
+			assert.equal(later.snapshot.capturedAt, "2026-09-01T00:00:00.000Z");
+			assert.deepEqual(later.snapshot.warnings, [], "UTC 零点晚于前一日 20:00Z 的快照，不得带「早于」告警");
+			assert.equal(latestSnapshotIfPresent(await deps.repo.load(), later.market.id)?.id, later.snapshot.id, "斜杠日期导入必须成为最新");
+			assert.notEqual(earlier.snapshot.id, later.snapshot.id);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
 });

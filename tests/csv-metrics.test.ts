@@ -5,6 +5,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { type AmazonSampleCounts, amazonSampleDiagnosis, decodeCsvBuffer, detectDelimiter, parseMarketCsv, parseNumeric } from "../csv.ts";
 import { calculateMarketMetrics, targetDependentMetrics } from "../metrics.ts";
+import { withTimeZones } from "./helpers/time-zones.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -853,5 +854,45 @@ test("target-dependent metrics recompute from listings and stay identical to the
 	assert.equal(empty.qualify_rank_depth.value, null);
 	assert.equal(empty.low_rating_high_sales_count.value, null);
 	assert.equal(empty.qualify_rank_depth.confidence, 0);
+});
+
+
+// —— D-1 缺陷组 ③：parseDate 时区（2026-09-05）——
+// 非零填充的纯日期归一后是 "2025-1-1" 这种非 ISO 形态，V8 按本机本地零点解析，UTC+ 时区下
+// 历日少一天、每月 1 号上架的行月龄多一个月；零填充形态不受影响。README 承诺的
+// `2024/1/5`、`2024.1.5`、`2024年1月5日` 恰好全是出错的形态。四个时区下必须与 "2025-01-01" 逐字一致。
+const NON_PADDED_LAUNCH_DATES = ["2025/1/1", "2025年1月1日", "2025.1.1", "2025-1-1", "2025-01-01", "2025/01/01"];
+
+test("非零填充的上架日期在四个时区都落到同一个 UTC 零点（D-1 缺陷组 ③）", () => {
+	withTimeZones("2025-01-01T00:00:00", (tz) => {
+		const parsed = parseMarketCsv(launchDateCsv(NON_PADDED_LAUNCH_DATES), { source: "generic_csv", capturedAt: "2026-01-15T00:00:00.000Z" });
+		assert.deepEqual(
+			parsed.listings.map((listing) => listing.launchDate),
+			NON_PADDED_LAUNCH_DATES.map(() => "2025-01-01T00:00:00.000Z"),
+			`TZ=${tz}`,
+		);
+		assert.deepEqual(parsed.listings.map((listing) => listing.monthsOnline), NON_PADDED_LAUNCH_DATES.map(() => 12), `TZ=${tz}`);
+	});
+});
+
+test("new_listing_share_12m 不随机器时区变化（D-1 缺陷组 ③）", () => {
+	const rows: Array<[string, string]> = [
+		["B0DEMO0001", "2025/1/1"], ["B0DEMO0002", "2025年1月1日"], ["B0DEMO0003", "2025.1.1"], ["B0DEMO0004", "2025-1-1"],
+		["B0DEMO0005", "2025-01-01"], ["B0DEMO0006", "2025/01/01"], ["B0DEMO0007", "2023-01-01"], ["B0DEMO0008", "2022-06-01"],
+	];
+	const csv = `ASIN,排名,上架日期\n${rows.map(([asin, date], index) => `${asin},${index + 1},${date}`).join("\n")}\n`;
+	withTimeZones("2025-01-01T00:00:00", (tz) => {
+		const parsed = parseMarketCsv(csv, { source: "generic_csv", capturedAt: "2026-01-15T00:00:00.000Z" });
+		const metrics = calculateMarketMetrics({ listings: parsed.listings, keywords: parsed.keywords, source: parsed.source, capturedAt: "2026-01-15T00:00:00.000Z" });
+		// 6 行上架满 12 个月（≤12 计新品）、2 行更早：6/8。本地零点解析会把前 4 行算成 13 个月 → 2/8
+		assert.equal(metrics.new_listing_share_12m.value, 0.75, `TZ=${tz}`);
+		assert.equal(metrics.new_listing_share_12m.sampleSize, 8, `TZ=${tz}`);
+	});
+});
+
+test("回卷日期（2 月 30 日、4 月 31 日）判缺失，不伪造成下月 1 日；闰日仍合法（D-1 缺陷组 ③）", () => {
+	const parsed = parseMarketCsv(launchDateCsv(["2024-02-30", "2024/4/31", "2024-02-29"]), { source: "generic_csv", capturedAt: "2026-08-22T00:00:00.000Z" });
+	assert.deepEqual(parsed.listings.map((listing) => listing.launchDate), [undefined, undefined, "2024-02-29T00:00:00.000Z"]);
+	assert.deepEqual(parsed.listings.map((listing) => listing.monthsOnline), [undefined, undefined, 30]);
 });
 

@@ -264,3 +264,20 @@ test("决策页接线：#/pool/<ref> 经 renderPool 分发到 renderPoolDecision
 	assert.match(page, /\$\{buildDecisionBreadcrumbHtml\(detail\.candidate\)\}/u);
 	assert.match(page, /\$\{buildDecisionLinksPanelHtml\(detail\.links\)\}/u);
 });
+
+
+// —— D-1 缺陷组 ①：复盘页「验证率」卡副文案按四桶披露（2026-09-05）——
+test("复盘页「验证率」卡副文案按四桶披露，不再把 strategyOnly 单独当成「不计入」全集（D-1 缺陷组 ①）", async () => {
+	const app = await readAsset("app.js");
+	const note = runFunction(app, "retroExclusionNote");
+	assert.equal(
+		note({ comparable: 3, ratedMarkets: 2, strategyOnly: 0, waitlistAnchored: 2, inconclusive: 1 }),
+		"可判对照 3 条去重为 2 个市场；不计入：waitlist 锚点 2 条、inconclusive 1 条",
+	);
+	assert.equal(note({ comparable: 1, ratedMarkets: 1, strategyOnly: 0, waitlistAnchored: 0, inconclusive: 0 }), "可判对照 1 条去重为 1 个市场");
+	assert.equal(note({ comparable: 0, ratedMarkets: 0, strategyOnly: 2, waitlistAnchored: 0, inconclusive: 0 }), "可判对照 0 条去重为 0 个市场；不计入：无决策锚点 2 条");
+	// 页面必须真的用它，而不是继续拼 strategyOnly
+	const retro = extractFunction(app, "buildRetroHtml");
+	assert.match(retro, /\$\{retroExclusionNote\(s\)\}/u);
+	assert.doesNotMatch(retro, /另有 \$\{s\.strategyOnly\} 条无决策锚点不计入/u);
+});

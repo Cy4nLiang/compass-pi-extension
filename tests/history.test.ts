@@ -452,8 +452,26 @@ test("复盘报告 §1 与 header 标明按市场去重，比率不再被对照�
 	);
 	const markdown = renderRetroReport(store, "2026-03-01T00:00:00.000Z", undefined, { timeZone: "UTC" });
 	assert.match(markdown, /对照次数 6 次 · 比率样本 2 个市场（按市场去重：同一市场只取最新一条可判对照）/);
-	assert.match(markdown, /- 验证率：50\.0%；go 达成率：—；no_go 正确率：50\.0%；错杀率：50\.0%（四率按市场去重，样本 2 个市场；无决策锚点与 inconclusive 不计入）。/);
+	// 2026-09-05（D-1 缺陷组 ①）：§1 改为带数字的四桶披露，本用例六条全部可判
+	assert.match(markdown, /- 验证率：50\.0%；go 达成率：—；no_go 正确率：50\.0%；错杀率：50\.0%（四率按市场去重：可判对照 6 条去重为 2 个市场；不计入：无决策锚点 0 条、waitlist 锚点 0 条、inconclusive 0 条）。/);
 	assert.match(markdown, /- 结论分布（按对照次数 6 次）：validated 5 \/ challenged 1 \/ inconclusive 0。/);
+});
+
+// —— D-1 缺陷组 ①：§1 分桶披露（2026-09-05）——
+test("复盘报告 §1 把 waitlist 锚点与无锚点、inconclusive 分桶带数字披露，不再只写「无决策锚点与 inconclusive 不计入」（D-1 缺陷组 ①）", () => {
+	const store = createEmptyStore(at);
+	store.markets.push(market("a", "market a", ["a"]), market("b", "market b", ["b"]), market("c", "market c", ["c"]));
+	store.outcomeChecks.push(
+		outcomeCheck("chk_a1", "a", "no_go", "validated", "2026-01-11T00:00:00.000Z"),
+		outcomeCheck("chk_a2", "a", "no_go", "validated", "2026-01-21T00:00:00.000Z"),
+		outcomeCheck("chk_b1", "b", "waitlist", "validated", "2026-01-11T00:00:00.000Z"),
+		outcomeCheck("chk_c1", "c", undefined, "challenged", "2026-01-11T00:00:00.000Z"),
+		outcomeCheck("chk_c2", "c", "go", "inconclusive", "2026-02-01T00:00:00.000Z"),
+	);
+	const markdown = renderRetroReport(store, "2026-03-01T00:00:00.000Z", undefined, { timeZone: "UTC" });
+	// 可判 2 条（a 的两条 no_go）去重为 1 个市场；b 的 waitlist、c 的无锚点、c 的 inconclusive 各进各的桶，2+1+1+1 = 5
+	assert.match(markdown, /（四率按市场去重：可判对照 2 条去重为 1 个市场；不计入：无决策锚点 1 条、waitlist 锚点 1 条、inconclusive 1 条）。/);
+	assert.match(markdown, /- 结论分布（按对照次数 5 次）：validated 3 \/ challenged 1 \/ inconclusive 1。/);
 });
 
 // 复盘报告黄金文件：六章结构 + 表格转义 + 「本次沉淀」的并集口径一次性钉死。

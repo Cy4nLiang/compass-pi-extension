@@ -438,3 +438,41 @@ test("retroDueConfig：小数天数回落缺省，不被 Math.floor 压成 0 天
 	assert.equal(retroDueConfig(undefined).goDays, DEFAULT_RETRO_DUE_RULES.goDays);
 });
 
+
+// —— D-1 缺陷组 ①：waitlist 锚点的 OutcomeCheck「两头落空」+ Web KPI 双计（2026-09-05）——
+// isComparableCheck 只认 go / no_go，strategyOnly 只数 decisionStatus === undefined：waitlist 锚点的
+// conclusive 对照既不进四率也不进「不计入」披露；无锚点的 inconclusive 又被 strategyOnly 与
+// inconclusive 数两次。每条 check 必须恰好落进一个披露桶，四桶之和等于 total。
+test("对照条数在四个桶里恰好分完：可判 + 无锚点 + waitlist 锚点 + inconclusive === total（D-1 缺陷组 ①）", () => {
+	const store = createEmptyStore(at);
+	store.outcomeChecks.push(
+		check("chk_wait_v", "m1", "waitlist", "validated"),
+		check("chk_wait_c", "m2", "waitlist", "challenged"),
+		check("chk_bare_i", "m3", undefined, "inconclusive"),
+		check("chk_go_i", "m4", "go", "inconclusive"),
+		check("chk_no_v", "m5", "no_go", "validated"),
+	);
+	const stats = outcomeStatistics(store);
+	assert.equal(stats.comparable, 1);
+	assert.equal(stats.ratedMarkets, 1);
+	assert.equal(stats.strategyOnly, 0);
+	assert.equal(stats.waitlistAnchored, 2);
+	assert.equal(stats.inconclusive, 2);
+	assert.equal(stats.comparable + stats.strategyOnly + stats.waitlistAnchored + stats.inconclusive, stats.total);
+	// 可判判据本身不动：waitlist 没有可比的期望结果，desiredOutcomeForCheck 与 backtest 同口径
+	assert.equal(latestComparableChecks(store.outcomeChecks).length, 1);
+});
+
+test("无锚点且 inconclusive 的对照只进 inconclusive，不再同时进 strategyOnly（Web 同屏双计）（D-1 缺陷组 ①）", () => {
+	const store = createEmptyStore(at);
+	store.outcomeChecks.push(check("chk_bare_i", "m1", undefined, "inconclusive"));
+	const stats = outcomeStatistics(store);
+	const web = retroData(store, "2026-03-01T00:00:00.000Z").stats;
+	assert.equal(stats.total, 1);
+	assert.equal(stats.inconclusive, 1);
+	assert.equal(stats.strategyOnly, 0);
+	assert.equal(web.strategyOnly, 0);
+	assert.equal(web.inconclusive, 1);
+	assert.equal(web.comparable + web.strategyOnly + web.waitlistAnchored + web.inconclusive, web.checks);
+});
+

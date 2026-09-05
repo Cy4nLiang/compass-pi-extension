@@ -9,6 +9,7 @@ import {
 	loadAgentDefinition,
 	resetDispatchCounters,
 	runDispatch,
+	validateReviewClusterer,
 	type DispatchCompletionLike,
 	type DispatchConfig,
 	type DispatchContext,
@@ -387,4 +388,47 @@ test("定义加载：解析失败降级并在 lines 注明", async () => {
 	const result = await runDispatch({ registry }, baseInput({ definition: loaded.definition, definitionNotes: loaded.notes }));
 	assert.equal(result.status, "success", result.summary);
 	assert.match(result.lines.join("\n"), /解析失败/u);
+});
+
+// —— 2026-09-06 交付评审核出的三条 ——
+
+test("evidence 校验比对的是材料正文而不是转义后的 JSON", () => {
+	// 材料是 JSON.stringify 写出的：正文里的引号变成 \" 、换行变成 \n。
+	// 拿原始 JSON 文本去 includes，合规输出会必然判失败，重问一次后整次派发报错、两次调用白花
+	const material = JSON.stringify({
+		kind: "review_material",
+		asins: ["B0DEMO0001"],
+		reviews: [
+			{ asin: "B0DEMO0001", title: "t1", body: '拉链用了两周就坏了，客服说"正常磨损"，不给换。', date: "20260801" },
+			{ asin: "B0DEMO0001", title: "t2", body: "第一行有问题\n第二行也一样", date: "20260802" },
+		],
+	});
+	const context = { materialText: material, materialAsins: ["B0DEMO0001"] };
+	const withEvidence = (quote: string) => ({
+		source_asins: ["B0DEMO0001"],
+		review_count: 2,
+		themes: [{ name: "拉链易坏", category: "quality", count: 1, fixability: "factory", evidence: [quote] }],
+		estimated_rating: null,
+	});
+	assert.deepEqual(validateReviewClusterer(withEvidence('客服说"正常磨损"'), context), [], "含双引号的原句必须通过");
+	assert.deepEqual(validateReviewClusterer(withEvidence("第一行有问题 第二行也一样"), context), [], "换行被抄成空格不算改写");
+	assert.deepEqual(validateReviewClusterer(withEvidence("第一行有问题\n第二行也一样"), context), [], "原样带换行也要通过");
+	// 放宽不能放到「编的也算」：这条是 grounding 的全部价值
+	const fabricated = validateReviewClusterer(withEvidence("这句材料里完全没有"), context);
+	assert.equal(fabricated.length, 1, `编造的句子必须判失败，实得：${fabricated.join("；")}`);
+	assert.match(fabricated[0] ?? "", /不是材料里的原句/u);
+});
+
+test("模型未配置 / 无鉴权：没有注册表时不谎报「已发往主模型供应商」", async () => {
+	resetDispatchCounters();
+	// ctx.model 只是个模型描述，真正发请求的通道是 registry.complete。没有注册表就没法回落，
+	// 把它当成可回落的原因，会一边报「材料已发往主模型供应商」一边对 undefined 取 .complete 抛错
+	const result = await runDispatch({ registry: undefined }, baseInput());
+	assert.equal(result.status, "error");
+	assert.equal(result.summary, DISPATCH_FAILURE_SUMMARIES.noModel, "应归到「模型未配置 / 无鉴权」而不是「输出未通过校验」");
+	assert.equal(result.payload.model_fallback, undefined, "没发生回落就不该有 model_fallback");
+	const text = result.lines.join("\n");
+	assert.equal(text.includes("发往了主模型供应商"), false, "零外发却宣称材料已发出去，是假陈述");
+	assert.match(text, /没有模型注册表/u);
+	assert.equal(dispatchCounters().calls, 0, "根本没发出请求，不该吃掉一格会话额度");
 });

@@ -711,8 +711,11 @@ export async function materializeReviewPayloads(deps: ConvertDeps, input: Review
 			for (const [field, path] of Object.entries(reviews.fields)) {
 				row[field] = path === REQUEST_ASIN_SENTINEL ? asin : pickPath(raw, path);
 			}
-			// 行内没有 id，去重只能按内容指纹。同一个 ASIN 被调两次时这道去重也挡住重复行
-			const fingerprint = `${asin} ${String(row.date ?? "")} ${String(row.title ?? "")} ${String(row.body ?? "")}`;
+			// 行内没有 id，去重只能按内容指纹。同一个 ASIN 被调两次时这道去重也挡住重复行。
+			// 用 JSON 数组而不是自选分隔符拼接：既天然无歧义（转义把边界处理掉了），又**全是可打印字符**。
+			// 别用 NUL 之类的控制字符当分隔符（连注释里都不能写出那个字节）——那会让本文件被 grep 判成二进制，
+			// 于是公开仓库卫生检查扫到它时静默跳过，从此对这个文件永久假绿（2026-09-06 交付评审核出）。
+			const fingerprint = JSON.stringify([asin, String(row.date ?? ""), String(row.title ?? ""), String(row.body ?? "")]);
 			if (fingerprints.has(fingerprint)) continue;
 			fingerprints.add(fingerprint);
 			rows.push(row);

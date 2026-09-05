@@ -1693,7 +1693,9 @@ export default function compassExtension(pi: ExtensionAPI): void {
 				);
 				if (choice === explainOption) {
 					const body = [`${market.name} · ${server} 补数链路（本次未调用、未扣次数）`, ...steps, "确认后再跑一次 approve。"].join("\n");
-					return textResult(body, details({ title: "补数确认", status: "info", summary: `${server} ${calls} 步链路预览（未调用）`, lines: steps }));
+					// 差评单的 calls 是 ASIN 个数、链本身只有 1 步，说成「N 步链路」是错的口径
+					const previewScope = isMaterial ? `${calls} 个 ASIN 各 1 次` : `${calls} 步链路`;
+					return textResult(body, details({ title: "补数确认", status: "info", summary: `${server} ${previewScope}预览（未调用）`, lines: steps }));
 				}
 				if (choice !== confirmOption) {
 					// 超时与 Esc 都走这里：ctx.ui.select 两种情况都返回 undefined，一律按取消处理
@@ -1935,13 +1937,10 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			let materialText: string | undefined;
 			let material: DispatchMaterialInfo | undefined;
 			if (params.material) {
-				// resolveInputPath 只保证「在项目根内」，而 .env 与受限会话的凭据副本都在项目根内。
-				// 白名单复核不是可选项：少了它，一条注入就能把任意项目内文件整段发给模型供应商
-				const target = repo.resolveInputPath(params.material);
-				const withinMaterials = relative(repo.materialsDir, target);
-				if (withinMaterials === "" || withinMaterials.startsWith("..") || isAbsolute(withinMaterials)) {
-					throw new Error(`材料文件必须位于罗盘数据目录的 materials 子目录内：${params.material}`);
-				}
+				// resolveMaterialPath 比 resolveInputPath 严一层：后者只保证「在项目根内」，而 .env 与
+				// 受限会话的凭据副本都在项目根内。少了这道复核，一条注入就能把任意项目内文件整段发给
+				// 模型供应商。判据在 store.ts 里，那样才测得到（源码切片守不住「判据被掏空」）
+				const target = repo.resolveMaterialPath(params.material);
 				materialText = await readFile(target, "utf8");
 				let parsed: { asins?: unknown; review_type?: unknown; sample_cap?: unknown } = {};
 				try {
@@ -1985,12 +1984,28 @@ export default function compassExtension(pi: ExtensionAPI): void {
 					if (how) lines.push(`内部提示：${field} — ${how}`);
 				}
 			}
+			// 子代理的结构化输出**必须进正文**：details 只走 UI 与本地消费方，宿主序列化给模型的只有
+			// content。只放进 details.data 的话，主会话拿到的就只有「差评聚类完成：3 个主题」，
+			// 运营说「记进去」时它只能凭空编出自己从没见过的 themes 与 evidence（2026-09-06 交付评审核出）。
+			//
+			// 尾句排在 JSON 之前：textResult 用 truncateHead（保头截尾），而定义文件可以把 max_tokens
+			// 提到 32000，届时超长 JSON 会把「未写回」这条纪律整段截掉——最不能丢的恰是那一句。
+			const outputJson = result.status === "success" && result.payload.output !== undefined ? JSON.stringify(result.payload.output, null, 2) : undefined;
+			const OUTPUT_MAX_BYTES = 12_000;
+			const outputBlock =
+				outputJson === undefined
+					? []
+					: Buffer.byteLength(outputJson, "utf8") > OUTPUT_MAX_BYTES
+						? ["```json", outputJson.slice(0, OUTPUT_MAX_BYTES), "```", "[结果 JSON 已截断；完整值在工具结果的 details.data.payload.output 里]"]
+						: ["```json", outputJson, "```"];
 			const text = [
 				`子代理 ${params.agent} · 模型 ${result.payload.model} · ${result.payload.ms} ms`,
 				result.summary,
+				...lines.slice(0, 12).map((line) => `· ${line}`),
 				"",
 				"**未写回**：确认结果后再执行 compass_reviews_record / compass_risk_check / compass_profit_estimate。",
 				"费用为目录表价名义值；中止的调用费用记不到。",
+				...(outputBlock.length ? ["", ...outputBlock] : []),
 			].join("\n");
 			try {
 				pi.events.emit("compass:dispatch", { agent: params.agent, status: result.status, ms: result.payload.ms, usage: result.usage });

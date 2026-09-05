@@ -1155,14 +1155,18 @@ export function dispatchFactsFor(
 		// 「运营显式填了 0」与「系统默认成 0」，所以对外一律说「假设值」，不说「未填」
 		facts.defaultedFields = PROFIT_ASSUMED_DEFAULTS.filter((item) => profit.input[item.field] === item.value).map((item) => item.field);
 	}
+	// 运营点名的类别 / 字段是**指令**，不是对 store 已有记录的过滤条件。
+	// 早先实现成求交集，于是「这个市场还没有风险记录 / 利润测算」时——那恰恰是最该派这两个
+	// 子代理的时候——点名的类别被静默丢空，<facts> 里一行都不发，子代理只能凭市场名瞎编
+	// （2026-09-06 交付评审核出）。改成并集：以运营点的为准，store 有记录就顺带带上。
 	if (options.categories && options.categories.length > 0) {
+		facts.riskCategories = [...options.categories];
+		// 缺证据链接的类别仍只能来自 store（没有记录就无从谈起），但要收敛到运营点名的范围内
 		const wanted = new Set(options.categories);
-		facts.riskCategories = facts.riskCategories.filter((item) => wanted.has(item));
 		facts.evidenceWithoutUrl = facts.evidenceWithoutUrl.filter((item) => wanted.has(item));
 	}
 	if (options.fields && options.fields.length > 0) {
-		const wanted = new Set(options.fields);
-		facts.defaultedFields = facts.defaultedFields.filter((item) => wanted.has(item));
+		facts.defaultedFields = [...options.fields];
 	}
 	return facts;
 }

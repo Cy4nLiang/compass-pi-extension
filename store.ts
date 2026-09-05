@@ -646,6 +646,25 @@ export class CompassRepository {
 		return resolvedCandidate;
 	}
 
+	/**
+	 * 差评材料的读路径。**比 resolveInputPath 严一层**：那条只保证「在项目根内」，而 `.env`
+	 * 与受限会话的凭据副本都在项目根内——材料会被整段读进内存发往模型供应商，只有项目内
+	 * 这一层根本挡不住「把 material 参数指向别的文件」。
+	 *
+	 * 提成方法而不是留在工具的 execute 里，是为了让它可被直接测：安全约束靠源码切片断言守着
+	 * 时，把判据掏空照样全绿（2026-09-06 交付评审核出）。
+	 */
+	resolveMaterialPath(path: string): string {
+		const target = this.resolveInputPath(path);
+		const root = canonicalPath(this.materialsDir);
+		// `target === root` 要单独排除：pathWithin 对「就是这个目录本身」返回 true（rel 为空串），
+		// 而目录不是材料。少这一条时读一个目录会走到 readFile 才报 EISDIR，理由指不到根因
+		if (target === root || !pathWithin(root, target)) {
+			throw new Error(`材料文件必须位于罗盘数据目录的 materials 子目录内：${path}`);
+		}
+		return target;
+	}
+
 	resolveOutputPath(path?: string, fallbackName = "report.md"): string {
 		const candidate = path
 			? isAbsolute(path) ? resolve(path) : resolve(this.projectRoot, path.replace(/^@/, ""))

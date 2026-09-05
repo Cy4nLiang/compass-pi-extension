@@ -437,6 +437,17 @@ test("compass_dispatch：execute 首行受限自拒", async () => {
 	// 只搜 lanShared 会被 description 里的措辞满足——钉到真的会拦的那个分支上，连拒绝文案一起钉
 	assert.match(body, /if \(lanShared\) throw new Error\(/u, "compass_dispatch 的 execute 必须自己判一次受限模式（纵深第二层，不依赖工作区 guard）");
 	assert.match(body, /局域网受限会话不可派发子代理/u, "受限拒绝必须给出明确文案");
+	// 「首行」是承重的，不只是好看：把这行挪到 runDispatch 之后，材料已经读进内存、已经发往
+	// 模型供应商、模型也已计费，才拒绝就毫无意义。所以钉它在 execute 体里**先于任何 await**
+	// （2026-09-06 交付评审核出：原断言只查出现过，挪到最后照样绿）
+	const execAt = body.indexOf("async execute(");
+	assert.notEqual(execAt, -1, "抽不到 compass_dispatch 的 execute 签名");
+	const execBody = body.slice(execAt);
+	const lanAt = execBody.indexOf("if (lanShared) throw new Error(");
+	const firstAwait = execBody.indexOf("await ");
+	assert.ok(lanAt > 0, "execute 体里找不到受限自拒");
+	assert.ok(firstAwait > 0, "execute 体里找不到任何 await——切片已失效");
+	assert.ok(lanAt < firstAwait, "受限自拒必须排在 execute 的任何 await 之前：晚一步材料就已经读进内存了");
 });
 
 test("compass_dispatch：注册在所有 pi.on 之前", async () => {
@@ -452,11 +463,15 @@ test("compass_dispatch：材料路径白名单复核在派发之前", async () =
 	const body = toolBody(source, "compass_dispatch");
 	// resolveInputPath 只保证「在项目根内」，.env 与受限会话的凭据副本都在项目根内。
 	// 复核必须排在 runDispatch 之前，晚一步就等于已经把文件读进内存发出去了
-	const guardAt = body.indexOf("repo.materialsDir");
+	// 判据本身在 store.ts 的 resolveMaterialPath 里，有真行为测试守着（tests/integration.test.ts
+	// 「材料路径白名单」）。这里只钉接线：工具**必须走那个方法**而不是宽一层的 resolveInputPath。
+	// 早先这条钉的是「repo.materialsDir 出现在 runDispatch 之前」，把判据掏空照样绿
+	const guardAt = body.indexOf("repo.resolveMaterialPath(params.material)");
 	const dispatchAt = body.indexOf("runDispatch(");
-	assert.notEqual(guardAt, -1, "compass_dispatch 必须把 material 参数复核到罗盘数据目录的材料子目录内");
+	assert.notEqual(guardAt, -1, "material 参数必须经 resolveMaterialPath 复核，不能只用 resolveInputPath");
 	assert.notEqual(dispatchAt, -1, "compass_dispatch 里找不到 runDispatch( 调用——切片已失效");
 	assert.ok(guardAt < dispatchAt, "白名单复核必须排在 runDispatch 之前");
+	assert.equal(/resolveInputPath\(params\.material\)/u.test(body), false, "不得绕过 resolveMaterialPath 直接用 resolveInputPath 取材料");
 	assert.match(body, /const store = await readStore\(ctx\)/u, "派发只读 store：readStoreFlushingUsage 在有未落盘计量时会真开一次写事务");
 });
 
@@ -495,12 +510,17 @@ test("compass_dispatch：热路径 hook 不出现派发调用", async () => {
 	const bodies = hookBodies(source);
 	// 只禁调用与 import，不禁文案——guardReason 里点名 compass_dispatch 是要给运营看的，
 	// 所以标识符必须紧跟 `(` 才算命中，字符串字面量 "compass_dispatch") 不会被判。
-	// 前缀 [A-Za-z_$]* 不能省：写成 /\bdispatch\w*\(/ 时 runDispatch( 里的 Dispatch 前面没有词边界，
-	// 真在热路径里调 runDispatch(...) 会被整条放过——变异核对时实测到过这个假绿。
-	const pattern = /[A-Za-z_$][A-Za-z0-9_$]*[Dd]ispatch[A-Za-z0-9_$]*\s*\(|from "\.\/dispatch\.(?:ts|js)"|modelRegistry/u;
-	// 自证：正则对真正的违规写法必须命中，对文案必须不命中
-	assert.equal(pattern.test("await runDispatch({ registry }, input);"), true, "正则必须能抓到 runDispatch( 调用");
+	//
+	// 两处坑都踩过：写成 /\bdispatch\w*\(/ 时 runDispatch( 里的 Dispatch 前面没有词边界，整条放过；
+	// 改成「前面至少一个标识符字符」之后，**以小写 dispatch 开头**的 dispatchRegistry( /
+	// dispatchFactsFor( 又全部漏网（2026-09-06 交付评审核出）。所以前缀写成可选。
+	const pattern = /[A-Za-z0-9_$]*[Dd]ispatch[A-Za-z0-9_$]*\s*\(|from "\.\/dispatch\.(?:ts|js)"|modelRegistry/u;
+	// 自证：正则对真正的违规写法必须命中，对文案必须不命中。四条违规写法一条都不能漏
+	for (const violation of ["await runDispatch({ registry }, input);", "dispatchRegistry(ctx)", "dispatchFactsFor(store, ref)", "resetDispatchCounters()"]) {
+		assert.equal(pattern.test(violation), true, `正则必须能抓到 ${violation}`);
+	}
 	assert.equal(pattern.test('renderCallLabel("compass_dispatch")'), false, "正则不该把工具名文案判成调用");
+	assert.equal(pattern.test("差评材料只能交给 compass_dispatch（agent=review-clusterer）"), false, "guardReason 的中文文案不该被判成调用");
 	for (const name of HOT_PATH_HOOKS) {
 		const body = bodies.get(name);
 		assert.ok(body, `index.ts 里找不到 pi.on("${name}")——切片正则或 hook 注册点已变`);

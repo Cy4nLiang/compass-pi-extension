@@ -272,11 +272,15 @@ export function resolveDispatchModel(
 ): ResolvedDispatchModel {
 	const requested = candidates.find((item) => isModelRef(item)) ?? DEFAULT_DISPATCH_MODEL;
 	const spec = resolveModelSpec(requested);
+	// 没有注册表是**没法回落**的：ctx.model 只是个模型描述，真正发请求的通道是 registry.complete。
+	// 把它当成可回落的原因，就会一边报「已用主会话模型、材料因此发往了主模型供应商」，
+	// 一边在下一步对 undefined 取 .complete 抛错——谎报一次并未发生的数据外发（2026-09-06 交付评审核出）。
+	if (!registry) {
+		return { error: "本会话没有模型注册表（宿主未提供，或它的形状与预期不符）：没有它就没有任何可用的模型通道，本次不会发出任何请求。" };
+	}
 	let reason = "";
 	if (!spec) {
 		reason = `模型引用「${String(requested).slice(0, 40)}」不是 provider/id 形状`;
-	} else if (!registry) {
-		reason = "本会话没有模型注册表";
 	} else {
 		let found: DispatchModelLike | undefined;
 		try {
@@ -439,6 +443,28 @@ export interface ReviewClustererContext {
 	materialAsins: readonly string[];
 }
 
+/**
+ * 把材料归一成「可比对语料」：解析出评论行后只取标题与正文拼成纯文本。
+ *
+ * 不能直接拿材料的**原始 JSON 文本**去 includes——那里面的正文是转义过的（引号变 \"、换行变 \n），
+ * 而模型引用的是渲染后的原句。评论里带引号或换行极常见，直接比对会让合规输出必然判失败，
+ * 重问一次后整次派发报错、两次调用白花（2026-09-06 交付评审核出）。
+ *
+ * 顺带折叠空白：模型常把原句里的换行抄成空格，那不该算改写。
+ * 解析不出评论行时回落到原文——手工材料不一定是 convert 的产物。
+ */
+export function materialCorpus(materialText: string): string {
+	const collapse = (value: string) => value.replace(/\s+/gu, " ").trim();
+	try {
+		const parsed = JSON.parse(materialText) as { reviews?: Array<Record<string, unknown>> };
+		const rows = Array.isArray(parsed.reviews) ? parsed.reviews : undefined;
+		if (!rows) return collapse(materialText);
+		return rows.map((row) => `${String(row.title ?? "")} ${String(row.body ?? "")}`).map(collapse).join("\n");
+	} catch {
+		return collapse(materialText);
+	}
+}
+
 const REVIEW_CATEGORY_SET = new Set<string>(REVIEW_THEME_CATEGORIES);
 const REVIEW_FIXABILITY_SET = new Set<string>(REVIEW_THEME_FIXABILITIES);
 const RISK_CATEGORY_SET = new Set<string>(RISK_QUERY_CATEGORIES);
@@ -446,7 +472,9 @@ const SUPPLIER_TARGET_SET = new Set<string>(SUPPLIER_INQUIRY_TARGETS);
 const SUPPLIER_FIELD_SET = new Set<string>(SUPPLIER_ASK_FIELDS);
 
 /** 金额判据：阿拉伯数字紧跟货币单位。body / fill_template 命中即判失败。 */
-const MONEY_PATTERN = /\d+(?:\.\d+)?\s*(?:元|美元|USD|CNY|\$|￥)/iu;
+// 两个方向都要认：中文习惯「1200 元」把币种放后面，英文习惯「$3.50 / USD 3.50」放前面。
+// 只认一个方向时另一半会整段穿过（2026-09-06 交付评审核出）。
+const MONEY_PATTERN = /\d+(?:\.\d+)?\s*(?:元|美元|USD|CNY|\$|￥)|(?:USD|CNY|\$|￥|人民币|美元)\s*\d/iu;
 
 function isNonNegativeInteger(value: unknown): boolean {
 	return typeof value === "number" && Number.isInteger(value) && value >= 0;
@@ -459,6 +487,8 @@ function isNonNegativeInteger(value: unknown): boolean {
  */
 export function validateReviewClusterer(value: unknown, context: ReviewClustererContext): string[] {
 	const errors: string[] = [];
+	// 归一一次，供下面所有 evidence 逐句比对复用
+	const corpus = materialCorpus(context.materialText);
 	if (!isRecord(value)) return ["输出不是 JSON 对象"];
 	if (!Object.hasOwn(value, "estimated_rating") || value.estimated_rating !== null) {
 		errors.push("estimated_rating 必须原样输出 null（预估星级由人给）");
@@ -506,7 +536,7 @@ export function validateReviewClusterer(value: unknown, context: ReviewClusterer
 			} else {
 				if (raw.evidence.length > 10) errors.push(`${at}.evidence 最多 10 条`);
 				for (const quote of raw.evidence as string[]) {
-					if (!context.materialText.includes(quote.trim())) {
+					if (!corpus.includes(quote.replace(/\s+/gu, " ").trim())) {
 						errors.push(`${at}.evidence 里「${quote.slice(0, 24)}」不是材料里的原句`);
 					}
 				}
@@ -839,7 +869,14 @@ export async function runDispatch(deps: { registry?: DispatchRegistryLike }, inp
 			return done("error", DISPATCH_BUSY_SUMMARY);
 		}
 
-		const resolved = resolveDispatchModel(deps.registry, [input.modelOverride, input.definition.model, config.model], input.hostModel);
+		// 先判注册表再解析模型：没有它就没有任何可用的模型通道，不能回落、也不该走进重问循环
+		// 白吃一格会话额度。resolveDispatchModel 内部同样挡了一道，那是给直接调用它的测试用的
+		const registry = deps.registry;
+		if (!registry) {
+			lines.push("本会话没有模型注册表（宿主未提供，或它的形状与预期不符）：没有它就没有任何可用的模型通道，本次不会发出任何请求。");
+			return done("error", DISPATCH_FAILURE_SUMMARIES.noModel);
+		}
+		const resolved = resolveDispatchModel(registry, [input.modelOverride, input.definition.model, config.model], input.hostModel);
 		if (!resolved.model) {
 			lines.push(resolved.error ?? "模型不可用");
 			return done("error", DISPATCH_FAILURE_SUMMARIES.noModel);
@@ -867,8 +904,15 @@ export async function runDispatch(deps: { registry?: DispatchRegistryLike }, inp
 		dispatchInFlight += 1;
 		try {
 			for (let attempt = 0; attempt <= DISPATCH_REASK_LIMIT; attempt += 1) {
+				// 重问也计入会话额度，所以每轮进来都要复核一次——只在进入时查一次的话，
+				// 第 40 次派发的那轮重问会让实际调用数变成 41（2026-09-06 交付评审核出）
+				if (dispatchCalls >= config.session_cap) {
+					if (attempt === 0) return done("error", DISPATCH_CAP_SUMMARY);
+					lines.push(`重问被会话上限拦下（已用 ${dispatchCalls} / ${config.session_cap} 次）`);
+					break;
+				}
 				dispatchCalls += 1;
-				const call = await callOnce(deps.registry as DispatchRegistryLike, model, context, signal, toolSignal, timeoutSignal, maxTokens, deadlineAt - Date.now());
+				const call = await callOnce(registry, model, context, signal, toolSignal, timeoutSignal, maxTokens, deadlineAt - Date.now());
 				addDispatchUsage(usage, call.usage);
 				if (call.kind === "cancelled") return done("error", DISPATCH_FAILURE_SUMMARIES.cancelled);
 				if (call.kind === "timeout") return done("error", DISPATCH_FAILURE_SUMMARIES.timeout);

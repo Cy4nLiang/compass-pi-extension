@@ -1882,6 +1882,34 @@ test("派发配置文件：不存在静默、坏内容要说出来，覆盖前�
 	}
 });
 
+// 差评材料的读路径比 resolveInputPath 严一层：材料会被整段读进内存发往模型供应商，
+// 只保证「在项目根内」根本挡不住把 material 参数指向别的文件。这条以前只有源码切片断言守着，
+// 把判据掏空照样全绿（2026-09-06 交付评审核出），所以判据提进 store.ts 换成行为测试。
+test("材料路径白名单：只放行 materials 子目录，项目内的其它文件一律拒绝", async () => {
+	const root = await mkdtemp(join(tmpdir(), "compass-material-path-"));
+	try {
+		const repo = new CompassRepository(root);
+		await mkdir(repo.materialsDir, { recursive: true, mode: 0o700 });
+		await writeFile(join(repo.materialsDir, "demo.json"), "{}", "utf8");
+		assert.equal(repo.resolveMaterialPath(".pi/compass/materials/demo.json"), join(repo.materialsDir, "demo.json"), "材料目录内的文件照常放行");
+
+		// 下面这些都在项目根内，resolveInputPath 会全部放行——正是这道复核存在的理由
+		await writeFile(join(root, ".env"), "SECRET=x", "utf8");
+		await mkdir(join(root, ".pi", "lan-share", "agent"), { recursive: true });
+		await writeFile(join(root, ".pi", "lan-share", "agent", "auth.json"), "{}", "utf8");
+		for (const evil of [".env", ".pi/lan-share/agent/auth.json", ".pi/compass/store.json", ".pi/compass/materials/../../../.env"]) {
+			assert.equal(typeof repo.resolveInputPath(evil), "string", `前提：${evil} 能过 resolveInputPath（否则这条用例没在验白名单）`);
+			assert.throws(() => repo.resolveMaterialPath(evil), /必须位于罗盘数据目录的 materials 子目录内/u, `${evil} 必须被拒绝`);
+		}
+		// 目录本身不是材料
+		assert.throws(() => repo.resolveMaterialPath(".pi/compass/materials"), /必须位于罗盘数据目录的 materials 子目录内/u);
+		// 项目外的路径先被 resolveInputPath 挡下
+		assert.throws(() => repo.resolveMaterialPath("/etc/hosts"), /必须位于/u);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
 
 // —— D-1 缺陷组 ②：毛利 Gate 单一事实来源（2026-09-05）——
 test("recordProfitEstimate 的 decisionLog 结论不得与生效策略的 gross_margin_gate 打架（D-1 缺陷组 ②）", async () => {

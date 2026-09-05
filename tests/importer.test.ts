@@ -254,6 +254,9 @@ test("normalizeCapturedAt 对 YYYY/MM/DD、点号与中文纯日期按 UTC 零�
 		assert.equal(normalizeCapturedAt("2026-09-01T10:00:00+08:00", now), "2026-09-01T02:00:00.000Z", `TZ=${tz}`);
 		assert.throws(() => normalizeCapturedAt("2062/09/01", now), /captured_at 不能晚于当前时间 36 小时/, `TZ=${tz}`);
 		assert.throws(() => normalizeCapturedAt("1026/08/22", now), /captured_at 过早/, `TZ=${tz}`);
+		// 回卷日期必须拒绝，而不是回退到 new Date(原串) 让 V8 进位到下月 1 日再带回本地时区依赖
+		assert.throws(() => normalizeCapturedAt("2026/02/30", now), /captured_at 日期不存在/, `TZ=${tz}`);
+		assert.throws(() => normalizeCapturedAt("2026-4-31", now), /captured_at 日期不存在/, `TZ=${tz}`);
 	});
 });
 

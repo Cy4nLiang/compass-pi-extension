@@ -1864,6 +1864,7 @@ test("gateDefaultsLine 的每个数字都来自最新策略的规则表达式，
 	assert.match(gateDefaultsLine(store), /QRD\(300\)≥20/);
 	// ① 只改 meta.q：规则仍是 qualify_rank_depth(300) >= 20，文案必须跟规则走而不是跟 meta.q
 	saveStrategyVersion(store, { yaml: DEFAULT_STRATEGY_YAML.replace("monthly_units_q: 300", "monthly_units_q: 500"), actor: "tester" });
+	assert.equal(targetMonthlyUnits(store), 500, "替换必须真的生效，否则本步空转");
 	assert.match(gateDefaultsLine(store), /QRD\(300\)≥20/);
 	assert.doesNotMatch(gateDefaultsLine(store), /QRD\(500\)/);
 	// ② 改规则本身

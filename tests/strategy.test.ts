@@ -7,7 +7,7 @@ import { parseMarketCsv } from "../csv.ts";
 import { DEFAULT_GATE_THRESHOLDS, DEFAULT_STRATEGY_ID, DEFAULT_STRATEGY_YAML, DEFAULT_TARGET_MONTHLY_UNITS } from "../defaults.ts";
 import { estimateProfit, normalizeProfitInput, profitMetrics } from "../economics.ts";
 import { calculateMarketMetrics } from "../metrics.ts";
-import { evaluateExpression, evaluateStrategy, parseStrategyYaml, ruleThreshold, slugify, strategyTargetDailyUnits, strategyTargetMonthlyUnits } from "../strategy.ts";
+import { evaluateExpression, evaluateStrategy, gateThresholdsFor, parseStrategyYaml, ruleThreshold, slugify, strategyTargetDailyUnits, strategyTargetMonthlyUnits } from "../strategy.ts";
 import type { StrategyContext } from "../strategy.ts";
 import type { MetricEvidence, MetricMap, MetricScalar } from "../types.ts";
 
@@ -696,5 +696,18 @@ test("内置 YAML 的 Gate 阈值与 DEFAULT_GATE_THRESHOLDS 逐条相等（D-1 
 	// 复杂表达式与不存在的规则一律 undefined，不猜
 	assert.equal(ruleThreshold(definition, "red_sea_veto"), undefined);
 	assert.equal(ruleThreshold(definition, "no_such_rule"), undefined);
+});
+
+test("ruleThreshold 的数字文法与 tokenize 一致：.35 / 3. / 35e-2 不得回落内置默认（D-1 缺陷组 ② 评审补）", () => {
+	for (const [written, expected] of [[".35", 0.35], ["35e-2", 0.35], ["0.355", 0.355], ["3.", 3]] as const) {
+		const definition = parseStrategyYaml(DEFAULT_STRATEGY_YAML.replace("gross_margin >= 0.40", `gross_margin >= ${written}`));
+		assert.equal(ruleThreshold(definition, "gross_margin_gate")?.value, expected, written);
+		assert.deepEqual(gateThresholdsFor(definition).fallbacks, [], written);
+	}
+	// 形状不对的规则逐字段回落，并把字段名记进 fallbacks；没有策略时六个字段全回落
+	const reversed = parseStrategyYaml(DEFAULT_STRATEGY_YAML.replace("cpc_ratio <= 0.60", "cpc_ratio >= 0.60"));
+	assert.deepEqual(gateThresholdsFor(reversed).fallbacks, ["cpcReview"]);
+	assert.equal(gateThresholdsFor(reversed).cpcReview, DEFAULT_GATE_THRESHOLDS.cpcReview);
+	assert.deepEqual([...gateThresholdsFor(undefined).fallbacks].sort(), ["cpcHard", "cpcReview", "grossMargin", "newListingShare", "qrdMinDepth", "qrdTargetUnits"]);
 });
 

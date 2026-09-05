@@ -401,4 +401,10 @@ test("毛利 Gate 阈值不得在 economics / service / index 里以字面量比
 	assert.deepEqual(offenders, [], "毛利 Gate 阈值只能来自 DEFAULT_GATE_THRESHOLDS / gateThresholds(store)");
 	const economics = await readFile(join(repoRoot, "economics.ts"), "utf8");
 	assert.ok(economics.includes("DEFAULT_GATE_THRESHOLDS"), "economics.ts 必须从 defaults.ts 取毛利 Gate 默认阈值");
+	// 工具层接线钉位置（评审变异核对：把 estimateProfit(input, thresholds) 改回单参，全量测试与 tsc 都不会红）
+	const source = await readFile(join(repoRoot, "index.ts"), "utf8");
+	const body = toolBody(source, "compass_profit_estimate");
+	assert.match(body, /const thresholds = gateThresholds\(store\);/u, "compass_profit_estimate 必须从最新默认策略读阈值");
+	assert.match(body, /estimateProfit\(input, thresholds\)/u, "compass_profit_estimate 必须把策略阈值传给 estimateProfit");
+	assert.match(body, /status: result\.warnings\.length === 0 \? "success" : "warning"/u, "status 只看 warnings 是否为空（②-2 记录的行为变化）");
 });

@@ -121,6 +121,8 @@ cd .pi/extensions/compass && COMPASS_ROOT=../../.. npm run web
 ├── raw/             # 原始 CSV 不可变归档
 ├── snapshots/       # 每个快照的 listing/keyword 数据文件（按需回放）
 ├── gapfill/         # 0600，补数档位与静音清单（state.jsonc）
+├── materials/       # 0600，差评材料（只交给 compass_dispatch，读工具会被拦）
+├── dispatch/        # 0600，子代理派发配置（config.jsonc，手工编辑）
 └── reports/         # Markdown 选品报告
 ```
 
@@ -137,7 +139,8 @@ Extension：
 - 不自动登录网页或绕过验证码；
 - 不把缺失指标伪装成通过；
 - 不把 AI 风险初筛当法律意见；
-- 强调采集环境与卖家主账号环境物理隔离。
+- 强调采集环境与卖家主账号环境物理隔离；
+- `compass_dispatch` 会把差评材料或采购口径**整段发往所配置的模型供应商**（默认是宿主 `/model` 之外单独配置的小模型），这是本扩展唯一会把数据发出本机的功能（MCP 取数之外）。它的模型费用**不计入** `compass_budget`（那是 MCP 调用次数的面），单会话有次数与并发上限，受限共享会话一律不可用。
 
 ## CSV 字段
 

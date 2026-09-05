@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { CSV_ALIAS_HEADERS, parseMarketCsv } from "../csv.ts";
-import { convertSorftimePayloads, createMcpPayloadCache, extractMcpPayload, isAdapterSpillPath, parseSorftimeFieldMap, pickPath, slugForFileName, type CachedPayload, type SorftimeFieldMap } from "../gapfill-convert.ts";
+import { capturedAtForBatch, convertSorftimePayloads, createMcpPayloadCache, extractMcpPayload, isAdapterSpillPath, parseSorftimeFieldMap, pickPath, slugForFileName, type CachedPayload, type SorftimeFieldMap } from "../gapfill-convert.ts";
 import { calculateMarketMetrics } from "../metrics.ts";
 import { CompassRepository, IMPORTS_DIR_NAME } from "../store.ts";
 
@@ -581,5 +581,81 @@ test("载荷不可恢复时，拒绝理由必须说「重试不会变好」而�
 		);
 		const after = await readdir(join(root, IMPORTS_DIR_NAME)).catch(() => [] as string[]);
 		assert.deepEqual(after, before, "拒绝时不得写出任何 CSV");
+	});
+});
+
+// —— 2026-09-05 真实冒烟回归：convert 给的 captured_at 必须是完整时间戳 ——
+test("capturedAtForBatch：取这批载荷最后一次收到返回的完整时间戳，不是纯日期", () => {
+	const at = capturedAtForBatch([
+		{ receivedAt: "2026-01-02T03:04:05.000Z" },
+		{ receivedAt: "2026-01-02T03:09:59.123Z" },
+		{ receivedAt: "2026-01-02T03:04:30.000Z" },
+	]);
+	assert.equal(at, "2026-01-02T03:09:59.123Z");
+	assert.match(at, /T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u, "必须是完整 ISO：纯日期会被导入侧归一到 UTC 零点，压不过同一天早些时候的手工快照");
+});
+
+test("capturedAtForBatch：没有可用的 receivedAt 时退回给定的 now", () => {
+	const now = new Date("2026-09-05T01:02:03.004Z");
+	assert.equal(capturedAtForBatch([], now), "2026-09-05T01:02:03.004Z");
+	assert.equal(capturedAtForBatch([{ receivedAt: "not-a-date" }, {}], now), "2026-09-05T01:02:03.004Z");
+});
+
+// —— 2026-09-05 评审核出的两处既有缺陷：链① 的包装体、失败调用的报错文本 ——
+test("链① 的 mcpResult 是整个 CallToolResult：convert 要从 content[].text 里二次 parse 才拿得到行", async () => {
+	await withRepo(async (repo) => {
+		const cache = createMcpPayloadCache();
+		// adapter 的 rawMcpResult 就是 CallToolResult（{ content: [{ type: "text", text }], isError }），
+		// 不是业务对象——真实冒烟归档的 payload-1.json 顶层键就是 content / isError
+		const wrap = (value: unknown) => ({ content: textBlocks(value), isError: false });
+		cache.remember({ server: "sorftime", tool: "category_report" }, { toolCallId: "l", details: { mode: "call", server: "sorftime", tool: "category_report", mcpResult: wrap(listingPayload(3)) }, content: textBlocks(listingPayload(3)), receivedAt: "2026-01-02T03:00:00.000Z" });
+		cache.remember({ server: "sorftime", tool: "category_keywords" }, { toolCallId: "k", details: { mode: "call", server: "sorftime", tool: "category_keywords", mcpResult: wrap(keywordPayload(2)) }, content: textBlocks(keywordPayload(2)), receivedAt: "2026-01-02T03:00:01.000Z" });
+		const entries = cache.since("sorftime", "2026-01-02T00:00:00.000Z");
+		assert.equal(entries.filter((entry) => entry.value !== undefined).length, 2, "两条都该走链①（value 形态）");
+		const result = await convertSorftimePayloads({ repo }, { payloads: entries, map: MAP, marketName: "demo market", capturedDate: "2026-01-02" });
+		assert.equal(result.listingRows, 3, "包装体里的 listing 行必须被取出，不能静默丢掉");
+		assert.equal(result.keywordRows, 2);
+		// 归档的是业务载荷，不是包装体
+		const archived = JSON.parse(await readFile(join(repo.projectRoot, result.archivedRaw[0] ?? ""), "utf8")) as Record<string, unknown>;
+		assert.ok("data" in archived && !("content" in archived), `归档应是业务对象，实得键：${Object.keys(archived).join("、")}`);
+	});
+});
+
+test("直接给业务对象的 mcpResult（旧夹具形态）仍然能转", async () => {
+	await withRepo(async (repo) => {
+		const result = await convertSorftimePayloads(
+			{ repo },
+			{ payloads: [inline(listingPayload(2), "category_report"), inline(keywordPayload(2), "category_keywords")], map: MAP, marketName: "demo market", capturedDate: "2026-01-02" },
+		);
+		assert.equal(result.listingRows, 2);
+		assert.equal(result.keywordRows, 2);
+	});
+});
+
+test("缓存里混进失败调用的报错文本：不崩、能转；缺行时拒绝理由点名被跳过的那一步", async () => {
+	const failedText = (tool: string): CachedPayload => ({ server: "sorftime", tool, text: "Failed to call tool: request timed out after 30000 ms\n\nExpected parameters:\n  node_id (string) *required*" });
+	await withRepo(async (repo) => {
+		// 第 2 步先超时再重调成功：两类行齐了，报错文本只是噪声
+		const ok = await convertSorftimePayloads(
+			{ repo },
+			{ payloads: [failedText("category_report"), inline(listingPayload(3), "category_report"), inline(keywordPayload(2), "category_keywords")], map: MAP, marketName: "demo market", capturedDate: "2026-01-02" },
+		);
+		assert.equal(ok.listingRows, 3);
+		assert.equal(ok.keywordRows, 2);
+	});
+	await withRepo(async (repo) => {
+		// 第 2 步只超时没重调：拒绝，且说清是 category_report 那条不是 JSON——「这一批没见到 X 的返回」
+		// 那个提示按工具名算会把失败的那次也当成「见到了」，所以这里必须自己点名
+		await assert.rejects(
+			() => convertSorftimePayloads({ repo }, { payloads: [failedText("category_report"), inline(keywordPayload(2), "category_keywords")], map: MAP, marketName: "demo market", capturedDate: "2026-01-02" }),
+			(error: unknown) => {
+				const message = error instanceof Error ? error.message : String(error);
+				assert.match(message, /没有 listing 行/u);
+				assert.match(message, /已跳过/u);
+				assert.match(message, /category_report（返回体不是 JSON/u);
+				assert.doesNotMatch(message, /Unexpected token/u, "不能把 SyntaxError 原样抛给运营");
+				return true;
+			},
+		);
 	});
 });

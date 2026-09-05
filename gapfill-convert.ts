@@ -293,6 +293,23 @@ export interface ConvertInput {
 	source?: string;
 }
 
+/**
+ * 这一批载荷的采集时刻：取最后一次收到 sorftime 返回的时间（完整 ISO），一个都取不到才用 now。
+ *
+ * 必须是完整时间戳而不是 YYYY-MM-DD：导入侧把纯日期归一到 UTC 零点，而「最新快照」按
+ * (capturedAt, importedAt) 比较——同一 UTC 日早些时候手工导入的快照会因此排在这批花钱补来的
+ * 数据之前，看板 / 市场档案 / 五维报告 / 粗筛继续用旧的，CPC 缺口只从 A 档降成 C 档
+ * （2026-09-05 真实冒烟实测：17:05Z 的手工快照压过了 22:13Z 补来的 sorftime 快照）。
+ */
+export function capturedAtForBatch(payloads: ReadonlyArray<{ receivedAt?: string }>, now = new Date()): string {
+	let latest = Number.NEGATIVE_INFINITY;
+	for (const payload of payloads) {
+		const time = typeof payload.receivedAt === "string" ? Date.parse(payload.receivedAt) : Number.NaN;
+		if (Number.isFinite(time) && time > latest) latest = time;
+	}
+	return new Date(Number.isFinite(latest) ? latest : now.getTime()).toISOString();
+}
+
 export interface ColumnCoverage {
 	column: string;
 	filled: number;
@@ -344,23 +361,46 @@ export function slugForFileName(marketName: string): string {
 	return slug || "market";
 }
 
-async function resolvePayload(payload: CachedPayload): Promise<unknown> {
-	if (payload.value !== undefined) return payload.value;
-	// 文本形态在热路径上只存不 parse，到这里才解析
-	if (payload.text !== undefined) return JSON.parse(payload.text) as unknown;
-	if (!payload.filePath) return undefined;
-	const raw = await readFile(payload.filePath, "utf8");
-	const parsed = JSON.parse(raw) as unknown;
-	if (!payload.fileHoldsToolResult) return parsed;
-	// mcpResult.fullResultPath 那条链存的是整个 CallToolResult：正文在 content[].text 里，
-	// 要二次 parse 才是业务载荷
-	const content = (parsed as { content?: Array<{ type?: string; text?: string }> }).content;
-	if (!Array.isArray(content)) return parsed;
+interface ResolvedPayload {
+	body: unknown;
+	/** 这条不是 JSON（call_failed / aborted 之后 adapter 给的报错文本之类），跳过但要在拒绝理由里点名 */
+	skipped?: string;
+}
+
+/**
+ * adapter 的 details.mcpResult（链①）与 fullResultPath 文件（链③）存的都是**整个 CallToolResult**：
+ * `{ content: [{ type: "text", text: "<业务 JSON>" }], isError }`，业务载荷在 content[].text 里要二次 parse。
+ * 2026-09-05 真实冒烟归档的 payload-1.json 顶层键就是 content / isError——此前链①把包装体原样当载荷，
+ * pickPath(body, "data…") 取到 undefined，返回体 ≤16 KiB 的那一步（关键词很少的类目）会静默丢行。
+ * 不是包装体（没有 content 数组）就原样返回，兼容直接给业务对象的调用方与夹具。
+ */
+function unwrapToolResult(value: unknown, parse: (text: string) => ResolvedPayload): ResolvedPayload {
+	const content = (value as { content?: unknown } | null | undefined)?.content;
+	if (!Array.isArray(content)) return { body: value };
 	const text = content
-		.filter((item) => item?.type === "text" && typeof item.text === "string")
-		.map((item) => item.text as string)
+		.filter((item): item is { type: string; text: string } => item?.type === "text" && typeof item?.text === "string")
+		.map((item) => item.text)
 		.join("\n");
-	return text ? (JSON.parse(text) as unknown) : undefined;
+	return text ? parse(text) : { body: undefined };
+}
+
+async function resolvePayload(payload: CachedPayload): Promise<ResolvedPayload> {
+	// 解析失败不抛：失败调用的报错文本若混进这一批，convert 直接崩会让这张确认单永远转不出去
+	// （catch 分支按设计不清单不清缓存），运营只能重新 approve 再把已经花钱拿到的两步重付一遍
+	const parse = (text: string): ResolvedPayload => {
+		try {
+			return { body: JSON.parse(text) as unknown };
+		} catch {
+			return { body: undefined, skipped: `${payload.tool}（返回体不是 JSON：${text.replace(/\s+/gu, " ").slice(0, 60)}…）` };
+		}
+	};
+	if (payload.value !== undefined) return unwrapToolResult(payload.value, parse);
+	// 文本形态在热路径上只存不 parse，到这里才解析
+	if (payload.text !== undefined) return parse(payload.text);
+	if (!payload.filePath) return { body: undefined };
+	const parsed = parse(await readFile(payload.filePath, "utf8"));
+	if (parsed.skipped !== undefined || !payload.fileHoldsToolResult) return parsed;
+	return unwrapToolResult(parsed.body, parse);
 }
 
 function headerFor(column: string): string {
@@ -375,9 +415,9 @@ function headerFor(column: string): string {
  * 抹掉指标。所以两类行必须同时拿到才写文件，拿不齐就拒绝并说清缺哪一边。
  */
 export async function convertSorftimePayloads(deps: ConvertDeps, input: ConvertInput): Promise<ConvertResult> {
-	const resolved: Array<{ payload: CachedPayload; body: unknown }> = [];
+	const resolved: Array<{ payload: CachedPayload } & ResolvedPayload> = [];
 	for (const payload of input.payloads) {
-		resolved.push({ payload, body: await resolvePayload(payload) });
+		resolved.push({ payload, ...(await resolvePayload(payload)) });
 	}
 
 	// 身份列过滤：确认单窗口内**同一个 server 的所有载荷**都会进来，而链路第 1 步
@@ -414,10 +454,16 @@ export async function convertSorftimePayloads(deps: ConvertDeps, input: ConvertI
 					`当前这一批缺${missing}，不会写出残缺快照。`,
 			);
 		}
+		// 被跳过的非 JSON 条目要点名：调用方按工具名算「这一批没见到谁的返回」时，失败的那次
+		// 也算「见到了」，不点名运营就不知道该重调哪一步
+		const skipped = resolved.filter((item) => item.skipped !== undefined).map((item) => item.skipped as string);
+		const skippedNote = skipped.length
+			? `另有 ${skipped.length} 条返回体不是 JSON、已跳过——多半是超时 / 中断后 adapter 给的报错文本，那一步要重调：${skipped.join("、")}。`
+			: "";
 		throw new Error(
 			`补数转换被拒绝：本批载荷里没有${missing}，只能合成残缺快照。` +
 				`残缺快照会让策略指标静默消失（只有关键词行时 21 个指标只剩 4 个），且导入链对此零告警。` +
-				`请先补齐这一步的调用再转换。`,
+				`请先补齐这一步的调用再转换。${skippedNote}`,
 		);
 	}
 

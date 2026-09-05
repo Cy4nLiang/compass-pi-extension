@@ -401,7 +401,11 @@ export function importParsedMarket(
 	});
 	const warnings = [...input.parsed.warnings];
 	if (previousLatest && compareSnapshotRecency({ capturedAt: input.capturedAt, importedAt: timestamp }, previousLatest) < 0) {
-		warnings.push(`本次快照采集于 ${input.capturedAt.slice(0, 10)}，早于该市场现有最新快照 ${previousLatest.id}（${previousLatest.capturedAt.slice(0, 10)}）：看板、市场档案、五维报告与粗筛仍以那份更新的快照为准`);
+		// 两边同一天时只回显日期会写成「2026-09-04 早于 2026-09-04」——排序是按完整时间戳比的
+		// （纯日期归一到 UTC 零点），日期相同就把时分秒露出来，运营才看得出为什么被判旧、该怎么改
+		const sameDay = input.capturedAt.slice(0, 10) === previousLatest.capturedAt.slice(0, 10);
+		const shown = (iso: string) => (sameDay ? iso : iso.slice(0, 10));
+		warnings.push(`本次快照采集于 ${shown(input.capturedAt)}，早于该市场现有最新快照 ${previousLatest.id}（${shown(previousLatest.capturedAt)}）：看板、市场档案、五维报告与粗筛仍以那份更新的快照为准`);
 	}
 	const snapshot: MarketSnapshot = {
 		id: shortId("snap"),

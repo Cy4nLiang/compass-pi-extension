@@ -17,7 +17,7 @@ import { Type } from "typebox";
 import { DOMAIN_TOOLS, rankTools, searchTerms } from "./catalog.ts";
 import { compareSnapshotRecencyDesc, snapshotTtlDays } from "./defaults.ts";
 import { estimateProfit, normalizeProfitInput } from "./economics.ts";
-import { convertSorftimePayloads, createMcpPayloadCache, parseSorftimeFieldMap, type McpPayloadEntry, type SorftimeFieldMap } from "./gapfill-convert.ts";
+import { capturedAtForBatch, convertSorftimePayloads, createMcpPayloadCache, parseSorftimeFieldMap, type McpPayloadEntry, type SorftimeFieldMap } from "./gapfill-convert.ts";
 import {
 	hasEffectiveLimit,
 	GAPFILL_MODES,
@@ -450,6 +450,11 @@ export default function compassExtension(pi: ExtensionAPI): void {
 	}
 	const TICKET_TTL_MS = 10 * 60_000;
 	let gapfillTicket: GapfillTicket | undefined;
+	// tool_call 时预扣过额度的调用：toolCallId → server。退款按这份记录退，不按 tool_result 的 sample 判——
+	// init_failed / not_initialized 这类结果没有 server 字段、classify 判不出 sample，只看 sample 会让
+	// 预扣的额度永远退不回来（2026-09-05 评审核出）。纯内存、有上限，结果一到就删
+	const deductedTicketCalls = new Map<string, string>();
+	const DEDUCTED_CALLS_MAX = 64;
 	// 只按**过期**判有效，不看剩余次数——次数用尽的确认单仍然是这一批的身份证：convert 要靠它
 	// 界定「哪些载荷属于这一批」。次数是调用额度，过期才是生命周期，两件事分开判。
 	function activeGapfillTicket(): GapfillTicket | undefined {
@@ -477,9 +482,20 @@ export default function compassExtension(pi: ExtensionAPI): void {
 	// 只管 A 档（付费）池：B/C 与本地源不在补数确认的范围里，拦它们只会平添惊吓。
 	// 这里只能读 event.input——tool_call 发生在调用之前，details 还不存在（P4 说的
 	// 「读 details」是 tool_result 侧的口径）。池名解析与熔断门共用 mcpCallTargetServers。
-	function gapfillTicketGate(store: CompassStore, call: { toolName: string; input?: Record<string, unknown> }, strict: boolean): string | undefined {
+	// 网关 `mcp` 的哪些形态是真调用：带 tool 名的规范形态，或「参数被套进 args 里」的兼容形态。
+	// describe / search / 列工具 / instructions / ui-messages 不发请求、不花钱，计量侧也判不出 sample
+	function isGatewayCall(input: Record<string, unknown> | undefined): boolean {
+		if (typeof input?.tool === "string" && input.tool) return true;
+		if (!input || input.args === undefined) return false;
+		return !("describe" in input) && !("search" in input) && !("instructions" in input) && !("action" in input);
+	}
+
+	function gapfillTicketGate(store: CompassStore, call: { toolName: string; toolCallId?: string; input?: Record<string, unknown> }, strict: boolean): string | undefined {
 		const servers = mcpCallTargetServers(store, call);
 		if (!servers.length) return undefined;
+		// 不花钱的网关形态既不该被 strict 档拦，也不该预扣额度：预扣了没人退（那种结果没有 server，
+		// 退款分支认不出），一次 mcp({describe}) 就白吃掉运营批的一个额度（2026-09-05 评审核出）
+		if (call.toolName === "mcp" && !isGatewayCall(call.input)) return undefined;
 		const paid = servers.filter((server) => store.budgetPools.some((pool) => pool.source === server && pool.tier === "A"));
 		if (!paid.length) return undefined;
 		const ticket = activeGapfillTicket();
@@ -501,7 +517,13 @@ export default function compassExtension(pi: ExtensionAPI): void {
 		// 预扣必须发生在 tool_call。宿主同一轮的工具批次是「先把每个调用的 tool_call 判定跑完，
 		// 再 Promise.all 执行」，扣在 tool_result 的话同一批里的调用彼此看不见对方，
 		// 运营批的 3 次挡不住一批 6 个调用。纯内存自减，不破坏热路径纪律
-		if (covered) covered.remainingCalls -= 1;
+		if (covered) {
+			covered.remainingCalls -= 1;
+			if (call.toolCallId) {
+				if (deductedTicketCalls.size >= DEDUCTED_CALLS_MAX) deductedTicketCalls.delete(deductedTicketCalls.keys().next().value as string);
+				deductedTicketCalls.set(call.toolCallId, covered.server);
+			}
+		}
 		return undefined;
 	}
 
@@ -622,13 +644,16 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			const outcome = imported.screenRun?.result.outcome ?? "未运行";
 			const summary = `${imported.created ? "创建" : "更新"} ${imported.market.name}：${imported.parsed.listings.length} listings / ${imported.parsed.keywords.length} keywords；粗筛=${outcome}`;
 			return textResult(
-				`${summary}\nmarket_id=${imported.market.id}\ncandidate_id=${imported.candidate.id}\nsnapshot_id=${imported.snapshot.id}${imported.outcomeCheck ? `\noutcome_check_id=${imported.outcomeCheck.id}\nretro_verdict=${imported.outcomeCheck.verdict}` : ""}\nraw=${imported.archivedFile}\nwarnings=${imported.parsed.warnings.join("；") || "无"}`,
+				`${summary}\nmarket_id=${imported.market.id}\ncandidate_id=${imported.candidate.id}\nsnapshot_id=${imported.snapshot.id}${imported.outcomeCheck ? `\noutcome_check_id=${imported.outcomeCheck.id}\nretro_verdict=${imported.outcomeCheck.verdict}` : ""}\nraw=${imported.archivedFile}\nwarnings=${imported.snapshot.warnings.join("；") || "无"}`,
 				details({
 					title: "CSV 已入库",
 					status: imported.screenRun?.result.outcome === "reject" || imported.outcomeCheck?.verdict === "challenged" ? "warning" : "success",
 					summary,
 					path: imported.archivedFile,
-					lines: imported.parsed.warnings,
+					// 取 snapshot.warnings 而不是 parsed.warnings：后者只有解析告警，事务里追加的
+					// 「本次快照早于现有最新快照……读面仍用那份」不在其中——2026-09-05 冒烟时工具回
+					// 「warnings=无」，而花钱补来的快照其实根本没成为最新
+					lines: imported.snapshot.warnings,
 					data: resultData({
 						historyNote: importHistoryNote(imported.store, imported.market.id, imported.snapshot.id, imported.outcomeCheck),
 						gapNote: gapNoteFor(imported.store, imported.market.id, imported.candidate.id),
@@ -1612,13 +1637,20 @@ export default function compassExtension(pi: ExtensionAPI): void {
 					throw new Error(`确认单属于「${ticket.marketName}」（${ticket.marketId}），与 market_ref=${params.market_ref}（解析为「${market.name}」）不符。转换按确认单的市场进行；要转别的市场请先给它 approve。`);
 				}
 				const map = await loadSorftimeFieldMap(ctx);
-				const entries: McpPayloadEntry[] = mcpPayloads.since(ticket.server, ticket.issuedAt);
+				// 只收确认单批的那几个工具的返回：10 分钟窗口内同一 server 别的调用（keyword_list 之类的
+				// 返回体同样是带 keyword 列的 data[]）会被身份列过滤放进来当关键词行，静默混进这张快照
+				// （2026-09-05 评审核出）。工具名与 tool_call 的白名单同源，都来自映射表 chain
+				const entries: McpPayloadEntry[] = mcpPayloads.since(ticket.server, ticket.issuedAt).filter((entry) => ticket.tools.includes(entry.tool));
 				if (!entries.length) {
 					throw new Error(`确认单发出后没有收到任何 ${ticket.server} 返回：可能调用还没做，也可能中途 /reload 过（载荷缓存只活到 reload）。请重新调用后再转换。`);
 				}
-				// captured_at 用当天：本次调用拿的就是此刻的线上数据。Sorftime 返回体里没有可映射的
-				// 统计期字段（E0 已核），所以不去猜一个更早的日期——写早了会让新快照被判成旧于已有快照
-				const capturedDate = new Date().toISOString().slice(0, 10);
+				// captured_at 用这批载荷最后一次收到返回的**完整时间戳**：本次调用拿的就是此刻的线上数据，
+				// Sorftime 返回体里没有可映射的统计期字段（E0 已核），所以不去猜一个更早的日期。
+				// 不能只给 YYYY-MM-DD：导入侧把纯日期归一到 UTC 零点，同一 UTC 日早些时候手工导入的
+				// 快照会因此排在这批花钱补来的数据之前，看板 / 报告 / 粗筛继续用旧的（2026-09-05 冒烟实测）。
+				// 文件名仍按 mcp-<日期>-<slug>-<source>.csv 的约定只带日期。
+				const capturedAt = capturedAtForBatch(entries);
+				const capturedDate = capturedAt.slice(0, 10);
 				let result: Awaited<ReturnType<typeof convertSorftimePayloads>>;
 				try {
 					result = await convertSorftimePayloads(
@@ -1645,7 +1677,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 					result.unmappedFields.length ? `载荷里未映射的字段：${result.unmappedFields.slice(0, 12).join("、")}` : "载荷里没有未映射字段",
 					// source 必须显式写 sorftime：这份 CSV 是全英文表头，detectSource 会判成 generic_csv，
 					// 在已有的 sorftime 市场里凭空造出「多来源」，进而激活快照明细同步读与偏差待办
-					`下一步：compass_import_csv path=${result.csvPath} market_name="${ticket.marketName}" source=${ticket.server} captured_at=${capturedDate}`,
+					`下一步：compass_import_csv path=${result.csvPath} market_name="${ticket.marketName}" source=${ticket.server} captured_at=${capturedAt}`,
 				];
 				const summary = `${ticket.marketName} · listing ${result.listingRows} / 关键词 ${result.keywordRows}`;
 				return textResult([summary, ...lines].join("\n"), details({
@@ -1653,7 +1685,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 					status: "success",
 					summary,
 					lines,
-					data: resultData({ payload: { csvPath: result.csvPath, marketId: ticket.marketId, coverage: result.coverage, archivedRaw: result.archivedRaw, cleaned: result.cleaned } }),
+					data: resultData({ payload: { csvPath: result.csvPath, marketId: ticket.marketId, capturedAt, coverage: result.coverage, archivedRaw: result.archivedRaw, cleaned: result.cleaned } }),
 				}));
 			}
 			if (action === "plan") {
@@ -1823,6 +1855,8 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			ctx.ui.notify(
 				[
 					`${imported.market.name} 已导入；粗筛=${imported.screenRun?.result.outcome ?? "未运行"}${imported.outcomeCheck ? `；复盘=${imported.outcomeCheck.verdict} (${imported.outcomeCheck.id})` : ""}`,
+					// 快照级告警（含「早于现有最新快照」）也要在命令入口露出，与工具入口同口径
+					...imported.snapshot.warnings.map((warning) => `警告：${warning}`),
 					...(importGapNote.length ? ["【补数缺口】", ...importGapNote.map((line) => `· ${line}`)] : []),
 				].join("\n"),
 				imported.screenRun?.result.outcome === "reject" || imported.outcomeCheck?.verdict === "challenged" ? "warning" : "info",
@@ -2148,11 +2182,16 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			// 否则缓存抛错会把计量一起吞掉，变成「花了钱不记账」，那是最坏的方向。
 			// 这里同样零 I/O：溢写文件只记路径不读，文本只存不 parse（热路径纪律）。
 			try {
-				if (sample) {
-					mcpPayloads.remember(sample, event);
-					// 退还确认单额度与缓存载荷共用这一个 try：两者都是补数的便利设施，坏了都不该影响计量
-					if (!sample.billable) refundTicketCall(sample.server);
-				}
+				// 失败的调用（call_failed / aborted / tool_error）返回的是 adapter 的报错文本，不是载荷：
+				// 缓存下来 convert 只会拿到一段非 JSON 文本，这张确认单从此转不出去（2026-09-05 评审核出）。
+				// 计量不受影响——它在上面自己的分支里
+				if (sample && event.isError !== true) mcpPayloads.remember(sample, event);
+				// 退还确认单额度与缓存载荷共用这一个 try：两者都是补数的便利设施，坏了都不该影响计量。
+				// 按 tool_call 时预扣的那条记录退，计费的调用钱已经花了不退；没有 sample（init_failed 之类
+				// 没有 server 字段的结果）也要退，否则预扣的额度永远回不来
+				const deducted = deductedTicketCalls.get(event.toolCallId);
+				deductedTicketCalls.delete(event.toolCallId);
+				if (deducted !== undefined && sample?.billable !== true) refundTicketCall(deducted);
 			} catch {
 				// 缓存是补数的便利设施，坏了不影响计量与工具结果
 			}
@@ -2209,7 +2248,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 				if (blocked) return { block: true, reason: blocked.reason };
 				// 补数确认门：strict 档给拒绝理由，任何档位都做额度预扣。排在熔断门**之后**——
 				// 熔断是硬边界，拿着确认单也不该越过；确认单只回答「这次调用有没有经过人」
-				const refusal = gapfillTicketGate(store, { toolName: event.toolName, input: event.input as Record<string, unknown> | undefined }, fillMode === "strict");
+				const refusal = gapfillTicketGate(store, { toolName: event.toolName, toolCallId: event.toolCallId, input: event.input as Record<string, unknown> | undefined }, fillMode === "strict");
 				if (refusal) return { block: true, reason: refusal };
 			}
 			// compass_gaps 的付费 action 拦截。它不匹配任何池前缀，进不了上面那个预过滤分支，

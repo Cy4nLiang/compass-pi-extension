@@ -42,7 +42,7 @@ A 档补数（`compass_gaps approve` / `convert` + `gapfill-convert.ts`）另有
 - **确认单只有一张，且是内存的**：`gapfillTicket` 是 `index.ts` 里的单变量而不是 Map——「同一时刻只有一张」若靠 Map 就成了要自觉遵守的约定。它只活到 `/reload`；`activeGapfillTicket()` **只按过期判有效、不看剩余次数**，因为次数用尽的单子仍是这一批的身份证（convert 靠 `issuedAt` 界定哪些载荷属于这批）。次数是调用额度，过期才是生命周期。
 - **扣额度与拿到载荷解耦**：被熔断门 block 的调用根本不经过 `tool_result`（pi 走 `kind:"immediate"`，不计量也不扣额），而超时 / 中断的调用计费但零载荷。所以「扣了一次却没有载荷」是正常形态，不是异常。
 - **完整快照原则**：convert 必须在同一张确认单内**同时**拿到 listing 与关键词两份载荷才写 CSV。实测负向对照：只有关键词行时 21 个指标只剩 4 个，只有 listing 行时丢 `main_cpc` 等 3 个，而**三种情况 `parseMarketCsv` 的告警数都是 0**——残缺快照会静默抹掉指标。
-- **映射表在宿主工作区、不在本仓库**（本仓库是公开的）：缺失或结构不全一律抛错**不降级**，且校验要在 approve 花掉真实调用**之前**跑（`parseSorftimeFieldMap` 连列名是否在 `CSV_ALIAS_HEADERS` 里都查）。转出的 CSV 是全英文表头，导入时必须显式 `source=sorftime`，否则 `detectSource` 判成 `generic_csv`，在已有的 sorftime 市场里凭空造出「多来源」。
+- **映射表在宿主工作区、不在本仓库**（本仓库是公开的）：缺失或结构不全一律抛错**不降级**，且校验要在 approve 花掉真实调用**之前**跑（`parseSorftimeFieldMap` 连列名是否在 `CSV_ALIAS_HEADERS` 里都查）。转出的 CSV 是全英文表头，导入时必须显式 `source=sorftime`，否则 `detectSource` 判成 `generic_csv`，在已有的 sorftime 市场里凭空造出「多来源」。convert 给出的 `captured_at` 必须是**完整 ISO 时间戳**（`capturedAtForBatch`：这批载荷最后一次收到返回的时刻），不能只给 `YYYY-MM-DD`——导入侧把纯日期归一到 UTC 零点，而「最新快照」按 (capturedAt, importedAt) 比，同一 UTC 日早些时候手工导入的快照会把花钱补来的这份压成「旧快照」（2026-09-05 真实冒烟实测；`tests/importer.test.ts` 有正反两向用例）。导入入口（工具与 `/compass-import`）露出的 warnings 取 `snapshot.warnings` 而非 `parsed.warnings`，否则这条「早于最新快照」的告警会被吞掉。
 
 新增工具时：在 `catalog.ts` 同时更新 `DOMAIN_TOOLS` 与 `TOOL_CATALOG`（`compass_tools` 的动态激活检索依赖后者，打分逻辑在同文件的 `rankTools`），并同步 README 工具表与 SKILL.md。`tests/tool-catalog.test.ts` 会比对 `index.ts` 里 `registerTool` 的工具名与 `DOMAIN_TOOLS`，漏登记/重复登记会直接测试红。
 

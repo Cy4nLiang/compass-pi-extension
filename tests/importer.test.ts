@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { snapshotsForMarket } from "../history.ts";
+import { capturedAtForBatch } from "../gapfill-convert.ts";
 import { normalizeCapturedAt, performCsvImport, type CsvImportDeps } from "../importer.ts";
 import { ensureDefaults, generateMarketReport, latestSnapshotIfPresent, scanMarkets } from "../service.ts";
 import { CompassRepository } from "../store.ts";
@@ -207,3 +208,33 @@ test("同日重导的修正版快照在所有读面胜出（capturedAt 相同则
 	}
 });
 
+
+// —— 2026-09-05 真实冒烟回归：同一 UTC 日先手工导入，再按 convert 的口径导入 sorftime ——
+test("同一 UTC 日先手工导入，再以 convert 给的完整时间戳导入 sorftime：sorftime 快照成为最新；只给纯日期则被判旧", async () => {
+	const { root, deps, csvPath } = await setupProject();
+	try {
+		// 手工导入按导入时刻记 capturedAt（钉成同一 UTC 日的上午；取值全部虚构，与任何真实市场无关）
+		const manual = await performCsvImport(deps, { path: csvPath, marketName: "demo yoga strap smoke", source: "generic_csv", capturedAt: "2026-09-04T09:00:00.000Z", actor: "tester", runScreen: false });
+		const base = await readFile(csvPath, "utf8");
+
+		const paidPath = join(root, "paid.csv");
+		await writeFile(paidPath, `${base}B0DEMO7777,Paid Row,26,11.99,4.0,10,40,Extra,Third Party,3,Sports & Outdoors,paid kw,100,0.5\n`);
+		const capturedAt = capturedAtForBatch([{ receivedAt: "2026-09-04T15:30:00.000Z" }]);
+		const paid = await performCsvImport(deps, { path: paidPath, marketName: "demo yoga strap smoke", source: "sorftime", capturedAt, actor: "tester", runScreen: false });
+		assert.deepEqual(paid.snapshot.warnings, [], "完整时间戳晚于手工快照，不得带「早于」告警");
+		assert.equal(latestSnapshotIfPresent(await deps.repo.load(), paid.market.id)?.id, paid.snapshot.id, "花钱补来的 sorftime 快照必须成为最新");
+		assert.notEqual(manual.snapshot.id, paid.snapshot.id);
+
+		// 对照：同一天只给 YYYY-MM-DD 会被归一到 UTC 零点，压不过 09:00Z 的手工快照——这就是冒烟撞到的形状
+		const datedPath = join(root, "dated.csv");
+		await writeFile(datedPath, `${base}B0DEMO6666,Dated Row,26,11.99,4.0,10,40,Extra,Third Party,3,Sports & Outdoors,dated kw,100,0.5\n`);
+		const dated = await performCsvImport(deps, { path: datedPath, marketName: "demo yoga strap smoke", source: "sorftime", capturedAt: "2026-09-04", actor: "tester", runScreen: false });
+		const recency = dated.snapshot.warnings.find((warning) => warning.includes("早于"));
+		assert.ok(recency, JSON.stringify(dated.snapshot.warnings));
+		// 两边同一天：告警必须露出完整时间戳，不能写成「2026-09-04 早于 2026-09-04」
+		assert.ok(recency.includes("2026-09-04T00:00:00.000Z") && recency.includes(`${paid.snapshot.id}（2026-09-04T15:30:00.000Z）`), recency);
+		assert.equal(latestSnapshotIfPresent(await deps.repo.load(), dated.market.id)?.id, paid.snapshot.id, "纯日期导入不得夺走「最新」");
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});

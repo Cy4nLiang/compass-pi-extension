@@ -120,7 +120,7 @@ test("补数确认门：hook 不重复注册、compass_gaps 串行、额度预�
 	const toolResult = hookBodies(source).get("tool_result");
 	assert.ok(toolResult, 'index.ts 里找不到 pi.on("tool_result")');
 	assert.equal(/remainingCalls\s*-=/u.test(toolResult), false, "额度预扣不能留在 tool_result：同一批并行调用会全部放行");
-	assert.match(toolResult, /if \(!sample\.billable\) refundTicketCall\(/u, "只有不计费的失败才退额度：计费的调用钱已经花了");
+	assert.match(toolResult, /if \(deducted !== undefined && sample\?\.billable !== true\) refundTicketCall\(deducted\);/u, "只有 tool_call 预扣过且这次不计费的调用才退额度：计费的调用钱已经花了；没有 sample 的结果（init_failed）也要退");
 
 	const gateStart = source.indexOf("function gapfillTicketGate(");
 	const gateEnd = source.indexOf("function refundTicketCall(");
@@ -325,4 +325,65 @@ test("compass_gaps 与 compass-fill 各自按 PI_LAN_SHARED 二次判定", async
 	// 命令 handler 会落盘档位，必须注册在所有 pi.on 之前——否则会被 hookBodies 切进某个热路径 hook
 	const firstHook = source.search(/^\tpi\.on\("/mu);
 	assert.ok(commandStart < firstHook, "/compass-fill 必须注册在所有 pi.on(...) 之前（它的 handler 带写事务标记）");
+});
+
+// —— 2026-09-05 真实冒烟暴露的两处展示层缺陷（A 档链路第一次在真实 TUI 里跑到底时发现）——
+test("convert 的下一步指令给完整时间戳的 captured_at，不给纯日期", async () => {
+	const source = await readFile(join(repoRoot, "index.ts"), "utf8");
+	const body = toolBody(source, "compass_gaps");
+	const start = body.indexOf('if (action === "convert")');
+	const end = body.indexOf('if (action === "plan")', start);
+	assert.ok(start > 0 && end > start, "抽不到 convert 分支——切片已失效");
+	const convert = body.slice(start, end);
+	assert.match(convert, /const capturedAt = capturedAtForBatch\(entries\);/u, "capturedAt 必须来自这批载荷的接收时刻（完整 ISO）");
+	assert.match(convert, /const capturedDate = capturedAt\.slice\(0, 10\);/u, "文件名仍只带日期，但要从同一个时间戳派生");
+	assert.match(convert, /captured_at=\$\{capturedAt\}/u, "下一步指令必须写完整时间戳");
+	assert.doesNotMatch(convert, /captured_at=\$\{capturedDate\}/u, "纯日期会被导入侧归一到 UTC 零点，同一 UTC 日早些时候的快照会压过这批花钱补来的数据");
+	assert.doesNotMatch(convert, /new Date\(\)\.toISOString\(\)\.slice\(0, 10\)/u, "不要再在 convert 里自己取「当天」");
+});
+
+test("compass_import_csv 与 /compass-import 露出快照级告警（含「早于现有最新快照」），不只露解析告警", async () => {
+	const source = await readFile(join(repoRoot, "index.ts"), "utf8");
+	const tool = toolBody(source, "compass_import_csv");
+	assert.match(tool, /warnings=\$\{imported\.snapshot\.warnings\.join\("；"\) \|\| "无"\}/u, "工具正文的 warnings= 要取 snapshot.warnings");
+	assert.match(tool, /lines: imported\.snapshot\.warnings,/u, "details.lines 要取 snapshot.warnings（follower 与 TUI 渲染读它）");
+	assert.doesNotMatch(tool, /imported\.parsed\.warnings/u, "parsed.warnings 只有解析告警，会把「早于最新快照」这条吞掉");
+	const commandStart = source.indexOf('pi.registerCommand("compass-import"');
+	assert.notEqual(commandStart, -1, "找不到 /compass-import 的注册块");
+	const command = source.slice(commandStart, source.indexOf("pi.registerCommand(", commandStart + 10));
+	assert.match(command, /\.\.\.imported\.snapshot\.warnings\.map\(\(warning\) => `警告：\$\{warning\}`\),/u, "斜杠命令的 notify 也要带快照级告警");
+});
+
+test("tool_result 不缓存失败调用的返回：那是 adapter 的报错文本，不是载荷", async () => {
+	const source = await readFile(join(repoRoot, "index.ts"), "utf8");
+	const body = hookBodies(source).get("tool_result");
+	assert.ok(body, "找不到 tool_result 片段");
+	assert.match(body, /if \(sample && event\.isError !== true\) mcpPayloads\.remember\(sample, event\);/u, "失败调用（call_failed / aborted / tool_error）不得进载荷缓存，否则 convert 会拿到非 JSON 文本");
+	// 退额度不受这个条件影响：它在缓存之后、同一个 try 里，按 tool_call 的预扣记录判
+	assert.match(body, /const deducted = deductedTicketCalls\.get\(event\.toolCallId\);/u);
+	assert.match(body, /if \(deducted !== undefined && sample\?\.billable !== true\) refundTicketCall\(deducted\);/u);
+});
+
+test("确认门：不花钱的网关形态不预扣、convert 只收确认单批的工具的返回", async () => {
+	const source = await readFile(join(repoRoot, "index.ts"), "utf8");
+	const gateStart = source.indexOf("function gapfillTicketGate(");
+	const gateEnd = source.indexOf("function refundTicketCall(");
+	assert.ok(gateStart > 0 && gateEnd > gateStart, "抽不到 gapfillTicketGate 的函数体——切片已失效");
+	const gate = source.slice(gateStart, gateEnd);
+	// describe / search / 列工具不发请求也不花钱；预扣了没人退（那种结果没有 server），一次 mcp({describe}) 就白吃一个额度
+	assert.match(gate, /if \(call\.toolName === "mcp" && !isGatewayCall\(call\.input\)\) return undefined;/u, "非调用形态的网关请求必须在预扣与 strict 拦截之前放行");
+	assert.match(gate, /deductedTicketCalls\.set\(call\.toolCallId, covered\.server\);/u, "预扣要按 toolCallId 记账，tool_result 才退得回来");
+	const helperStart = source.indexOf("function isGatewayCall(");
+	assert.ok(helperStart > 0, "找不到 isGatewayCall");
+	const helper = source.slice(helperStart, gateStart);
+	assert.match(helper, /"describe" in input/u);
+	assert.match(helper, /"search" in input/u);
+
+	const body = toolBody(source, "compass_gaps");
+	const start = body.indexOf('if (action === "convert")');
+	const end = body.indexOf('if (action === "plan")', start);
+	assert.ok(start > 0 && end > start, "抽不到 convert 分支——切片已失效");
+	const convert = body.slice(start, end);
+	// 窗口内同一 server 别的调用（keyword_list 之类）返回体同样是带 keyword 列的 data[]，不按工具名过滤就混进快照
+	assert.match(convert, /mcpPayloads\.since\(ticket\.server, ticket\.issuedAt\)\.filter\(\(entry\) => ticket\.tools\.includes\(entry\.tool\)\)/u, "convert 只收确认单批的工具的返回");
 });

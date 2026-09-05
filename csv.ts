@@ -370,6 +370,7 @@ function parseBoolean(value: string | undefined): boolean | undefined {
 
 const EXCEL_SERIAL_PATTERN = /^\d{5}(?:\.\d+)?$/u;
 const DOTTED_DATE_PATTERN = /^\d{4}\.\d{1,2}\.\d{1,2}$/u;
+const CALENDAR_DATE_PATTERN = /^(\d{4})-(\d{1,2})-(\d{1,2})$/u;
 const MIN_PLAUSIBLE_YEAR = 1990;
 const MAX_PLAUSIBLE_YEAR = 2100;
 
@@ -379,6 +380,38 @@ function plausibleIso(timestamp: number): string | undefined {
 	const year = date.getUTCFullYear();
 	if (year < MIN_PLAUSIBLE_YEAR || year > MAX_PLAUSIBLE_YEAR) return undefined;
 	return date.toISOString();
+}
+
+// 中文 / 斜杠 / 点号纯日期归一成 "YYYY-M-D"；点号只在「纯日期」形态下替换，避免打断 ISO 毫秒与秒小数。
+function normalizeCalendarText(trimmed: string): string {
+	let normalized = trimmed
+		.replace(/[年月]/gu, "-")
+		.replace(/日/gu, "")
+		.replace(/\//gu, "-")
+		.trim();
+	if (DOTTED_DATE_PATTERN.test(normalized)) normalized = normalized.replace(/\./gu, "-");
+	return normalized;
+}
+
+/**
+ * 纯日期（零填充与否、`-` / `/` / `.` / 中文年月日）→ UTC 零点的毫秒值，与运行机器时区无关。
+ * 形态不是纯日期返回 undefined（交给调用方走别的解析路径）；形态是纯日期但日期不存在
+ * （2024-02-30、2024/4/31）返回 NaN——按「不伪造月龄」原则判缺失，不让 V8 悄悄进位到下月 1 日。
+ *
+ * 为什么不能靠 Date.parse：只有零填充的 "2025-01-01" 是 ECMAScript 的 ISO 形态、按 UTC 零点解释；
+ * "2025-1-1" 这类非零填充串会落到 V8 的旧版解析器、按本机**本地**零点解释，UTC+8 下历日少一天、
+ * 每月 1 号上架的行月龄多一个月，同一份 CSV 的 new_listing_share_12m 随机器时区变化（D-1 缺陷组 ③）。
+ */
+export function calendarDateUtcMs(value: string): number | undefined {
+	const match = CALENDAR_DATE_PATTERN.exec(normalizeCalendarText(value.normalize("NFKC").trim()));
+	if (!match) return undefined;
+	const year = Number(match[1]);
+	const month = Number(match[2]);
+	const day = Number(match[3]);
+	const ms = Date.UTC(year, month - 1, day);
+	const date = new Date(ms);
+	if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day) return Number.NaN;
+	return ms;
 }
 
 function parseDate(value: string | undefined): string | undefined {
@@ -396,16 +429,14 @@ function parseDate(value: string | undefined): string | undefined {
 		}
 	}
 
-	// 中文/斜杠日期归一；点号只在「纯日期」形态下替换，避免打断 ISO 毫秒与秒小数。
-	// 归一必须排在 Date.parse(原串) 之前：直接解析 "2024/10/01" 会按本地零点算，
-	// 与既有的 UTC 零点语义差一个时区，每月 1 号的月龄会整整差一个月。
-	let normalized = trimmed
-		.replace(/[年月]/gu, "-")
-		.replace(/日/gu, "")
-		.replace(/\//gu, "-")
-		.trim();
-	if (DOTTED_DATE_PATTERN.test(normalized)) normalized = normalized.replace(/\./gu, "-");
-	return plausibleIso(Date.parse(normalized)) ?? plausibleIso(Date.parse(trimmed));
+	// 纯日期一律显式按 UTC 零点构造（见 calendarDateUtcMs），排在任何 Date.parse 之前；
+	// 回卷日期得到 NaN → plausibleIso 返回 undefined → 判缺失。
+	const calendar = calendarDateUtcMs(trimmed);
+	if (calendar !== undefined) return plausibleIso(calendar);
+
+	// 其余形态（带时间、带时区、英文月名）保持原有顺序：归一串在前、原串兜底（M22：
+	// 不能先 Date.parse 原串，否则 "2024/10/01 10:20" 这类会按本地时间算）。
+	return plausibleIso(Date.parse(normalizeCalendarText(trimmed))) ?? plausibleIso(Date.parse(trimmed));
 }
 
 function monthsSince(date: string, capturedAt: string): number | undefined {

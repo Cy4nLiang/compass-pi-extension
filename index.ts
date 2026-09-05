@@ -626,7 +626,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			market_name: Type.String({ minLength: 1, description: "细分市场/关键词族名称" }),
 			source: Type.Optional(StringEnum(SNAPSHOT_SOURCES)),
 			keywords: Type.Optional(Type.Array(Type.String())),
-			captured_at: Type.Optional(Type.String({ description: "采集时间，默认当前时间。口径（批次三的显式契约）：`YYYY-MM-DD` 按 UTC 零点解释；带时区的完整 ISO（如 2026-09-01T10:00:00+08:00）按其时区解释；**`YYYY/MM/DD` 与不带时区的 ISO 按运行机器的本地时区解释**——UTC+8 下 `2026/09/01` 会落到 `2026-08-31T16:00Z`，即前一个 UTC 日，可能导致新导入被判定为旧于已有快照。要跨机器一致请始终用 `YYYY-MM-DD` 或带时区的完整 ISO。取值须落在 [2000-01-01, 当前时间+36 小时] 内。" })),
+			captured_at: Type.Optional(Type.String({ description: "采集时间，默认当前时间。口径：纯日期（`YYYY-MM-DD`、`YYYY/M/D`、`YYYY.M.D`、`YYYY年M月D日`，零填充与否都行）一律按 UTC 零点解释、与运行机器时区无关；带时区的完整 ISO（如 2026-09-01T10:00:00+08:00）按其时区解释；**不带时区的日期时间**（如 2026-09-01 10:00）按运行机器的本地时区解释——要跨机器一致请用纯日期或带时区的完整 ISO。不存在的日期（2 月 30 日）拒绝。取值须落在 [2000-01-01, 当前时间+36 小时] 内。" })),
 			run_screen: Type.Optional(Type.Boolean({ description: "导入后运行默认粗筛 Gate；默认 true" })),
 			actor: Type.Optional(Type.String()),
 		}),

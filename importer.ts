@@ -1,6 +1,6 @@
 import { readFile, stat, unlink } from "node:fs/promises";
 import { basename, join, relative } from "node:path";
-import { decodeCsvBuffer, parseMarketCsv } from "./csv.ts";
+import { calendarDateUtcMs, decodeCsvBuffer, parseMarketCsv } from "./csv.ts";
 import { findDuplicateImport, importContentHash, importMarketAndScreen } from "./service.ts";
 import type { CompassRepository } from "./store.ts";
 import type { CompassStore } from "./types.ts";
@@ -41,7 +41,15 @@ const CAPTURED_AT_MIN_MS = Date.UTC(2000, 0, 1);
 // load 与 save 跑同一份 assertStore，收紧后存量脏记录会让 store 既读不出也写不进。
 export function normalizeCapturedAt(value?: string, now = Date.now()): string {
 	if (!value) return new Date(now).toISOString();
-	const date = new Date(value);
+	// 纯日期（含 YYYY/M/D、点号、中文）与 csv.ts 的上架日期同口径：显式按 UTC 零点构造，
+	// 不经 new Date(原串)——后者对非 ISO 形态按本机本地零点解释，UTC+8 下 "2026/09/01"
+	// 会落到前一 UTC 日、被同日早些时候的快照压成「旧快照」（D-1 缺陷组 ③）。
+	// 回卷日期（2 月 30 日）得到 NaN：单独报「日期不存在」，别让运营误以为是斜杠形态不被接受。
+	const calendar = calendarDateUtcMs(value);
+	if (calendar !== undefined && Number.isNaN(calendar)) {
+		throw new Error(`captured_at 日期不存在：${value}；请核对月份与日期后重导`);
+	}
+	const date = calendar === undefined ? new Date(value) : new Date(calendar);
 	const time = date.getTime();
 	if (!Number.isFinite(time)) throw new Error(`captured_at 无效：${value}；请使用合法的 ISO 时间`);
 	if (time > now + CAPTURED_AT_MAX_AHEAD_MS) {

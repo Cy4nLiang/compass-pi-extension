@@ -235,9 +235,12 @@ function verdictStats(store: CompassStore) {
 		challenged: stats.challenged,
 		inconclusive: stats.inconclusive,
 		activeLessons: store.lessons.filter((lesson) => lesson.status === "active").length,
-		// 比率样本（市场数）与无决策锚点条数一并带出，前端要能说清「对照次数 ≠ 比率分母」
+		// 披露四桶一并带出（comparable + strategyOnly + waitlistAnchored + inconclusive === checks），
+		// 前端要能说清「对照次数 ≠ 比率分母」且每条不计入的对照都有归属，不再把 strategyOnly 当「不计入」全集
 		ratedMarkets: stats.ratedMarkets,
+		comparable: stats.comparable,
 		strategyOnly: stats.strategyOnly,
+		waitlistAnchored: stats.waitlistAnchored,
 		// 无可判样本时为 null（前端显示 —）
 		validationRate: stats.validationRate,
 	};

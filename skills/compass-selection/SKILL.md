@@ -140,7 +140,7 @@ description: Amazon US 中小卖家精铺选品工作流。用于市场 CSV 导�
 
 - 先用 `compass_retro(action="due")` 看逾期对象，或运行 `/compass-retro` 进入交互式复盘会。
 - go/testing 品用 `record_actuals` 录入日销、TACOS、退货率、净利率；日销达到策略目标 70% 且净利为正才记为 validated，低于 40% 或净利为负记为 challenged，字段不足则 inconclusive。
-- no_go/waitlist 在新快照到场后用 `check` 回看；疑似错杀仍须人工确认后再 `compass_pool move`。
+- no_go 在新快照到场后用 `check` 重放当时规则；waitlist 的 `check` 只记录市场变化、恒为 inconclusive，是否升级重评由人判断；疑似错杀仍须人工确认后再 `compass_pool move`。
 - 调策略前先用 `backtest` 比较 `strategy_id` 与 `baseline_strategy_id`（支持 `id@vN`），验证翻转矩阵和后验对齐率，再保存新版本。对齐率的分母只算给出 `pass`/`reject` 的样本，`review` 记为弃权单列；同时看「覆盖」，覆盖不足一半时结论不可用。
 - 经验只通过 `save_lesson` 保存，evidence 必须非空；过时经验用 `retire_lesson` 并填写 reason，不删除。
 

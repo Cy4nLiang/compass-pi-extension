@@ -137,6 +137,17 @@ function formatMoney(amount) {
 	return `¥${(Number(amount) || 0).toFixed(2)}`;
 }
 
+// 复盘页「验证率」卡副文案：可判对照去重情况 + 不计入的三桶（0 的桶省略）。
+// 口径唯一所有者是 history.outcomeStatistics，这里只拼字；四桶之和等于对照次数（D-1 缺陷组 ①）。
+function retroExclusionNote(s) {
+	const excluded = [
+		s.strategyOnly ? `无决策锚点 ${s.strategyOnly} 条` : "",
+		s.waitlistAnchored ? `waitlist 锚点 ${s.waitlistAnchored} 条` : "",
+		s.inconclusive ? `inconclusive ${s.inconclusive} 条` : "",
+	].filter(Boolean);
+	return `可判对照 ${s.comparable ?? 0} 条去重为 ${s.ratedMarkets ?? 0} 个市场${excluded.length ? `；不计入：${excluded.join("、")}` : ""}`;
+}
+
 function formatPercent(rate, digits = 0) {
 	if (rate === null || rate === undefined || Number.isNaN(rate)) return "—";
 	return `${(rate * 100).toFixed(digits)}%`;
@@ -1149,7 +1160,7 @@ function buildRetroHtml(data) {
 			<div class="kpi-card">
 				<div class="kpi-label">验证率</div>
 				<div class="kpi-value ${s.validationRate === null ? "cell-muted" : ""}">${formatPercent(s.validationRate)}</div>
-				<div class="kpi-sub">只统计挂到人工决策的对照，按市场去重：每市场取最新一条可判对照（样本 ${s.ratedMarkets} 个市场）${s.strategyOnly ? `；另有 ${s.strategyOnly} 条无决策锚点不计入` : ""}</div>
+				<div class="kpi-sub">只统计挂到人工决策的对照，按市场去重（每市场取最新一条可判对照）：${retroExclusionNote(s)}</div>
 			</div>
 		</div>
 		<div style="display:grid; grid-template-columns: 1fr 1fr; gap:14px; flex:1 1 auto; min-height:0;">

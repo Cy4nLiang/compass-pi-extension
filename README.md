@@ -160,7 +160,7 @@ Sorftime 等 MCP 在线调用由罗盘自动计量（按次计入 `sorftime` 预
 
 ## 历史与复盘
 
-**该市场已有人工决策留痕（`compass_pool decide`）**、且新快照与该决策的基线快照相隔至少 7 天时，导入流程会自动重放 `no_go` 的原 veto/fail 规则并写入 `OutcomeCheck`；从未做过决策的市场不会自动对照——需要看「策略结论本身站不站得住」时，用 `compass_retro action=check` 显式发起。「验证率」只统计挂到人工决策锚点的对照，无锚点的策略自我对照单列、不进比率。`validated` 表示既有判断得到后验支持，`challenged` 只表示建议人工复看，`inconclusive` 表示证据不足；系统不会自动翻转候选决策。go 品应通过 `compass_retro action=record_actuals` 录入日销、TACOS、退货率和净利率。验证率、go 达成率、no_go 正确率与错杀率**按市场去重**：同一市场刷再多次快照也只取最新一条可判对照、只算一票，无决策锚点与 `inconclusive` 的对照不计入；对照次数单独列出，与 `compass_retro action=backtest` 的一致率同口径。
+**该市场已有人工决策留痕（`compass_pool decide`）**、且新快照与该决策的基线快照相隔至少 7 天时，导入流程会自动重放 `no_go` 的原 veto/fail 规则并写入 `OutcomeCheck`；从未做过决策的市场不会自动对照——需要看「策略结论本身站不站得住」时，用 `compass_retro action=check` 显式发起。「验证率」只统计挂到人工决策锚点的对照，无锚点的策略自我对照单列、不进比率。`validated` 表示既有判断得到后验支持，`challenged` 只表示建议人工复看，`inconclusive` 表示证据不足；系统不会自动翻转候选决策。go 品应通过 `compass_retro action=record_actuals` 录入日销、TACOS、退货率和净利率。验证率、go 达成率、no_go 正确率与错杀率**按市场去重**：同一市场刷再多次快照也只取最新一条可判对照、只算一票；无决策锚点、waitlist 锚点（没有可比的期望结果）与 `inconclusive` 的对照都不计入，报告 §1 分桶给出各自条数，四桶之和等于对照次数；对照次数单独列出，与 `compass_retro action=backtest` 的一致率同口径。
 
 Lesson 必须关联现存的 `chk_*`、`dec_*` 或 `run_*` evidence。默认复盘周期为 go 30 天、testing 停留 60 天、waitlist 45 天、no_go 抽样 90 天、review 30 天，可在策略 `meta` 中调整。罗盘会按选品意图注入有预算上限的历史速览；直接读取 `store.json`/快照 sidecar 会被护栏拦截，请使用 `compass_history`。
 

@@ -138,8 +138,15 @@ export interface OutcomeStats {
 	conclusive: number;
 	/** 四率的分母：每个市场最新一条可判 check 只算一票（与 backtest alignment 同口径） */
 	ratedMarkets: number;
-	/** 无人工决策锚点的条数：策略自我对照，只留档不进任何比率 */
+	/**
+	 * 披露四桶（D-1 缺陷组 ①）：每条 check 恰好落进一桶，恒等式 total = comparable + strategyOnly + waitlistAnchored + inconclusive。
+	 * comparable = 可判对照条数（去重前，isComparableCheck）；comparable − ratedMarkets 就是同市场重复对照被去掉的条数。
+	 */
+	comparable: number;
+	/** 无人工决策锚点且结论 conclusive 的条数：策略自我对照，只留档不进任何比率（inconclusive 的归 inconclusive 桶，不双计） */
 	strategyOnly: number;
+	/** waitlist 锚点且结论 conclusive 的条数：waitlist 没有可比的期望结果，不进四率，但必须披露（之前两头落空） */
+	waitlistAnchored: number;
 	validated: number;
 	challenged: number;
 	inconclusive: number;
@@ -676,11 +683,17 @@ export function outcomeStatistics(store: CompassStore, checks = store.outcomeChe
 		group[check.verdict]++;
 		groups.set(strategy, group);
 	}
+	// 披露四桶互斥：inconclusive 先归 inconclusive 桶，其余按锚点分——无锚点 / waitlist / 可判（go、no_go）
+	const comparable = checks.filter(isComparableCheck).length;
+	const strategyOnly = checks.filter((check) => check.verdict !== "inconclusive" && check.decisionStatus === undefined).length;
+	const waitlistAnchored = checks.filter((check) => check.verdict !== "inconclusive" && check.decisionStatus === "waitlist").length;
 	return {
 		total: checks.length,
 		conclusive,
 		ratedMarkets: rated.length,
-		strategyOnly: checks.filter((check) => check.decisionStatus === undefined).length,
+		comparable,
+		strategyOnly,
+		waitlistAnchored,
 		validated,
 		challenged,
 		inconclusive,
@@ -1004,7 +1017,7 @@ export function renderRetroReport(
 		"",
 		`- 决策分布：go ${distribution.go} / waitlist ${distribution.waitlist} / no_go ${distribution.no_go}。`,
 		`- 平均决策周期：${averageCycle === null ? "—" : `${averageCycle.toFixed(1)} 天`}。`,
-		`- 验证率：${percent(stats.validationRate)}；go 达成率：${percent(stats.goAttainmentRate)}；no_go 正确率：${percent(stats.noGoAccuracyRate)}；错杀率：${percent(stats.falseKillRate)}（四率按市场去重，样本 ${stats.ratedMarkets} 个市场；无决策锚点与 inconclusive 不计入）。`,
+		`- 验证率：${percent(stats.validationRate)}；go 达成率：${percent(stats.goAttainmentRate)}；no_go 正确率：${percent(stats.noGoAccuracyRate)}；错杀率：${percent(stats.falseKillRate)}（四率按市场去重：可判对照 ${stats.comparable} 条去重为 ${stats.ratedMarkets} 个市场；不计入：无决策锚点 ${stats.strategyOnly} 条、waitlist 锚点 ${stats.waitlistAnchored} 条、inconclusive ${stats.inconclusive} 条）。`,
 		`- 结论分布（按对照次数 ${stats.total} 次）：validated ${stats.validated} / challenged ${stats.challenged} / inconclusive ${stats.inconclusive}。`,
 		"",
 		"## 2. 逐项对照",

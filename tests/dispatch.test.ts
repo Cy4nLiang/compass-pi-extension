@@ -432,3 +432,79 @@ test("模型未配置 / 无鉴权：没有注册表时不谎报「已发往主�
 	assert.match(text, /没有模型注册表/u);
 	assert.equal(dispatchCounters().calls, 0, "根本没发出请求，不该吃掉一格会话额度");
 });
+
+// —— 2026-09-06 真实冒烟核出的两条（notes/2026-09-06-compass-dispatch-smoke-result.md）——
+
+test("evidence 比对放宽首字母大小写与印刷体标点：真实冒烟里四次失败全是这两类，句子都在材料里", () => {
+	// 只照搬真实材料撞到的**形态**，正文一律虚构（本仓库公开，CI 日志会把实参打到公网上）：
+	// ① 材料句首大写，模型当句中引文引用时改成小写；② 材料用弯引号 ‘，模型规范化成直引号 '；
+	// ③ 材料用破折号与省略号，模型写成 ASCII 的 - 与 ...
+	const material = JSON.stringify({
+		kind: "review_material",
+		asins: ["B0DEMO0001"],
+		reviews: [
+			{ asin: "B0DEMO0001", title: "t1", body: "The demo bracket is so flimsy and the clip is weak." },
+			{ asin: "B0DEMO0001", title: "t2", body: "Resin not metal don‘t be fooled." },
+			{ asin: "B0DEMO0001", title: "t3", body: "Well the demo listing said 6 pack — only received 4pcs…" },
+		],
+	});
+	const context = { materialText: material, materialAsins: ["B0DEMO0001"] };
+	const withEvidence = (quote: string) => ({
+		source_asins: ["B0DEMO0001"],
+		review_count: 3,
+		themes: [{ name: "塑料脆弱", category: "quality", count: 1, fixability: "factory", evidence: [quote] }],
+		estimated_rating: null,
+	});
+	assert.deepEqual(validateReviewClusterer(withEvidence("the demo bracket is so flimsy"), context), [], "句首大小写不同不算改写");
+	assert.deepEqual(validateReviewClusterer(withEvidence("resin not metal don't be fooled"), context), [], "弯引号被规范成直引号不算改写");
+	assert.deepEqual(validateReviewClusterer(withEvidence("well the demo listing said 6 pack - only received 4pcs..."), context), [], "破折号与省略号被规范成 ASCII 不算改写");
+	assert.deepEqual(validateReviewClusterer(withEvidence("The demo bracket is so flimsy"), context), [], "原样照抄当然也要通过");
+	// 放宽不能放到「编的也算」：这是 grounding 的全部价值
+	const fabricated = validateReviewClusterer(withEvidence("the demo hinge rusted in a week"), context);
+	assert.equal(fabricated.length, 1, `编造的句子必须判失败，实得：${fabricated.join("；")}`);
+	assert.match(fabricated[0] ?? "", /不是材料里的原句/u);
+});
+
+test("review_count 必须等于材料里的评论行数：少报会让 share 分母偏小、写回条数也错", () => {
+	const context = { materialText: MATERIAL_TEXT, materialAsins: ["B0DEMO0001"] };
+	const withCount = (count: number) => ({
+		source_asins: ["B0DEMO0001"],
+		review_count: count,
+		themes: [{ name: "拉链易坏", category: "quality", count: 1, fixability: "factory", evidence: [MATERIAL_QUOTE] }],
+		estimated_rating: null,
+	});
+	assert.deepEqual(validateReviewClusterer(withCount(2), context), [], "等于材料行数时通过");
+	// 真实冒烟：材料 72 条，模型三次分别报 55 / 70 / 70，一次都没对上，而旧校验只查 Σcount ≤ review_count
+	const under = validateReviewClusterer(withCount(1), context);
+	assert.equal(under.length, 1, `少报必须判失败，实得：${under.join("；")}`);
+	assert.match(under[0] ?? "", /review_count 1 与材料里的评论行数 2 不符/u);
+	assert.match(validateReviewClusterer(withCount(9), context)[0] ?? "", /review_count 9 与材料里的评论行数 2 不符/u, "多报同样判失败");
+});
+
+test("手工材料解析不出 reviews 数组时不做条数等值判定（那条入口本来就没有行数可比）", () => {
+	const context = { materialText: "一段运营自己贴的差评摘录，不是 convert 的产物", materialAsins: [] as string[] };
+	const errors = validateReviewClusterer({
+		source_asins: [],
+		review_count: 7,
+		themes: [{ name: "主题", category: "other", count: 1, fixability: "unknown" }],
+		estimated_rating: null,
+	}, context);
+	assert.deepEqual(errors.filter((item) => item.includes("评论行数")), [], `手工材料不该有条数等值报错，实得：${errors.join("；")}`);
+});
+
+test("<material> 元信息把实际条数告诉子代理，别让它数上百条", async () => {
+	resetDispatchCounters();
+	const { registry, calls } = fakeRegistry([DEEPSEEK], () => reply(clusterOutput()));
+	await runDispatch({ registry }, baseInput());
+	const seen = JSON.stringify(calls[0].context);
+	assert.match(seen, /实际 2 条/u, `<material> 元信息要带实际条数，实得：${seen.slice(0, 400)}`);
+	assert.match(seen, /review_count 必须等于实际条数/u, "元信息要点明 review_count 的口径，别让模型自己重数");
+});
+
+test("提示明写「每条只归一个主题」：Σcount ≤ review_count 这条硬门靠它才讲得通", () => {
+	// 校验只说「之和不得超过」，没说清一条评论撞多个问题时怎么办；模型按打标签算就必然超。
+	// 真实冒烟里 DeepSeek 连着三次 Σcount 超标（73/55、85/70、95/72），补这句之前它没被告知过。
+	const prompt = DISPATCH_AGENTS["review-clusterer"].systemPrompt;
+	assert.match(prompt, /每条差评只归入一个最主要的主题/u, "单归属规则必须写进提示，否则硬门是模型没被告知过的规则");
+	assert.match(prompt, /实际 N 条/u, "review_count 的取数出处也要写明，别让模型自己数");
+});

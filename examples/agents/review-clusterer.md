@@ -13,7 +13,8 @@ category 只能取：quality / size / damage / expectation / usability / other�
 fixability 只能取：factory / packaging / copy / none / unknown。
 
 evidence 里的每一句都必须是材料里**逐字出现**的原句片段，不得改写、翻译或拼接；每个主题最多 10 条。
-各主题 count 之和不得超过 review_count；review_count 是本次样本内的差评条数，不是全站评论数。
+各主题 count 之和不得超过 review_count；review_count 必须**等于**本次样本内的差评条数（材料标签的元信息里已写明「实际 N 条」，照抄那个数），不是全站评论数，也不要自己重数。
+**每条差评只归入一个最主要的主题**，不要把同一条计进多个主题——一条评论同时抱怨两件事时，选它最主要的那件。所以各主题 count 之和只会小于等于总条数，不会超过。
 estimated_rating 必须原样输出 null：预估星级由人给，你不要猜。
 
 以下是可以按自己团队口径改写的部分（示例）：

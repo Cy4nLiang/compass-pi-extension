@@ -338,7 +338,8 @@ export const DISPATCH_AGENTS: Readonly<Record<DispatchAgentName, DispatchAgentDe
 			`category 只能取：${REVIEW_THEME_CATEGORIES.join(" / ")}。`,
 			`fixability 只能取：${REVIEW_THEME_FIXABILITIES.join(" / ")}。`,
 			"evidence 里的每一句都必须是材料里**逐字出现**的原句片段，不得改写、翻译或拼接；每个主题最多 10 条。",
-			"各主题 count 之和不得超过 review_count；review_count 是本次样本内的差评条数，不是全站评论数。",
+			"各主题 count 之和不得超过 review_count；review_count 必须**等于**本次样本内的差评条数（材料标签的元信息里已写明「实际 N 条」，照抄那个数），不是全站评论数，也不要自己重数。",
+			"**每条差评只归入一个最主要的主题**，不要把同一条计进多个主题——一条评论同时抱怨两件事时，选它最主要的那件。所以各主题 count 之和只会小于等于总条数，不会超过。",
 			"estimated_rating 必须原样输出 null：预估星级由人给，你不要猜。",
 		].join("\n"),
 	},
@@ -465,6 +466,40 @@ export function materialCorpus(materialText: string): string {
 	}
 }
 
+/**
+ * evidence 逐字比对前的归一。除折叠空白外还放宽两类差异——它们是「模型合规引用」与「材料原文」
+ * 之间必然出现的形态，不是改写（2026-09-06 真实冒烟核出：四次校验失败**全部**属于这两类，
+ * 被点名的句子在材料里逐条都找得到，模型一个字都没编）：
+ *   ① 首字母大小写：模型把整句当句中引文引用时会改成小写（材料 `The demo bracket is so flimsy`
+ *      → 模型 `the demo bracket is so flimsy`）。
+ *   ② 印刷体标点：材料里的 ‘ ’ “ ” – — … 被模型规范化成 ASCII 的 ' " - ...。
+ * 判据仍然是「必须在材料里找得到」，编造的句子照样失败——tests/dispatch.test.ts 有反向对照。
+ * 与 materialCorpus 分开：那个产出的是可读语料，这个只服务于比对，两边必须用同一套归一。
+ */
+export function foldForEvidenceMatch(text: string): string {
+	return text
+		.replace(/[‘’‚‛′]/gu, "'")
+		.replace(/[“”„‟″]/gu, '"')
+		.replace(/[‐-―]/gu, "-")
+		.replace(/…/gu, "...")
+		.replace(/\s+/gu, " ")
+		.trim()
+		.toLowerCase();
+}
+
+/**
+ * 材料里的评论行数。手工材料不一定是 convert 的产物（解析不出 reviews 数组），那时返回
+ * undefined，条数等值判定随之跳过——那条入口本来就没有行数可比。
+ */
+export function materialReviewCount(materialText: string): number | undefined {
+	try {
+		const parsed = JSON.parse(materialText) as { reviews?: unknown };
+		return Array.isArray(parsed.reviews) ? parsed.reviews.length : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 const REVIEW_CATEGORY_SET = new Set<string>(REVIEW_THEME_CATEGORIES);
 const REVIEW_FIXABILITY_SET = new Set<string>(REVIEW_THEME_FIXABILITIES);
 const RISK_CATEGORY_SET = new Set<string>(RISK_QUERY_CATEGORIES);
@@ -487,8 +522,8 @@ function isNonNegativeInteger(value: unknown): boolean {
  */
 export function validateReviewClusterer(value: unknown, context: ReviewClustererContext): string[] {
 	const errors: string[] = [];
-	// 归一一次，供下面所有 evidence 逐句比对复用
-	const corpus = materialCorpus(context.materialText);
+	// 归一一次，供下面所有 evidence 逐句比对复用。两边必须走同一个 fold，否则放宽等于没放宽
+	const corpus = foldForEvidenceMatch(materialCorpus(context.materialText));
 	if (!isRecord(value)) return ["输出不是 JSON 对象"];
 	if (!Object.hasOwn(value, "estimated_rating") || value.estimated_rating !== null) {
 		errors.push("estimated_rating 必须原样输出 null（预估星级由人给）");
@@ -503,6 +538,13 @@ export function validateReviewClusterer(value: unknown, context: ReviewClusterer
 		}
 	}
 	if (!isNonNegativeInteger(value.review_count)) errors.push("review_count 必须是非负整数");
+	// 条数必须**等于**材料行数，不是「≤」。Σcount ≤ review_count 那条只在模型自报的数字内部自洽，
+	// 少报一样能过：真实冒烟里材料 72 条而三次输出报 55 / 70 / 70，一次都没对上，于是 share 的分母
+	// 偏小、写回 compass_reviews_record 的条数也是错的（2026-09-06 核出）
+	const materialRows = materialReviewCount(context.materialText);
+	if (isNonNegativeInteger(value.review_count) && materialRows !== undefined && value.review_count !== materialRows) {
+		errors.push(`review_count ${String(value.review_count)} 与材料里的评论行数 ${materialRows} 不符：share 的分母与写回的条数都以它为准`);
+	}
 	const themes = Array.isArray(value.themes) ? value.themes : undefined;
 	if (!themes || themes.length === 0) {
 		errors.push("themes 至少要有一项");
@@ -536,7 +578,7 @@ export function validateReviewClusterer(value: unknown, context: ReviewClusterer
 			} else {
 				if (raw.evidence.length > 10) errors.push(`${at}.evidence 最多 10 条`);
 				for (const quote of raw.evidence as string[]) {
-					if (!corpus.includes(quote.replace(/\s+/gu, " ").trim())) {
+					if (!corpus.includes(foldForEvidenceMatch(quote))) {
 						errors.push(`${at}.evidence 里「${quote.slice(0, 24)}」不是材料里的原句`);
 					}
 				}
@@ -822,8 +864,11 @@ function factsBlock(facts: DispatchFacts | undefined): string {
 function buildUserText(input: RunDispatchInput): string {
 	const blocks: string[] = [];
 	if (input.materialText) {
+		// 实际条数要直接给出来：让模型自己数上百条评论是它最容易错的一步，而 review_count
+		// 现在是等值判据，数错就整次失败并白花一次调用（2026-09-06 真实冒烟核出）
+		const rows = materialReviewCount(input.materialText);
 		const meta = input.material
-			? `（样本上限 ${input.material.sample_cap ?? "未知"} 条，评论类型 ${input.material.review_type ?? "未知"}；share 的分母是样本内差评数）`
+			? `（${rows === undefined ? "" : `实际 ${rows} 条，`}样本上限 ${input.material.sample_cap ?? "未知"} 条，评论类型 ${input.material.review_type ?? "未知"}；review_count 必须等于实际条数，share 的分母也是它）`
 			: "";
 		blocks.push(`<material>${meta}\n${input.materialText}\n</material>`);
 	}

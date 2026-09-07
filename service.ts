@@ -45,6 +45,7 @@ import type {
 	DecisionTrigger,
 	GateOutcome,
 	Lesson,
+	CostReference,
 	Market,
 	MarketSnapshot,
 	MetricEvidence,
@@ -524,6 +525,45 @@ export function recordProfitEstimate(
 		});
 	}
 	return estimate;
+}
+
+// —— 1688 参考成本（compass-1688-cost-reference）——
+// 三个纯内存函数：index.ts 的 convert 分支与 compass_profit_estimate 都经它们读写，
+// 「最新一条」的并列规则沿用 latestBy（不写 sort()[0]）。
+
+export function latestProfitEstimate(store: CompassStore, marketId: string): ProfitEstimate | undefined {
+	return latestForMarket(store.profitEstimates, marketId);
+}
+
+/** 落一条参考成本记录。不写 decisionLog（回滚红线），审计链由记录自身的 actor / createdAt 承载。 */
+export function recordCostReference(store: CompassStore, input: Omit<CostReference, "id" | "createdAt">): CostReference {
+	const market = findMarket(store, input.marketId);
+	const reference: CostReference = { ...input, marketId: market.id, id: shortId("cref"), createdAt: nowIso() };
+	store.costReferences ??= [];
+	store.costReferences.push(reference);
+	return reference;
+}
+
+/**
+ * compass_profit_estimate 的 cost_reference_ref 解析：`latest` 取该市场最新一条，否则按 id 找；
+ * 找到的记录必须属于这个市场——参考成本是按关键词搜出来的，跨市场引用等于把别的品类的价填进来。
+ */
+export function resolveCostReferenceForEstimate(store: CompassStore, marketId: string, ref: string): CostReference {
+	const market = findMarket(store, marketId);
+	const references = store.costReferences ?? [];
+	const wanted = ref.trim();
+	if (!wanted) throw new ValidationError("cost_reference_ref 不能为空：写 latest 或参考成本记录的 id");
+	const found = wanted === "latest" ? latestForMarket(references, market.id) : references.find((item) => item.id === wanted);
+	if (!found) {
+		throw new NotFoundError(
+			"cost_reference",
+			wanted === "latest"
+				? `${market.name} 还没有 1688 参考成本记录：先跑 compass_gaps action=approve market_ref=${market.id} origin=purchase_cost_source search_name=<中文品类词>，convert 之后再引用`
+				: `找不到参考成本记录 ${wanted}`,
+		);
+	}
+	if (found.marketId !== market.id) throw new ValidationError(`参考成本 ${found.id} 属于市场 ${found.marketId}，不能用于 ${market.id}：参考成本是按该市场的关键词搜出来的`);
+	return found;
 }
 
 function overallRisk(input: {

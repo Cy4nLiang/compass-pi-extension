@@ -14,7 +14,7 @@
 // 领域错误一旦带上它就会被当成文件系统故障吞成 500。
 
 /** 缺失实体的种类。只用于排障与调用方的二次分派，状态码分级只看类型本身 */
-export type MissingEntityKind = "market" | "candidate" | "snapshot" | "strategy" | "todo";
+export type MissingEntityKind = "market" | "candidate" | "snapshot" | "strategy" | "todo" | "cost_reference";
 
 /** 引用指向的实体不存在（Web 层映射为 404） */
 export class NotFoundError extends Error {

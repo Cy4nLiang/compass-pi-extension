@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { CSV_ALIAS_HEADERS, parseMarketCsv } from "../csv.ts";
-import { capturedAtForBatch, convertSorftimePayloads, createMcpPayloadCache, extractMcpPayload, isAdapterSpillPath, materializeReviewPayloads, parseSorftimeFieldMap, pickPath, slugForFileName, type CachedPayload, type McpPayloadEntry, type SorftimeFieldMap } from "../gapfill-convert.ts";
+import { capturedAtForBatch, convertSorftimePayloads, createMcpPayloadCache, extractMcpPayload, isAdapterSpillPath, materializeReviewPayloads, parseSorftimeFieldMap, pickPath, requestParamsOf, resolveCostReferencePayload, slugForFileName, type CachedPayload, type McpPayloadEntry, type SorftimeFieldMap } from "../gapfill-convert.ts";
 import { calculateMarketMetrics } from "../metrics.ts";
 import { CompassRepository, IMPORTS_DIR_NAME } from "../store.ts";
 
@@ -870,4 +870,199 @@ test("reviews 链：doc 块丢弃且按指纹去重", async () => {
 		assert.equal(material.reviews.some((row) => row.body === "正文"), false);
 		assert.deepEqual(Object.keys(material.reviews[0]).sort(), ["asin", "body", "date", "rating", "title", "variant"]);
 	});
+});
+
+
+// —— 1688 参考成本链（compass-1688-cost-reference，2026-09-07）——
+// 用例名统一以 `cost_reference 链：` 开头，任务书 Proof 表按前缀选行。夹具全部虚构：
+// product_id 一律 1688DEMO 前缀、标题是 Demo 词——compass 是公开仓库且带公开 CI。
+
+const COST_RAW = {
+	rows: { listing: "data.top100_products", keyword: "data" },
+	listing: { asin: "asin", title: "title" },
+	keyword: { keyword: "keyword" },
+	cost_reference: {
+		chain: [{ step: 1, tool: "ali1688_similar_product", required: ["search_name"], fixed: { page: "1" } }],
+		rows: "data",
+		fields: {
+			product_id: "product_id",
+			title: "title",
+			url: "url",
+			photo: "photo",
+			price: "price",
+			sales: "sales_of_30d",
+			tiers: "wholesale_price_range",
+			tier_price: "price",
+			tier_quantity: "purchase_quantity",
+			moq: "min_order_quantity",
+		},
+		empty_sentinel: "未找到相关类目",
+		page_size: 100,
+	},
+};
+
+const COST_MAP: SorftimeFieldMap = parseSorftimeFieldMap(COST_RAW);
+
+const costRow = (seed: number) => {
+	const id = `1688DEMO${String(seed).padStart(4, "0")}`;
+	return {
+		product_id: id,
+		title: `Demo Basket ${seed}`,
+		url: `https://detail.1688.com/offer/${id}.html`,
+		photo: `https://img.example.invalid/${id}.jpg`,
+		price: seed % 3 === 0 ? 0 : 10 + seed,
+		sales_of_30d: seed <= 3 ? 100 - seed : 0,
+		wholesale_price_range: [{ price: (9 + seed).toFixed(2), purchase_quantity: "≥2件" }],
+		min_order_quantity: 2,
+	};
+};
+
+const costEntry = (rows: Array<Record<string, unknown>>, extra: Partial<McpPayloadEntry> = {}): McpPayloadEntry => ({
+	server: "sorftime",
+	tool: "ali1688_similar_product",
+	toolCallId: "call-cost-1",
+	receivedAt: "2026-09-07T00:00:00.000Z",
+	approxBytes: 4_096,
+	requestSearchName: "demo",
+	// 返回体根下的 doc 是字段说明块，rows 只取 data
+	value: { doc: { title: "Product title.", price: "Product selling price (in CNY)." }, data: rows },
+	...extra,
+});
+
+const COST_INPUT = { map: COST_MAP, marketName: "demo market", capturedDate: "2026-09-07", source: "sorftime" };
+
+test("cost_reference 链：映射段解析——齐全时可用，缺必填字段抛错，缺段时另两条链照常可用", () => {
+	assert.equal(COST_MAP.costReference?.chain[0].tool, "ali1688_similar_product");
+	assert.equal(COST_MAP.costReference?.chain[0].fixed?.page, "1");
+	assert.equal(COST_MAP.costReference?.rows, "data");
+	assert.equal(COST_MAP.costReference?.fields.tier_price, "price");
+	assert.equal(COST_MAP.costReference?.emptySentinel, "未找到相关类目");
+	assert.equal(COST_MAP.costReference?.pageSize, 100);
+	const without = parseSorftimeFieldMap({ rows: COST_RAW.rows, listing: COST_RAW.listing, keyword: COST_RAW.keyword });
+	assert.equal(Object.hasOwn(without, "costReference"), false, "没声明 cost_reference 时不该出现这个键");
+	assert.throws(() => parseSorftimeFieldMap({ ...COST_RAW, cost_reference: { ...COST_RAW.cost_reference, chain: [] } }), /cost_reference\.chain 必须是非空数组/u);
+	assert.throws(() => parseSorftimeFieldMap({ ...COST_RAW, cost_reference: { ...COST_RAW.cost_reference, rows: 1 } }), /cost_reference\.rows 必须是非空点路径/u);
+	assert.throws(
+		() => parseSorftimeFieldMap({ ...COST_RAW, cost_reference: { ...COST_RAW.cost_reference, fields: { product_id: "product_id", price: "price", sales: "sales_of_30d", tiers: "wholesale_price_range" } } }),
+		/cost_reference\.fields 必须映射 tier_price/u,
+	);
+	// 数字型 fixed 会被 chainStep 静默丢弃：映射表必须写字符串 "1"，否则确认单失去 page 复核
+	const numericPage = parseSorftimeFieldMap({ ...COST_RAW, cost_reference: { ...COST_RAW.cost_reference, chain: [{ step: 1, tool: "ali1688_similar_product", fixed: { page: 1 } }] } });
+	assert.equal(numericPage.costReference?.chain[0].fixed, undefined);
+});
+
+test("cost_reference 链：哨兵文本「未找到相关类目」判为空结果——不当成非 JSON 报错、原文归档、溢写清理", async () => {
+	await withRepo(async (repo, root) => {
+		const spillRoot = await mkdtemp(join(tmpdir(), "compass-cost-spill-"));
+		const dir = join(spillRoot, "a");
+		await mkdir(dir, { recursive: true });
+		const file = join(dir, "output-1.txt");
+		await writeFile(file, "未找到相关类目", "utf8");
+		try {
+			const result = await resolveCostReferencePayload(
+				{ repo },
+				{
+					...COST_INPUT,
+					payloads: [
+						costEntry([], { toolCallId: "call-inline", value: undefined, text: "未找到相关类目" }),
+						costEntry([], { toolCallId: "call-spill", receivedAt: "2026-09-07T00:01:00.000Z", value: undefined, filePath: file, cleanupPaths: [file] }),
+					],
+				},
+			);
+			assert.equal(result.rows.length, 0);
+			assert.equal(result.emptyResult, true, "哨兵是正常空值，不是失败");
+			assert.deepEqual(result.skipped, [], "不得把哨兵当成「返回体不是 JSON、那一步要重调」");
+			assert.equal(result.archivedRaw.length, 2, "两次哨兵返回都要归档，钱花了要留痕");
+			for (const path of result.archivedRaw) {
+				const archived = JSON.parse(await readFile(join(root, path), "utf8")) as { empty_sentinel?: string };
+				assert.equal(archived.empty_sentinel, "未找到相关类目");
+			}
+			assert.deepEqual(result.cleaned, [file]);
+			await assert.rejects(() => stat(file), /ENOENT/u);
+			await assert.rejects(() => stat(dir), /ENOENT/u);
+		} finally {
+			await rm(spillRoot, { recursive: true, force: true });
+		}
+	});
+});
+
+test("cost_reference 链：真 0 行（data 为空数组）同样判空结果", async () => {
+	await withRepo(async (repo) => {
+		const result = await resolveCostReferencePayload({ repo }, { ...COST_INPUT, payloads: [costEntry([])] });
+		assert.equal(result.rows.length, 0);
+		assert.equal(result.emptyResult, true);
+		assert.equal(result.usedToolCallId, "call-cost-1");
+		assert.equal(result.archivedRaw.length, 1);
+	});
+});
+
+test("cost_reference 链：多份返回取最后收到的一份，其余计入 droppedCalls 但仍归档", async () => {
+	await withRepo(async (repo) => {
+		const result = await resolveCostReferencePayload(
+			{ repo },
+			{
+				...COST_INPUT,
+				payloads: [
+					costEntry([costRow(1), costRow(2)], { toolCallId: "call-late", receivedAt: "2026-09-07T00:05:00.000Z" }),
+					costEntry([costRow(3), costRow(4), costRow(5)], { toolCallId: "call-early", receivedAt: "2026-09-07T00:01:00.000Z" }),
+				],
+			},
+		);
+		assert.equal(result.usedToolCallId, "call-late", "按 receivedAt 取最后一份，不按数组顺序");
+		assert.equal(result.rows.length, 2);
+		assert.equal(result.droppedCalls, 1);
+		assert.equal(result.emptyResult, false);
+		assert.equal(result.archivedRaw.length, 2, "被丢弃的那份也要归档：钱已经花了");
+	});
+});
+
+test("cost_reference 链：溢写文件读取——正文链与结果链都能取到行，文件与目录被清理", async () => {
+	await withRepo(async (repo) => {
+		const spillRoot = await mkdtemp(join(tmpdir(), "compass-cost-spill-"));
+		const dirA = join(spillRoot, "a");
+		const dirB = join(spillRoot, "b");
+		await mkdir(dirA, { recursive: true });
+		await mkdir(dirB, { recursive: true });
+		const fileA = join(dirA, "output-1.txt");
+		const fileB = join(dirB, "result-1.txt");
+		await writeFile(fileA, JSON.stringify({ doc: {}, data: [costRow(1), costRow(2), costRow(3)] }), "utf8");
+		await writeFile(fileB, JSON.stringify({ content: [{ type: "text", text: JSON.stringify({ doc: {}, data: [costRow(4), costRow(5), costRow(6), costRow(7)] }) }] }), "utf8");
+		try {
+			const bodyChain = await resolveCostReferencePayload(
+				{ repo },
+				{ ...COST_INPUT, payloads: [costEntry([], { toolCallId: "call-a", value: undefined, filePath: fileA, cleanupPaths: [fileA] })] },
+			);
+			assert.equal(bodyChain.rows.length, 3, "正文链：文件里就是业务 JSON");
+			const resultChain = await resolveCostReferencePayload(
+				{ repo },
+				{ ...COST_INPUT, payloads: [costEntry([], { toolCallId: "call-b", value: undefined, filePath: fileB, fileHoldsToolResult: true, cleanupPaths: [fileB] })] },
+			);
+			assert.equal(resultChain.rows.length, 4, "结果链：要从 content[].text 二次 parse");
+			assert.deepEqual([...bodyChain.cleaned, ...resultChain.cleaned].sort(), [fileA, fileB].sort());
+			await assert.rejects(() => stat(dirA), /ENOENT/u);
+			await assert.rejects(() => stat(dirB), /ENOENT/u);
+		} finally {
+			await rm(spillRoot, { recursive: true, force: true });
+		}
+	});
+});
+
+test("cost_reference 链：requestParamsOf 按键取参数对象（直连与网关两种形态），缓存条目记 requestSearchName", () => {
+	// 直连形态：参数就在 input 顶层；网关形态：参数套在 args 里。两个字段必须从同一个对象读
+	assert.deepEqual(requestParamsOf({ search_name: "demo", page: 1 }, "search_name"), { search_name: "demo", page: 1 });
+	assert.deepEqual(requestParamsOf({ server: "sorftime", tool: "ali1688_similar_product", args: { search_name: "demo", page: 2 } }, "search_name"), { search_name: "demo", page: 2 });
+	assert.equal(requestParamsOf({ asin: "B0DEMO0001" }, "search_name"), undefined, "键不在就不猜");
+	assert.deepEqual(requestParamsOf({ asin: "B0DEMO0001" }), { asin: "B0DEMO0001" }, "缺省键仍是 asin（差评链不受影响）");
+
+	const cache = createMcpPayloadCache();
+	cache.remember(
+		{ server: "sorftime", tool: "ali1688_similar_product" },
+		{ toolCallId: "direct", details: { mode: "call", server: "sorftime", tool: "ali1688_similar_product", mcpResult: { data: [] } }, content: [], receivedAt: "2026-09-07T00:00:00.000Z", input: { search_name: " demo ", page: 1 } },
+	);
+	cache.remember(
+		{ server: "sorftime", tool: "ali1688_similar_product" },
+		{ toolCallId: "gateway", details: { mode: "call", server: "sorftime", tool: "ali1688_similar_product", mcpResult: { data: [] } }, content: [], receivedAt: "2026-09-07T00:00:01.000Z", input: { server: "sorftime", tool: "ali1688_similar_product", args: { search_name: "demo" } } },
+	);
+	const entries = cache.since("sorftime", "2026-09-07T00:00:00.000Z");
+	assert.deepEqual(entries.map((entry) => [entry.toolCallId, entry.requestSearchName, entry.requestAsin]), [["direct", "demo", undefined], ["gateway", "demo", undefined]], "关键词去首尾空白；差评链的 requestAsin 不受影响");
 });

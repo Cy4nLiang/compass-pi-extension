@@ -1,6 +1,7 @@
 import { readFile, rmdir, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, resolve } from "node:path";
+import type { CostReferenceFieldMap } from "./cost-reference.ts";
 import { CSV_ALIAS_HEADERS } from "./csv.ts";
 import type { CompassRepository } from "./store.ts";
 
@@ -8,9 +9,9 @@ import type { CompassRepository } from "./store.ts";
 //
 // 分层：这是**编排层**，与 importer.ts 平级——它做文件 I/O（读溢写文件、写 CSV、归档原始
 // JSON、清理临时文件），所以不能放进 csv.ts / metrics.ts / gaps.ts 那一层的纯函数模块里。
-// 依赖方向单向：只 import csv.ts（拿表头）与 store.ts 的类型；绝不 import index.ts /
-// importer.ts / service.ts / ui.ts / web/*——convert 只产出 CSV，回写走现有的
-// compass_import_csv，不另开第二条导入链路。反向也不许：纯函数层不得 import 本模块。
+// 依赖方向单向：只 import csv.ts（拿表头）、store.ts 的类型与 cost-reference.ts 的类型；绝不 import
+// index.ts / importer.ts / service.ts / ui.ts / web/*——convert 只产出 CSV / 材料 / 参考成本候选行，
+// 回写走现有的 compass_import_csv 或调用方的写事务，不另开第二条导入链路。反向也不许：纯函数层不得 import 本模块。
 //
 // 数字不经 LLM：取值一律按映射文件里的点路径直取，不 eval、不推断、缺字段留空。
 
@@ -24,6 +25,22 @@ export interface SorftimeFieldMap {
 	chain?: SorftimeChainStep[];
 	/** 差评材料链。缺省表示映射表没声明它，material 单一律拒绝而不是降级 */
 	reviews?: SorftimeReviewsMap;
+	/** 1688 参考成本链。缺省表示映射表没声明它，cost_reference 单一律拒绝而不是降级 */
+	costReference?: SorftimeCostReferenceMap;
+}
+
+/**
+ * 1688 参考成本链：第三种产物——既不是 CSV 也不是材料，convert 算出一条参考成本记录写回 store。
+ * `rows` 是商品行数组的点路径；`fields` 的键是 cost-reference.ts 认的字段名（product_id / price / sales /
+ * tiers / tier_price …），不是 CSV 列名，同样不能并进 headerFor 那个循环。
+ */
+export interface SorftimeCostReferenceMap {
+	chain: SorftimeChainStep[];
+	rows: string;
+	fields: CostReferenceFieldMap;
+	/** 服务端「无结果」时返回的纯文本哨兵（不是 JSON）。命中即判空结果，不当成非 JSON 报错 */
+	emptySentinel?: string;
+	pageSize?: number;
 }
 
 /** 映射表 `chain` 数组里的一步。工具名只在映射表里出现，compass 源码不硬编码第三方工具名。 */
@@ -136,6 +153,36 @@ export function parseSorftimeFieldMap(raw: unknown): SorftimeFieldMap {
 					: undefined,
 		};
 		if (map.reviews.asinsPerTicketMax === undefined) throw new Error("reviews.asins_per_ticket_max 必须是正整数：approve 靠它复核一张单最多批几个 ASIN");
+	}
+
+	// cost_reference 段同样是「缺省不带键」：调用方按键集判映射表声明了哪几条链
+	if (root.cost_reference !== undefined) {
+		const section = asRecord(root.cost_reference, "cost_reference");
+		if (!Array.isArray(section.chain) || !section.chain.length) throw new Error("cost_reference.chain 必须是非空数组");
+		if (typeof section.rows !== "string" || !section.rows) throw new Error("cost_reference.rows 必须是非空点路径");
+		const fields = asPathMap(section.fields, "cost_reference.fields");
+		// 取价要靠阶梯与头价，排序要靠销量，复核要靠商品 id：缺任一项算出来的参考成本都不可信
+		for (const required of ["product_id", "price", "sales", "tiers", "tier_price"] as const) {
+			if (!fields[required]) throw new Error(`cost_reference.fields 必须映射 ${required}：缺了它参考成本要么取不到价、要么排不了序、要么无法复核`);
+		}
+		map.costReference = {
+			chain: section.chain.map((item, index) => chainStep(asRecord(item, `cost_reference.chain[${index}]`), index)),
+			rows: section.rows,
+			fields: {
+				product_id: fields.product_id,
+				title: fields.title ?? "title",
+				url: fields.url,
+				photo: fields.photo,
+				price: fields.price,
+				sales: fields.sales,
+				tiers: fields.tiers,
+				tier_price: fields.tier_price,
+				tier_quantity: fields.tier_quantity,
+				moq: fields.moq,
+			},
+			emptySentinel: typeof section.empty_sentinel === "string" && section.empty_sentinel.trim() ? section.empty_sentinel.trim() : undefined,
+			pageSize: typeof section.page_size === "number" && Number.isInteger(section.page_size) && section.page_size > 0 ? section.page_size : undefined,
+		};
 	}
 
 	// 身份列必须映射：convert 靠 asin / keyword 判断一行到底属于哪一类（与 csv.ts 同口径）。
@@ -282,6 +329,12 @@ export interface McpPayloadEntry extends CachedPayload {
 	 * 落进会话文件了，这里再持一份只是白占内存。
 	 */
 	requestAsin?: string;
+	/**
+	 * 这次调用请求参数里的检索关键词（1688 参考成本链）。convert 按它只收本关键词的返回——
+	 * 窗口内同一工具换个词再调，返回体形状完全相同，不记下来就分不出哪份是确认单批的那次。
+	 * 与 requestAsin 同理只存一个字符串。
+	 */
+	requestSearchName?: string;
 }
 
 export interface McpPayloadCache {
@@ -304,22 +357,29 @@ export interface McpPayloadCache {
  * 「热路径出现写事务」，缓存里出现 `xxx.update(` 会被误判。
  */
 /**
- * 从调用参数里取 ASIN。两种形态：直连是 `input.asin`，网关把参数套在 `input.args` 里。
+ * 从调用参数里取「含某个键」的参数对象。两种形态：直连是 `input[key]`，网关把参数套在 `input.args` 里。
+ * 缺省键是 asin（差评链）；1688 参考成本链传 "search_name"。
  *
- * 两个字段必须从**同一个对象**读——门禁那边还要在同一个对象里读 review_type，跨对象拼会在
+ * 门禁与缓存里的字段必须从**同一个对象**读——门禁那边还要在同一个对象里读 review_type / page，跨对象拼会在
  * 网关形态下把合规调用误拦。这里只认字符串、不 parse、不递归，热路径经得起。
  */
-export function requestParamsOf(input: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+export function requestParamsOf(input: Record<string, unknown> | undefined, key = "asin"): Record<string, unknown> | undefined {
 	if (!input) return undefined;
-	if (typeof input.asin === "string") return input;
+	if (typeof input[key] === "string") return input;
 	const args = input.args;
-	if (args && typeof args === "object" && !Array.isArray(args) && typeof (args as Record<string, unknown>).asin === "string") return args as Record<string, unknown>;
+	if (args && typeof args === "object" && !Array.isArray(args) && typeof (args as Record<string, unknown>)[key] === "string") return args as Record<string, unknown>;
 	return undefined;
 }
 
 function requestAsinOf(input: Record<string, unknown> | undefined): string | undefined {
 	const asin = requestParamsOf(input)?.asin;
 	return typeof asin === "string" && asin ? asin : undefined;
+}
+
+function requestSearchNameOf(input: Record<string, unknown> | undefined): string | undefined {
+	const searchName = requestParamsOf(input, "search_name")?.search_name;
+	const trimmed = typeof searchName === "string" ? searchName.trim() : "";
+	return trimmed ? trimmed : undefined;
 }
 
 export function createMcpPayloadCache(options: { maxEntries?: number; maxBytes?: number } = {}): McpPayloadCache {
@@ -352,6 +412,7 @@ export function createMcpPayloadCache(options: { maxEntries?: number; maxBytes?:
 				receivedAt: event.receivedAt ?? new Date().toISOString(),
 				approxBytes: extracted.approxBytes,
 				requestAsin: requestAsinOf(event.input),
+				requestSearchName: requestSearchNameOf(event.input),
 			});
 			evict();
 		},
@@ -453,6 +514,8 @@ interface ResolvedPayload {
 	body: unknown;
 	/** 这条不是 JSON（call_failed / aborted 之后 adapter 给的报错文本之类），跳过但要在拒绝理由里点名 */
 	skipped?: string;
+	/** 命中映射表声明的「无结果」纯文本哨兵：是正常空值，不是失败，不进 skipped */
+	empty?: true;
 }
 
 /**
@@ -472,10 +535,13 @@ function unwrapToolResult(value: unknown, parse: (text: string) => ResolvedPaylo
 	return text ? parse(text) : { body: undefined };
 }
 
-async function resolvePayload(payload: CachedPayload): Promise<ResolvedPayload> {
+async function resolvePayload(payload: CachedPayload, emptySentinel?: string): Promise<ResolvedPayload> {
 	// 解析失败不抛：失败调用的报错文本若混进这一批，convert 直接崩会让这张确认单永远转不出去
 	// （catch 分支按设计不清单不清缓存），运营只能重新 approve 再把已经花钱拿到的两步重付一遍
 	const parse = (text: string): ResolvedPayload => {
+		// 哨兵要在 JSON.parse **之前**比对：服务端「无结果」给的是纯文本，走到 catch 就成了
+		// 「返回体不是 JSON、那一步要重调」——那是在诱导运营再花一次钱去搜一个本来就没结果的词
+		if (emptySentinel !== undefined && text.trim() === emptySentinel) return { body: undefined, empty: true };
 		try {
 			return { body: JSON.parse(text) as unknown };
 		} catch {
@@ -764,6 +830,100 @@ export async function materializeReviewPayloads(deps: ConvertDeps, input: Review
 		perAsin: [...perAsinCount.entries()].map(([asin, count]) => ({ asin, rows: count })),
 		missingAsins,
 		droppedAsins: [...droppedAsins],
+		archivedRaw,
+		cleaned,
+	};
+}
+
+export interface CostReferencePayloadInput {
+	/** 必须是带 requestSearchName 的缓存条目：调用方已按确认单的关键词过滤过 */
+	payloads: McpPayloadEntry[];
+	map: SorftimeFieldMap;
+	marketName: string;
+	/** YYYY-MM-DD，从这批载荷的 capturedAt 派生，归档文件名用 */
+	capturedDate: string;
+	source?: string;
+}
+
+export interface CostReferencePayloadResult {
+	/** 取自最后收到的那份返回的商品行（原样对象，交 cost-reference.ts 归一） */
+	rows: unknown[];
+	usedToolCallId?: string;
+	/** 同一确认单里多出来的返回份数（都已归档，只是不参与取样） */
+	droppedCalls: number;
+	/** 服务端返回哨兵或 0 行：正常空值，不是失败 */
+	emptyResult: boolean;
+	skipped: string[];
+	unavailable: string[];
+	archivedRaw: string[];
+	cleaned: string[];
+}
+
+/**
+ * 把 1688 参考成本链的返回体解析成商品行。与另外两条链的三条差异：
+ *  1. **只有一步、只取第 1 页**：多份返回时取最后收到的一份，其余归档但不参与取样。
+ *  2. **哨兵是正常空值**：服务端无结果时返回纯文本（映射表 empty_sentinel），判成 0 行并把这段文本
+ *     归档留痕，不走「返回体不是 JSON、那一步要重调」——那会诱导运营再花一次钱。
+ *  3. **产物不是 CSV 也不是材料**：这里只解析与归档，取价 / 排序 / 中位数在纯函数层 cost-reference.ts。
+ * 一份可用返回都没有且不是哨兵时抛错，与快照链同样说清「载荷不可恢复」还是「返回体不是 JSON」。
+ */
+export async function resolveCostReferencePayload(deps: ConvertDeps, input: CostReferencePayloadInput): Promise<CostReferencePayloadResult> {
+	const section = input.map.costReference;
+	if (!section) throw new Error("补数映射表没有声明 cost_reference 链：1688 参考成本需要它才能把返回体映射成候选行，请先在工作区补上再试。");
+
+	const ordered = [...input.payloads].sort((a, b) => a.receivedAt.localeCompare(b.receivedAt));
+	const resolved: Array<{ payload: McpPayloadEntry } & ResolvedPayload> = [];
+	for (const payload of ordered) {
+		resolved.push({ payload, ...(await resolvePayload(payload, section.emptySentinel)) });
+	}
+
+	let usedToolCallId: string | undefined;
+	let rows: unknown[] = [];
+	let droppedCalls = 0;
+	let sawSentinel = false;
+	const skipped: string[] = [];
+	for (const item of resolved) {
+		if (item.empty) {
+			sawSentinel = true;
+			// 归档哨兵而不是丢掉：这次调用已经计费，运营要能回头看到「那天搜这个词确实没结果」
+			item.body = { empty_sentinel: section.emptySentinel };
+			continue;
+		}
+		if (item.skipped !== undefined) {
+			skipped.push(item.skipped);
+			continue;
+		}
+		const list = pickPath(item.body, section.rows);
+		if (!Array.isArray(list)) {
+			skipped.push(`${item.payload.tool}（返回体里没有 ${section.rows} 数组）`);
+			continue;
+		}
+		if (usedToolCallId !== undefined) droppedCalls += 1;
+		usedToolCallId = item.payload.toolCallId;
+		rows = list;
+	}
+
+	const unavailable = [...new Set(input.payloads.filter((payload) => payload.unavailable).map((payload) => payload.unavailable as string))];
+	if (usedToolCallId === undefined && !sawSentinel) {
+		if (unavailable.length) {
+			throw new Error(
+				`参考成本转换被拒绝：这一批有 ${unavailable.length} 种返回体**已经拿不回来了**（${unavailable.join("；")}）。` +
+					`这次的钱已经花了，但正文被截断且溢写文件没写成，**重试同一步不会变好**——先解决溢写失败（多半是磁盘满或临时目录不可写），再重新 approve。`,
+			);
+		}
+		throw new Error(`参考成本转换被拒绝：确认单窗口内没有一份可解析的返回体${skipped.length ? `（${skipped.join("、")}）` : ""}。请确认调用真的发出去了再转换；失败就重新 approve，不要在同一张单里重试。`);
+	}
+
+	const source = input.source ?? "sorftime";
+	const base = `mcp-${input.capturedDate}-${slugForFileName(input.marketName)}-${source}-cost-reference`;
+	const { archivedRaw, cleaned } = await archiveAndClean(deps, resolved, base);
+	return {
+		rows,
+		usedToolCallId,
+		droppedCalls,
+		emptyResult: rows.length === 0,
+		skipped,
+		unavailable,
 		archivedRaw,
 		cleaned,
 	};

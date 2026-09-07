@@ -1,4 +1,4 @@
-import { compareSnapshotRecency, compareSnapshotRecencyDesc, SNAPSHOT_FRESHNESS_DAYS, snapshotFreshness } from "./defaults.ts";
+import { compareSnapshotRecency, compareSnapshotRecencyDesc, isStageMoveInto, SNAPSHOT_FRESHNESS_DAYS, snapshotFreshness } from "./defaults.ts";
 import type { RetroDueItem } from "./history.ts";
 import {
 	RESOLVABLE_TODO_KINDS,
@@ -117,14 +117,14 @@ interface CurrentBasis {
 	metricsComplete?: boolean;
 }
 
-// 阶段周期锚：候选本次进入某阶段的时间 = decisionLog 最近一次「→ stage」的 stage_move createdAt，
-// 无留痕时回落建卡时间。**禁用 candidate.updatedAt**——例行 CSV 导入会刷新它，造成水位假失效。
+// 阶段周期锚：候选本次进入某阶段的时间 = decisionLog 最近一次 toStage === stage 的 stage_move
+// createdAt（存量记录没有该字段，isStageMoveInto 回退解析 conclusion 文案），无留痕时回落建卡
+// 时间。**禁用 candidate.updatedAt**——例行 CSV 导入会刷新它，造成水位假失效。
 // 导出供 service 勾选时落 basis.stageEnteredAt 复用，杜绝抑制判定与水位口径两处漂移。
 export function stageEntryTimes(store: CompassStore, stage: CandidateStage): Map<string, string> {
 	const entered = new Map<string, string>();
-	const suffix = `→ ${stage}`;
 	for (const log of store.decisionLog) {
-		if (log.type !== "stage_move" || !log.candidateId || !log.conclusion.endsWith(suffix)) continue;
+		if (log.type !== "stage_move" || !log.candidateId || !isStageMoveInto(log, stage)) continue;
 		const previous = entered.get(log.candidateId);
 		if (previous === undefined || log.createdAt > previous) entered.set(log.candidateId, log.createdAt);
 	}

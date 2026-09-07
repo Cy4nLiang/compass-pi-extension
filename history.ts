@@ -1,5 +1,6 @@
 import type {
 	Candidate,
+	CandidateStage,
 	CompassStore,
 	DecisionLog,
 	DecisionStatus,
@@ -17,7 +18,7 @@ import type {
 } from "./types.ts";
 // 复盘报告与市场报告共用同一套「自由文本进 Markdown」的转义规则，别再内联复制一份。
 // report.ts 只 import type，反向无依赖，不成环。
-import { compareSnapshotRecency, compareSnapshotRecencyDesc } from "./defaults.ts";
+import { compareSnapshotRecency, compareSnapshotRecencyDesc, isStageMoveInto } from "./defaults.ts";
 import { escapeCell } from "./report.ts";
 
 const DAY_MS = 86_400_000;
@@ -753,9 +754,11 @@ function addDays(value: string, days: number): string {
 	return new Date(time + days * DAY_MS).toISOString();
 }
 
-function latestStageMove(store: CompassStore, candidate: Candidate, stage?: string): DecisionLog | undefined {
+// stage 省略 = 最近一次任意阶段迁移（waitlist 分支要的就是这个）；给了 stage 就按结构化
+// toStage 判定，存量记录由 isStageMoveInto 回退文案解析。
+function latestStageMove(store: CompassStore, candidate: Candidate, stage?: CandidateStage): DecisionLog | undefined {
 	return store.decisionLog
-		.filter((log) => log.candidateId === candidate.id && log.type === "stage_move" && (!stage || log.conclusion.endsWith(`→ ${stage}`)))
+		.filter((log) => log.candidateId === candidate.id && log.type === "stage_move" && (!stage || isStageMoveInto(log, stage)))
 		.sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
 }
 

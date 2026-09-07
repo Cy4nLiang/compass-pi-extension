@@ -951,6 +951,10 @@ export function moveCandidate(
 		candidateId: candidate.id,
 		marketId: candidate.marketId,
 		type: "stage_move",
+		// 阶段起止落在结构化字段上；conclusion 保持原样，它是 compass_history / 报告 / Web
+		// 决策流里给人看的展示串，读侧已不再从它反解析阶段。
+		fromStage: previous,
+		toStage: input.stage,
 		conclusion: `${previous} → ${input.stage}`,
 		reason,
 		snapshotId: latestSnapshotIfPresent(store, candidate.marketId)?.id,

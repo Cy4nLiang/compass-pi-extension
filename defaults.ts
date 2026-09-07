@@ -1,4 +1,4 @@
-import type { BudgetPool } from "./types.ts";
+import type { BudgetPool, CandidateStage, DecisionLog } from "./types.ts";
 
 // 口径缺省值：策略 meta 未声明时全系统统一按这两个数走（DEFAULT_STRATEGY_YAML 由下面的常量插值生成，不再各写一份字面量）
 export const DEFAULT_TARGET_MONTHLY_UNITS = 300;
@@ -251,4 +251,15 @@ export function snapshotTtlDays(stage: DataRouteStage): number {
 	if (stage === "lead" || stage === "screen") return SNAPSHOT_FRESHNESS_DAYS.screen;
 	if (stage === "testing") return SNAPSHOT_FRESHNESS_DAYS.testing;
 	return SNAPSHOT_FRESHNESS_DAYS.deepResearch;
+}
+
+// ---- 阶段迁移的读侧唯一口径 ----
+// 「这条 stage_move 是不是迁进了 stage」的唯一所有者：todo.ts 的深研周期锚与 history.ts 的
+// 复盘到期判定都走这里，别再各写一份。放 defaults.ts 是因为它已是两者共同依赖的纯函数层
+// （只 import type，反向无依赖、不成环）；放其中任一侧都会造成领域模块横向依赖。
+// 口径：结构化字段在就以它为准（哪怕判否），只有字段**缺失**（存量记录）才回退文案解析。
+// 不做「字段不等再试文案」的二次兜底——那会把「写侧填错阶段」重新藏回展示串里。
+export function isStageMoveInto(log: Pick<DecisionLog, "conclusion" | "toStage">, stage: CandidateStage): boolean {
+	if (log.toStage !== undefined) return log.toStage === stage;
+	return log.conclusion.endsWith(`→ ${stage}`);
 }

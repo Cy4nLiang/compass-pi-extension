@@ -353,6 +353,13 @@ export interface DecisionLog {
 	// candidate.latestStrategyRunId，两者可以落在不同快照上。只有新决策会写，旧记录靠
 	// findRetroBaseline 的读侧回退补齐，因此保持可选、不做写回迁移。
 	strategyRunId?: string;
+	// 阶段迁移的起止阶段（只有 type === "stage_move" 写）。分类信息必须落在字段上：
+	// conclusion 是给人看的展示串，措辞、中文标签、结尾备注都可能变，把 from / to 编进
+	// 那句话里，等于让「深研抑制水位」「测品停留超上限」这些判定跟着文案一起漂。
+	// 同样是刻意加**可选字段**而不是新 decisionLog.type 取值（回滚红线见文件头 M43 注释）；
+	// 存量记录没有这两个字段，读侧靠 isStageMoveInto 回退文案解析，不做写回迁移。
+	fromStage?: CandidateStage;
+	toStage?: CandidateStage;
 	actor: string;
 	createdAt: string;
 }

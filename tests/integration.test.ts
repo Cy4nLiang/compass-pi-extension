@@ -1956,3 +1956,72 @@ test("gateDefaultsLine 的每个数字都来自最新策略的规则表达式，
 	saveStrategyVersion(store, { yaml: DEFAULT_STRATEGY_YAML.replace("gross_margin >= 0.40", "gross_margin >= 0.40 && cr3 < 0.9"), actor: "tester" });
 	assert.match(gateDefaultsLine(store), /毛利≥40%（内置默认）/);
 });
+
+
+// —— 审计 M17 回归：反向对照 ——
+// M17 给策略保存加了「未知标识符直接拒绝」的白名单。白名单**漏**一个名字比原缺陷更痛：
+// 运营写对的策略会被拒收，且从错误信息里看不出该怎么改。这条用例刻意不引用白名单常量，
+// 而是从**真实生产者**取一遍 context.metrics 的键——四个 MetricMap 生产者分别是
+// metrics.ts 的 calculateMarketMetrics 与 targetDependentMetrics、economics.ts 的 profitMetrics
+// （capital_share 只在给了 portfolioCapital 时才产出，所以下面必须传）、service.ts 的
+// riskMetrics 与 reviewMetrics（两者未导出，只能经 buildStrategyContext 拿到）——
+// 逐个生成一条规则，连同全部字面量与函数名一起走真实写入口 saveStrategyVersion。
+// 今后谁在四个生产者里加了指标却忘了登记白名单，这条当场红并点名那个字符串。
+test("引用全部合法标识符的策略必须仍能保存（M17 反向对照）", async () => {
+	const store = createEmptyStore();
+	ensureDefaults(store, "tester");
+	const csv = await readFile(join(here, "../examples/demo-market.csv"), "utf8");
+	const parsed = parseMarketCsv(csv, { source: "sellersprite", capturedAt: "2026-08-22T00:00:00.000Z" });
+	const imported = importParsedMarket(store, {
+		marketName: "m17 identifier probe",
+		parsed,
+		capturedAt: "2026-08-22T00:00:00.000Z",
+		actor: "tester",
+	});
+	const profitInput = normalizeProfitInput({
+		marketId: imported.market.id,
+		salePrice: 25.99,
+		purchaseCost: 3.5,
+		fbaFee: 5.2,
+		referralRate: 0.15,
+		cvr: 0.12,
+		cpc: 0.85,
+		portfolioCapital: 20_000,
+	});
+	recordProfitEstimate(store, profitInput, estimateProfit(profitInput), "tester");
+	recordRisk(store, {
+		marketRef: imported.market.id,
+		certStatus: "pass",
+		ipRiskLevel: "pass",
+		seasonFlag: "clear",
+		policyFlag: "clear",
+		logisticsRisk: "pass",
+		evidence: [{ category: "policy", url: "https://sellercentral.amazon.com/", title: "Amazon policy" }],
+		actor: "tester",
+	});
+	recordReviewAnalysis(store, {
+		marketRef: imported.market.id,
+		sourceAsins: ["B0DEMO0007"],
+		reviewCount: 120,
+		themes: [{ name: "金属扣滑动", category: "quality", count: 38, fixability: "factory", recommendation: "增加防滑纹" }],
+		estimatedRating: 4.4,
+		actor: "tester",
+	});
+
+	const metricNames = Object.keys(buildStrategyContext(store, imported.market.id).context.metrics).sort();
+	// 四个生产者各取一个哨兵：context.metrics 意外变空时这条用例不许静默空转
+	for (const probe of ["listing_count", "qualify_rank_depth", "gross_margin", "capital_share", "risk_overall", "est_rating_gap"]) {
+		assert.ok(metricNames.includes(probe), `${probe} 应由真实生产者产出，夹具不完整会让本用例失去意义`);
+	}
+
+	const rules = metricNames.map((name, index) =>
+		`      - id: probe_metric_${index}\n        when: "${name} != red"\n        action: review_if_fail\n        label: "指标 ${name}"`
+	);
+	// 字面量九个（true / false / null / pass / red / strong / clear / review / unknown）与唯一的策略函数
+	rules.push(`      - id: probe_literals\n        when: "true != false && null != unknown && pass != red && strong != clear && review != unknown"\n        action: review_if_fail\n        label: 字面量`);
+	rules.push(`      - id: probe_function\n        when: "qualify_rank_depth(300) >= 20"\n        action: review_if_fail\n        label: 策略函数`);
+	const yaml = `meta:\n  name: m17-identifier-probe\n  display_name: M17 标识符探针\nstages:\n  - stage: market_screen\n    rules:\n${rules.join("\n")}\nscoring:\n  weights:\n    demand: 1\n`;
+
+	const saved = saveStrategyVersion(store, { yaml, actor: "tester" });
+	assert.equal(saved.definition.stages[0].rules.length, metricNames.length + 2);
+});

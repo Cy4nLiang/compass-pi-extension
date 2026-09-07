@@ -9,7 +9,7 @@ import { estimateProfit, normalizeProfitInput, profitMetrics } from "../economic
 import { calculateMarketMetrics } from "../metrics.ts";
 import { evaluateExpression, evaluateStrategy, gateThresholdsFor, parseStrategyYaml, ruleThreshold, slugify, strategyTargetDailyUnits, strategyTargetMonthlyUnits } from "../strategy.ts";
 import type { StrategyContext } from "../strategy.ts";
-import type { MetricEvidence, MetricMap, MetricScalar } from "../types.ts";
+import type { MetricEvidence, MetricMap, MetricScalar, StrategyDefinition } from "../types.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -433,7 +433,10 @@ test("原型属性名不是指标：require 规则必须转人工复核而不是
 		assert.equal(probe.missing, true, `${name} 应按缺指标处理`);
 		assert.equal(probe.value, undefined);
 	}
-	const strategy = parseStrategyYaml(`
+	// M17 起 parseStrategyYaml 按白名单拒收未知标识符，原型名在保存前就过不去；
+	// 而运行期真正的触发面是**存量 store 里的 definition**（它绕过 parseStrategyYaml）。
+	// 所以夹具改为直接构造 StrategyDefinition，原有断言一条不删，另把「新解析会被拒」钉住。
+	const protoYaml = `
 meta:
   name: proto-probe
 stages:
@@ -443,7 +446,21 @@ ${PROTOTYPE_NAMES.map((name, index) => `      - id: proto_gate_${index}\n       
 scoring:
   weights:
     demand: 1
-`);
+`;
+	assert.throws(() => parseStrategyYaml(protoYaml), /未知指标名/u, "原型名不是指标，保存时就该被拒");
+	const strategy: StrategyDefinition = {
+		meta: { name: "proto-probe" },
+		stages: [{
+			stage: "market_screen",
+			rules: PROTOTYPE_NAMES.map((name, index) => ({
+				id: `proto_gate_${index}`,
+				when: `${name} != red`,
+				action: "require" as const,
+				label: `硬门槛 ${name}`,
+			})),
+		}],
+		scoring: { weights: { demand: 1 } },
+	};
 	const result = evaluateStrategy(strategy, { metrics: {}, listings: [] }, "screen");
 	assert.equal(result.outcome, "review");
 	assert.deepEqual(result.rules.map((rule) => rule.status), ["missing", "missing", "missing", "missing", "missing"]);
@@ -457,7 +474,9 @@ scoring:
 
 // —— 审计 M7 回归 ——
 test("veto 规则引用原型属性名同样按缺指标处理，不会静默放行", () => {
-	const strategy = parseStrategyYaml(`
+	// 同上：新解析被 M17 的白名单拒收，运行期触发面只剩存量 definition
+	assert.throws(
+		() => parseStrategyYaml(`
 meta:
   name: proto-veto
 stages:
@@ -470,7 +489,14 @@ stages:
 scoring:
   weights:
     demand: 1
-`);
+`),
+		/未知指标名/u,
+	);
+	const strategy: StrategyDefinition = {
+		meta: { name: "proto-veto" },
+		stages: [{ stage: "market_screen", rules: [{ id: "proto_veto", when: "constructor == red", action: "veto", label: "红海一票否决" }] }],
+		scoring: { weights: { demand: 1 } },
+	};
 	const result = evaluateStrategy(strategy, { metrics: {}, listings: [] }, "screen");
 	assert.equal(result.rules[0].status, "missing");
 	assert.equal(result.outcome, "review");
@@ -711,3 +737,41 @@ test("ruleThreshold 的数字文法与 tokenize 一致：.35 / 3. / 35e-2 不得
 	assert.deepEqual([...gateThresholdsFor(undefined).fallbacks].sort(), ["cpcHard", "cpcReview", "grossMargin", "newListingShare", "qrdMinDepth", "qrdTargetUnits"]);
 });
 
+
+
+// —— 审计 M17 回归 ——
+// 修前：表达式里的未知标识符一律被当成「指标引用」，readMetricValue 对不存在的键返回 null，
+// 于是拼错的指标名求值成 missing → 规则判 missing → 结论 review，运营看到的是
+// 「缺少指标：gros_margin，转人工复核」——把「你的策略写错了」伪装成「这个市场缺数据」，
+// 而且会一路落进 strategyRuns、报告与待办。函数名同理：callFunction 的 missing 早退排在
+// 「不支持的策略函数」检查之前，qualify_rank_dept(gross_margin) 这种拼错的函数名在解析期
+// 与运行期都静默判 missing（只有实参写成数字字面量时才会被现有代码抓到）。
+test("策略保存时拼错的指标名必须被拒绝，不得静默判 missing（M17）", () => {
+	// ① 正向控制：内置策略必须仍能解析。ensureDefaults 走的就是这条路，它一红等于扩展装不起来。
+	assert.doesNotThrow(() => parseStrategyYaml(DEFAULT_STRATEGY_YAML));
+
+	// ② 拼错的指标名：整条策略在版本落库之前就该被拒绝，并点名是哪条规则、哪个标识符、像谁
+	assert.throws(
+		() => parseStrategyYaml(DEFAULT_STRATEGY_YAML.replace('when: "gross_margin >= 0.40"', 'when: "gros_margin >= 0.40"')),
+		(error: unknown) => {
+			assert.ok(error instanceof Error);
+			assert.match(error.message, /未知指标名/u);
+			assert.match(error.message, /gros_margin/u, "错误信息要点名是哪个标识符");
+			assert.match(error.message, /gross_margin_gate/u, "错误信息要点名是哪条规则");
+			assert.match(error.message, /最接近的可用指标：gross_margin/u, "错误信息要给出可操作的近似名");
+			return true;
+		},
+	);
+
+	// ③ 拼错的函数名，且实参是指标引用：修前被 args.some(missing) 的早退整条吞掉
+	assert.throws(
+		() => parseStrategyYaml(DEFAULT_STRATEGY_YAML.replace('when: "qualify_rank_depth(300) >= 20"', 'when: "qualify_rank_dept(gross_margin) >= 20"')),
+		/不支持的策略函数/u,
+	);
+	// 同一个拼错的函数名，实参换成数字字面量——这是修前唯一会报错的形状，用来证明 ③ 不是
+	// 靠这条老路径变红的（实参含指标引用才是真实触发面）
+	assert.throws(
+		() => parseStrategyYaml(DEFAULT_STRATEGY_YAML.replace('when: "qualify_rank_depth(300) >= 20"', 'when: "qualify_rank_dept(300) >= 20"')),
+		/不支持的策略函数/u,
+	);
+});

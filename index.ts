@@ -281,6 +281,13 @@ export default function compassExtension(pi: ExtensionAPI): void {
 	// 未落盘的 MCP 计量：server → tool → 次数。热路径 hook 只做内存自增（不变式：hook 零写事务），
 	// 在安全点（任意写事务顺带 / 打开工作台 / 查预算与待办 / 正常退出）统一落账
 	const pendingUsage = new Map<string, Map<string, number>>();
+	// 在途预占：已经放行、但结果还没回来的 MCP 调用（toolCallId → 命中的池名）。宿主同一轮是
+	// 「先把整批的 tool_call 判定跑完，再 Promise.all 执行」，所以判定期间 pendingUsage 里一条都
+	// 没有——不预占的话一批 k 个调用会各自看到同一个旧计数而全部放行，触限前一次都不落地
+	//（Sorftime 按次计费，多出来的是真钱）。与 deductedTicketCalls 同一形状：结果一到就删，
+	// 有界防泄漏；纯内存，不参与落账（落账只认 pendingUsage，否则会与 tool_result 的自增双计）
+	const inflightMcpCalls = new Map<string, readonly string[]>();
+	const INFLIGHT_CALLS_MAX = 64;
 	// tool_call 拦截的廉价预过滤缓存：避免为每个无关工具调用做 repo.load()
 	let cachedPoolSources: string[] = [];
 	// 当前会话持有的 Web 工作台句柄：/compass-web 启动、session_shutdown 兜底关闭。
@@ -309,6 +316,12 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			let total = 0;
 			for (const calls of tools.values()) total += calls;
 			if (total > 0) counts[server] = total;
+		}
+		// 并进在途预占：熔断门只读这一个数字，不并进来等于没预占。口径外溢是有意的——
+		// compass_budget status 与 compass_gaps 的预检投影也走这个函数，会把在途调用算进
+		// 「本月已用」；这两处都不与 MCP 调用同轮，看到的数字仍与真实消耗一致
+		for (const servers of inflightMcpCalls.values()) {
+			for (const server of servers) counts[server] = (counts[server] ?? 0) + 1;
 		}
 		return counts;
 	}
@@ -2442,6 +2455,11 @@ export default function compassExtension(pi: ExtensionAPI): void {
 
 	pi.on("tool_result", async (event, ctx) => {
 		if (!ctx.isProjectTrusted()) return;
+		// 在途预占释放：排在最前，且不包 try——Map.delete 抛不出错，而漏释放会让
+		// pendingCallCounts 永久虚高、把池提前熔断，比漏计一次账更难排查。
+		// 与紧随其后的计量之间不得插入 await：同批的 tool_result 是并发跑的，
+		// 中间让出微任务会让总数瞬时偏低
+		inflightMcpCalls.delete(event.toolCallId);
 		if (!event.toolName.startsWith("compass_")) {
 			// MCP 计量：只做内存自增（O(1)、零 I/O），落账在安全点完成；计量绝不影响工具结果
 			let sample: ReturnType<typeof classifyMcpToolResult>;
@@ -2522,6 +2540,19 @@ export default function compassExtension(pi: ExtensionAPI): void {
 				// 熔断是硬边界，拿着确认单也不该越过；确认单只回答「这次调用有没有经过人」
 				const refusal = gapfillTicketGate(store, { toolName: event.toolName, toolCallId: event.toolCallId, input: event.input as Record<string, unknown> | undefined }, fillMode === "strict");
 				if (refusal) return { block: true, reason: refusal };
+				// 在途预占登记：必须排在**两道门都放行之后**——被拦的调用走 kind:"immediate"，
+				// 根本不产生 tool_result，登记了没人释放，池会被永久性地提前熔断。
+				// 排除 compass_ 自家工具：池名理论上可以被配成 "compass"，那会让下面几段 block
+				// 早退的调用（compass_gaps off、重复 CSV）留下永不释放的条目。
+				// 不发请求的网关形态（describe / search / instructions / action）不花钱，与确认单侧同口径
+				if (!event.toolName.startsWith("compass_") && (event.toolName !== "mcp" || isGatewayCall(event.input as Record<string, unknown> | undefined))) {
+					const targets = mcpCallTargetServers(store, { toolName: event.toolName, input: event.input as Record<string, unknown> | undefined });
+					// mcpScript 命中多池时逐池各占 1 次：保守高估，与「计费口径宁多勿漏」同向
+					if (targets.length) {
+						if (inflightMcpCalls.size >= INFLIGHT_CALLS_MAX) inflightMcpCalls.delete(inflightMcpCalls.keys().next().value as string);
+						inflightMcpCalls.set(event.toolCallId, targets);
+					}
+				}
 			}
 			// compass_gaps 的付费 action 拦截。它不匹配任何池前缀，进不了上面那个预过滤分支，
 			// 所以只能另起一个独立 if（照下面 compass_import_csv 那段的写法）。

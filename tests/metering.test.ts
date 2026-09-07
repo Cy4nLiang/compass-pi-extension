@@ -291,6 +291,53 @@ test("classifyMcpToolResult 按拒绝名单计费：请求发出去了就算钱�
 	assert.equal(classifyMcpToolResult("sorftime_doc", { server: "sorftime", resourceUri: "res://doc" })?.tool, "res://doc");
 });
 
+// 审计 G3：direct 工具的失败分支（tool_error / call_failed / aborted）在 details 里**不带 tool**，
+// 只有成功分支带（pi-mcp-adapter 2.27.0 的 guardedMcpDetails 只产 mcpResult / outputGuard）。
+// 后果不是「钱算错了」——金额与次数只读 calls / amountCny——而是 recordMcpUsage 的
+// `server tool` 合并键把同一批里不同工具的失败撞成一条「unknown × N」，工具维度事后不可恢复。
+test("classifyMcpToolResult：direct 失败结果按工具名前缀归因，不落 unknown 桶（G3）", () => {
+	for (const [name, details] of [
+		["directToolError", ADAPTER_DETAILS.directToolError],
+		["directCallFailed", ADAPTER_DETAILS.directCallFailed],
+		["directAborted", ADAPTER_DETAILS.directAborted],
+		// 不计费的失败同样要归因：tool 与 billable 是正交的两个维度
+		["directServerUnavailable", ADAPTER_DETAILS.directServerUnavailable],
+	] as const) {
+		assert.equal(classifyMcpToolResult("sorftime_ProductResearch", details)?.tool, "ProductResearch", `${name} 应按工具名前缀归因`);
+	}
+	// 归因只改 tool，不得顺手动了计费判定（拒绝名单仍是唯一口径）
+	assert.equal(classifyMcpToolResult("sorftime_ProductResearch", ADAPTER_DETAILS.directServerUnavailable)?.billable, false);
+	assert.equal(classifyMcpToolResult("sorftime_ProductResearch", ADAPTER_DETAILS.directToolError)?.billable, true);
+
+	// 回退顺序不许改：details.tool → details.resourceUri → 工具名前缀 → "unknown"
+	assert.equal(classifyMcpToolResult("sorftime_doc", { server: "sorftime", tool: "P", resourceUri: "res://doc" })?.tool, "P");
+	assert.equal(classifyMcpToolResult("sorftime_doc", { server: "sorftime", resourceUri: "res://doc" })?.tool, "res://doc");
+
+	// 边界：池名自带下划线时按 server 的长度截，不能按第一个下划线切
+	assert.equal(classifyMcpToolResult("my_mcp_ProductResearch", { error: "tool_error", server: "my_mcp" })?.tool, "ProductResearch");
+	// 边界：工具名恰等于池名——没有前缀可截，不猜
+	assert.equal(classifyMcpToolResult("sorftime", { error: "tool_error", server: "sorftime" })?.tool, "unknown");
+	// 边界：截完是空串必须回落 "unknown"。载荷缓存没有 recordMcpUsage 的 `|| "unknown"` 兜底，
+	// 留下一条 tool:"" 的条目会让 convert 的跳过文案指不出是谁
+	assert.equal(classifyMcpToolResult("sorftime_", { error: "tool_error", server: "sorftime" })?.tool, "unknown");
+	// 边界：前缀与 details.server 不符（宿主把 toolPrefix 配成 none / short / 自定义）→ 降级回 unknown
+	assert.equal(classifyMcpToolResult("other_Tool", { error: "tool_error", server: "sorftime" })?.tool, "unknown");
+	// 边界：网关形态的工具名恒为 "mcp"，截不出任何东西（网关的 call 分支本来就带 tool）
+	assert.equal(classifyMcpToolResult("mcp", { mode: "call", error: "tool_error", server: "sorftime" })?.tool, "unknown");
+
+	// 后果级：同一批里两个不同工具各失败一次，必须落成两条事件，而不是合并键撞号后的一条「unknown × 2」
+	const store = createEmptyStore();
+	ensureDefaults(store, "tester");
+	const first = classifyMcpToolResult("sorftime_category_report", ADAPTER_DETAILS.directCallFailed);
+	const second = classifyMcpToolResult("sorftime_keyword_list", ADAPTER_DETAILS.directToolError);
+	assert.ok(first && second, "两条 direct 失败都应被识别为 MCP 样本");
+	const events = recordMcpUsage(store, [
+		{ server: first.server, tool: first.tool, calls: 1 },
+		{ server: second.server, tool: second.tool, calls: 1 },
+	], "compass-meter");
+	assert.deepEqual(events.map((event) => event.tool).sort(), ["category_report", "keyword_list"]);
+});
+
 test("evaluateMcpGate blocks only fused metered pools and names the exit path", () => {
 	const store = createEmptyStore();
 	ensureDefaults(store, "tester");

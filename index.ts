@@ -2425,6 +2425,14 @@ export default function compassExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
+		// 在途预占的唯一清空点，必须排在下面那道早退守卫**之前**：新一轮开始时，
+		// 上一轮的调用要么已回结果（tool_result 释放过）、要么被中断——中断的那些
+		// 走 kind:"immediate"（宿主在 beforeToolCall 返回后立刻查 signal.aborted，
+		// 后加载扩展的 block 同理），根本不产生 tool_result，登记了没人释放。
+		// 所以此刻 Map 里剩下的**按定义就是泄漏**，清掉不会误删在途的调用。
+		// 不清的话幽灵计数会活到整个 pi 进程结束（工厂闭包不随会话销毁），
+		// 表现是「明明没调几次却说熔断了」，且 /reload 前不自愈。
+		inflightMcpCalls.clear();
 		if (!historyBriefEnabled || !ctx.isProjectTrusted()) return;
 		try {
 			const store = await repository(ctx).load();

@@ -155,10 +155,25 @@ test("熔断门在途预占：并进 pendingCallCounts、登记在两道门之�
 	const gateAt = toolCall.indexOf("evaluateMcpGate(");
 	const ticketAt = toolCall.indexOf("gapfillTicketGate(");
 	const inflightAt = toolCall.indexOf("inflightMcpCalls.set(");
+	// 锚点必须是确认门的**早退语句**而不是它的调用点：锚在 `gapfillTicketGate(` 上时，
+	// 把登记块塞进 `const refusal = …` 与 `if (refusal) return` 这两行之间照样绿，
+	// 而那恰好就是本断言声称要挡的泄漏
+	const refusalReturnAt = toolCall.indexOf("if (refusal) return { block: true, reason: refusal };");
 	assert.ok(inflightAt > 0, "在途预占必须登记在 tool_call hook 里：tool_result 太晚，同一批的调用彼此看不见");
 	assert.ok(gateAt > 0 && gateAt < ticketAt, "熔断门仍要排在确认门之前");
-	assert.ok(ticketAt < inflightAt, "在途预占要登记在两道门之后：被拦的调用没有 tool_result，登记了没人释放");
+	assert.ok(refusalReturnAt > ticketAt, "确认门的早退语句找不到了（或跑到调用点前面去了）——本用例的切片已失效");
+	assert.ok(refusalReturnAt < inflightAt, "在途预占要登记在两道门的**早退之后**：被拦的调用走 kind:\"immediate\"、没有 tool_result，登记了没人释放");
 	assert.match(toolCall, /^\t{4}if \(refusal\) return \{ block: true, reason: refusal \};$/mu, "确认门的早退必须留在登记之前（缩进层级一并钉住：预过滤分支内 4 tab）");
+
+	// ⓑ' 泄漏兜底：中断（ESC）与后加载扩展的 block 都不产生 tool_result，条目会永久滞留在
+	// 工厂闭包里（不随会话销毁）。每轮开始清一次是唯一的清空点，且必须排在该 hook 的早退守卫之前
+	const beforeAgent = hookBodies(source).get("before_agent_start");
+	assert.ok(beforeAgent, 'index.ts 里找不到 pi.on("before_agent_start")');
+	const clearAt = beforeAgent.indexOf("inflightMcpCalls.clear()");
+	const guardAt = beforeAgent.indexOf("if (!historyBriefEnabled");
+	assert.ok(clearAt > 0, "每轮开始必须清空在途预占：被中断的调用不回 tool_result，不清就是永久幽灵计数");
+	assert.ok(guardAt > 0, "before_agent_start 的早退守卫找不到了——本用例的切片已失效");
+	assert.ok(clearAt < guardAt, "清空要排在 before_agent_start 的早退守卫之前：历史速览关掉时那道守卫会直接 return，清空就永远跑不到");
 
 	// ⓒ 释放点在 tool_result，且排在计量之前。漏释放比漏计量更难查：pendingCallCounts
 	// 会永久虚高，表现是「明明没调几次却说熔断了」，而且 /reload 前不会自愈

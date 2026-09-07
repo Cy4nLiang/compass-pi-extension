@@ -807,11 +807,18 @@ test("参考成本 ③：strict 档固定参数用 String() 比对，且参考�
 	const gateEnd = source.indexOf("function refundTicketCall(");
 	assert.ok(gateStart > 0 && gateEnd > gateStart, "抽不到 gapfillTicketGate 的函数体——切片已失效");
 	const gate = source.slice(gateStart, gateEnd);
+	// 门禁里有**两处**固定参数比对（差评分支、参考成本分支），各自切片各自钉：只在整个函数体里搜一次
+	// String() 会被差评分支单独满足，参考成本分支退化成裸比对照样绿（2026-09-07 verifier 核出）
+	const materialStart = gate.indexOf('if (covered.kind === "material")');
+	const costStart = gate.indexOf('if (covered.kind === "cost_reference")');
+	assert.ok(materialStart > 0 && costStart > materialStart, "差评单与参考成本单的复核分支都得在门禁里，且差评分支在前——切片已失效");
+	const material = gate.slice(materialStart, costStart);
+	const cost = gate.slice(costStart);
 	// 差评单的 review_type 是字符串、参考成本单的 page 在 schema 里是整数：不 String() 化就会把合规的 page=1 当成不符
-	assert.match(gate, /String\(params\[key\]\) !== String\(expected\)/u, "固定参数比对必须两边都 String()");
-	assert.doesNotMatch(gate, /if \(params\[key\] !== expected\)/u, "裸比对会把整数 page=1 判成与 \"1\" 不符");
-	assert.match(gate, /covered\.kind === "cost_reference"/u, "参考成本单要有自己的复核分支");
-	assert.match(gate, /requestParamsOf\(call\.input, "search_name"\)/u, "参考成本单按 search_name 取参数对象，与差评单按 asin 同口径");
+	assert.match(material, /if \(String\(params\[key\]\) !== String\(expected\)\)/u, "差评单固定参数比对必须两边都 String()");
+	assert.match(cost, /requestParamsOf\(call\.input, "search_name"\)/u, "参考成本单按 search_name 取参数对象，与差评单按 asin 同口径");
+	assert.match(cost, /if \(params\[key\] !== undefined && String\(params\[key\]\) !== String\(expected\)\)/u, "参考成本单：page 漏传按第 1 页放行，传了就两边 String() 比对");
+	assert.doesNotMatch(gate, /params\[key\] !== expected\)/u, "裸比对会把整数 page=1 判成与 \"1\" 不符——两个分支都不许");
 });
 
 test("参考成本 ④：approve 在 origin 缺省时排除参考成本链，既有快照链的 approve 不受新缺口影响", async () => {

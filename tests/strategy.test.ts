@@ -9,6 +9,7 @@ import { estimateProfit, normalizeProfitInput, profitMetrics } from "../economic
 import { calculateMarketMetrics } from "../metrics.ts";
 import { evaluateExpression, evaluateStrategy, gateThresholdsFor, parseStrategyYaml, ruleThreshold, slugify, strategyTargetDailyUnits, strategyTargetMonthlyUnits } from "../strategy.ts";
 import type { StrategyContext } from "../strategy.ts";
+import { POLICY_FLAGS, RISK_STATUSES, SEASON_FLAGS } from "../types.ts";
 import type { MetricEvidence, MetricMap, MetricScalar, StrategyDefinition } from "../types.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -774,4 +775,25 @@ test("策略保存时拼错的指标名必须被拒绝，不得静默判 missing
 		() => parseStrategyYaml(DEFAULT_STRATEGY_YAML.replace('when: "qualify_rank_depth(300) >= 20"', 'when: "qualify_rank_dept(300) >= 20"')),
 		/不支持的策略函数/u,
 	);
+});
+
+// M17 的白名单把「合法标识符」收成了闭集，于是 LITERALS 必须是三个风险枚举取值的**超集**——
+// 少一个，运营写对的 `cert_status == <新取值>` 就会在保存期被拒，错误文案还会把它说成
+// 「未知指标名」，比原缺陷更难排查。今天恰好完全覆盖纯属巧合：types.ts 里任一枚举加值都会破。
+// 与 KNOWN_METRIC_NAMES 那条双向集合等式同族，只是这一维原先没有钉子。
+// 断言锚在**后果**（这条策略能不能保存）而不是 LITERALS 这个内部 map，所以换实现也不会假绿。
+test("风险枚举的每个取值都必须是合法字面量，不得在策略保存期被当成未知指标名（M17 漂移锁）", () => {
+	const enumValues = [...new Set<string>([...RISK_STATUSES, ...SEASON_FLAGS, ...POLICY_FLAGS])];
+	assert.ok(enumValues.length > 0, "枚举取值抽空了——本用例已失效");
+	const rejected = enumValues.filter((value) => {
+		// 换掉内置策略里现成的那条风险规则，其余部分逐字不动：只有字面量这一维在变
+		const yaml = DEFAULT_STRATEGY_YAML.replace('when: "risk_overall == red"', `when: "risk_overall == ${value}"`);
+		try {
+			parseStrategyYaml(yaml);
+			return false;
+		} catch {
+			return true;
+		}
+	});
+	assert.deepEqual(rejected, [], "这些枚举取值不在 LITERALS 里，运营写对的策略会被拒收并被误报成「未知指标名」——请同步 strategy.ts 的 LITERALS");
 });

@@ -163,7 +163,11 @@ test("snapshot → economics → review/risk → full GSE → report remains rep
 		assert.match(loaded.candidates[0].decisionReason ?? "", /Gate 通过/);
 		assert.match(loaded.candidates[0].gateReason ?? "", /规则通过/);
 		assert.equal(loaded.candidates[0].stageReason, "粗筛与完整 Gate 均通过");
-		assert.ok(loaded.decisionLog.find((decision) => decision.type === "stage_move")?.strategyVersion);
+		const persistedMove = loaded.decisionLog.find((decision) => decision.type === "stage_move");
+		assert.ok(persistedMove?.strategyVersion);
+		// 阶段起止落在结构化字段上（M90），且这两个新可选字段能原样过 assertStore 与 save/load 往返
+		assert.equal(persistedMove?.fromStage, "lead");
+		assert.equal(persistedMove?.toStage, "deep_research");
 		assert.equal(loaded.decisionLog.find((decision) => decision.type === "decision")?.decisionStatus, "go");
 		assert.equal(result.full.result.outcome, "pass");
 		assert.equal(result.report.snapshotId, result.imported.snapshot.id);

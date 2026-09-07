@@ -134,6 +134,43 @@ test("补数确认门：hook 不重复注册、compass_gaps 串行、额度预�
 	assert.match(gateBody, /covered\.tools\.includes\(tool\)/u, "确认单要按工具白名单判，不能只看池名");
 });
 
+// 熔断门的在途预占。与上一条用例守的是同一个宿主事实（同一轮先把整批 tool_call 判定
+// 跑完，再 Promise.all 执行），但守的是**另一道门**：确认单额度靠 deductedTicketCalls
+// 预扣，熔断门靠 inflightMcpCalls 预占，两条各写各的，删掉哪一条都会让同批 k 个调用
+// 在触限前全部放行——Sorftime 按次计费，多出来的是真钱。
+test("熔断门在途预占：并进 pendingCallCounts、登记在两道门之后、释放在 tool_result 最前", async () => {
+	const source = await readFile(join(repoRoot, "index.ts"), "utf8");
+
+	// ⓐ 熔断门读的是 pendingCallCounts()，所以在途预占必须并进这个函数——只加一个 Map
+	// 而不并进来，等于没预占。先切到函数体再匹配：只搜标识符会被别处的引用蒙混过关
+	const countsStart = source.indexOf("function pendingCallCounts(");
+	const countsEnd = source.indexOf("function drainPendingUsage(");
+	assert.ok(countsStart > 0 && countsEnd > countsStart, "抽不到 pendingCallCounts 的函数体——本用例的切片已失效");
+	assert.match(source.slice(countsStart, countsEnd), /inflightMcpCalls/u, "pendingCallCounts 必须把在途预占并进来：熔断门只读这一个数字");
+
+	// ⓑ 登记点在 tool_call，且排在**两道门都放行之后**。被拦的调用走 kind:"immediate"，
+	// 根本不产生 tool_result——登记在门之前就没人释放，池会被永久性地提前熔断
+	const toolCall = hookBodies(source).get("tool_call");
+	assert.ok(toolCall, 'index.ts 里找不到 pi.on("tool_call")');
+	const gateAt = toolCall.indexOf("evaluateMcpGate(");
+	const ticketAt = toolCall.indexOf("gapfillTicketGate(");
+	const inflightAt = toolCall.indexOf("inflightMcpCalls.set(");
+	assert.ok(inflightAt > 0, "在途预占必须登记在 tool_call hook 里：tool_result 太晚，同一批的调用彼此看不见");
+	assert.ok(gateAt > 0 && gateAt < ticketAt, "熔断门仍要排在确认门之前");
+	assert.ok(ticketAt < inflightAt, "在途预占要登记在两道门之后：被拦的调用没有 tool_result，登记了没人释放");
+	assert.match(toolCall, /^\t{4}if \(refusal\) return \{ block: true, reason: refusal \};$/mu, "确认门的早退必须留在登记之前（缩进层级一并钉住：预过滤分支内 4 tab）");
+
+	// ⓒ 释放点在 tool_result，且排在计量之前。漏释放比漏计量更难查：pendingCallCounts
+	// 会永久虚高，表现是「明明没调几次却说熔断了」，而且 /reload 前不会自愈
+	const toolResult = hookBodies(source).get("tool_result");
+	assert.ok(toolResult, 'index.ts 里找不到 pi.on("tool_result")');
+	const releaseAt = toolResult.indexOf("inflightMcpCalls.delete(event.toolCallId)");
+	const classifyAt = toolResult.indexOf("classifyMcpToolResult(");
+	assert.ok(releaseAt > 0, "在途预占必须在 tool_result 里释放");
+	assert.ok(classifyAt > 0, "找不到计量分类调用——本用例的切片已失效");
+	assert.ok(releaseAt < classifyAt, "释放要排在计量之前：计量那段自带 catch，排在它后面会被一次分类异常带着跳过，预占就此泄漏");
+});
+
 test("生命周期 hook 仍带写事务——切片失效时这条先红", async () => {
 	// 反向哨兵：若 hookBodies 切出空片段或错位，上一条用例会假绿，而这条会立刻失败
 	const source = await readFile(join(repoRoot, "index.ts"), "utf8");

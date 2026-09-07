@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { compareSnapshotRecency, compareSnapshotRecencyDesc, DEFAULT_BUDGET_POOLS, DEFAULT_GATE_THRESHOLDS, DEFAULT_STRATEGY_ID, DEFAULT_STRATEGY_YAML, formatGatePercent, type GateThresholds, isNewerSnapshot } from "./defaults.ts";
 import type { DispatchAgentName, DispatchFacts } from "./dispatch.ts";
 import { profitMetrics } from "./economics.ts";
+import { NotFoundError, ValidationError } from "./errors.ts";
 import { PROFIT_ASSUMED_DEFAULTS } from "./gaps.ts";
 import {
 	calculateMetricDeltas,
@@ -198,8 +199,8 @@ export function findMarket(store: CompassStore, reference: string): Market {
 		(market) => normalizeLookup(market.name).includes(normalized) || market.keywords.some((keyword) => normalizeLookup(keyword).includes(normalized)),
 	);
 	if (matches.length === 1) return matches[0];
-	if (matches.length > 1) throw new Error(`市场引用“${reference}”不唯一：${matches.map((market) => market.id).join(", ")}`);
-	throw new Error(`未找到市场：${reference}`);
+	if (matches.length > 1) throw new ValidationError(`市场引用“${reference}”不唯一：${matches.map((market) => market.id).join(", ")}`);
+	throw new NotFoundError("market", `未找到市场：${reference}`);
 }
 
 export function findCandidate(store: CompassStore, reference: string): Candidate {
@@ -210,11 +211,11 @@ export function findCandidate(store: CompassStore, reference: string): Candidate
 		market = findMarket(store, reference);
 	} catch (error) {
 		// 按市场找不到时，错误应说的是「候选」——报「未找到市场」会把排障方向带偏
-		if (error instanceof Error && error.message.startsWith("未找到市场：")) throw new Error(`未找到候选：${reference}`);
+		if (error instanceof NotFoundError && error.entity === "market") throw new NotFoundError("candidate", `未找到候选：${reference}`);
 		throw error;
 	}
 	const candidate = store.candidates.find((item) => item.marketId === market.id);
-	if (!candidate) throw new Error(`市场 ${market.id} 尚无候选卡`);
+	if (!candidate) throw new NotFoundError("candidate", `市场 ${market.id} 尚无候选卡`);
 	return candidate;
 }
 
@@ -230,7 +231,7 @@ export function latestSnapshotIfPresent(store: CompassStore, marketId: string): 
 
 export function latestSnapshot(store: CompassStore, marketId: string): MarketSnapshot {
 	const snapshot = latestSnapshotIfPresent(store, marketId);
-	if (!snapshot) throw new Error(`市场 ${marketId} 尚无数据快照`);
+	if (!snapshot) throw new NotFoundError("snapshot", `市场 ${marketId} 尚无数据快照`);
 	return snapshot;
 }
 
@@ -248,7 +249,7 @@ function resolveStrategyChain(store: CompassStore, reference: string): StrategyV
 		if (bucket) bucket.push(strategy);
 		else chains.set(strategy.id, [strategy]);
 	}
-	if (chains.size > 1) throw new Error(`策略引用“${reference}”不唯一：${[...chains.keys()].join("、")}；请改用 strategy_id 精确指定`);
+	if (chains.size > 1) throw new ValidationError(`策略引用“${reference}”不唯一：${[...chains.keys()].join("、")}；请改用 strategy_id 精确指定`);
 	return [...chains.values()][0] ?? [];
 }
 
@@ -261,7 +262,7 @@ export function latestStrategyIfPresent(store: CompassStore, strategyId = DEFAUL
 
 export function latestStrategy(store: CompassStore, strategyId = DEFAULT_STRATEGY_ID): StrategyVersion {
 	const strategy = latestStrategyIfPresent(store, strategyId);
-	if (!strategy) throw new Error(`未找到策略：${strategyId}`);
+	if (!strategy) throw new NotFoundError("strategy", `未找到策略：${strategyId}`);
 	return strategy;
 }
 
@@ -277,7 +278,7 @@ export function findStrategyVersion(store: CompassStore, reference = DEFAULT_STR
 	// 各入口从 latestStrategy 换过来才不会丢原有的可查性。
 	const byWholeName = latestStrategyIfPresent(store, reference);
 	if (byWholeName) return byWholeName;
-	throw new Error(`未找到策略版本：${reference}`);
+	throw new NotFoundError("strategy", `未找到策略版本：${reference}`);
 }
 
 function appendDecision(store: CompassStore, input: Omit<DecisionLog, "id" | "createdAt">): DecisionLog {
@@ -737,7 +738,7 @@ export function buildStrategyContextForSnapshot(
 	const snapshot = snapshotId
 		? store.snapshots.find((item) => item.id === snapshotId && item.marketId === marketId)
 		: latestSnapshot(store, marketId);
-	if (!snapshot) throw new Error(`市场 ${marketId} 未找到快照 ${snapshotId}`);
+	if (!snapshot) throw new NotFoundError("snapshot", `市场 ${marketId} 未找到快照 ${snapshotId}`);
 	const metrics: MetricMap = { ...snapshot.metrics };
 	const profit = latestForMarket(store.profitEstimates, marketId);
 	if (profit) Object.assign(metrics, profitMetrics(profit.input, profit.result, profit.createdAt));
@@ -2073,7 +2074,7 @@ export function submitTodoResolution(
 	if (existing?.status === "resolved") throw new Error(`待办 ${input.todoRef} 已勾选处理，如需重新处理请先重开`);
 	// 必须命中当前活跃派生清单：条件已自然解决的待办不接受提交
 	const todo = listWorkbenchTodos(store, now).find((item) => item.id === input.todoRef);
-	if (!todo) throw new Error(`待办 ${input.todoRef} 不存在或已消失（可能条件已解决）`);
+	if (!todo) throw new NotFoundError("todo", `待办 ${input.todoRef} 不存在或已消失（可能条件已解决）`);
 	if (!isResolvableTodoKind(todo.kind)) throw new Error(`待办 ${input.todoRef} 属 ${todo.kind}，该类待办由系统动作自动消失，无需提交处理结果`);
 	const attempt: TodoResolutionAttempt = { submittedAt: now, submittedBy: actor, note, evidence };
 	// 提交时刻的水位：complete 据此判断「提交→勾选之间是否出现未经核对的新事实」。

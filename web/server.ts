@@ -2,6 +2,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { readdir, readFile, realpath, stat } from "node:fs/promises";
 import { dirname, extname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { NotFoundError, ValidationError } from "../errors.ts";
 import { performCsvImport } from "../importer.ts";
 import {
 	completeTodoResolution,
@@ -89,19 +90,23 @@ function statusForError(error: unknown): number {
 	return error instanceof HttpError ? error.status : 500;
 }
 
-// 领域层抛的中文错误绝大多数是「用户给的输入被业务规则拒绝」（400/404）；
-// 系统故障由 store.ts 用 StoreIoError 显式标记——按类型判定而非匹配文案，
-// 因为底层 fs 错误的措辞由运行时决定，正则白名单必然漏判。
+// 错误分级全部按类型判定，不猜文案：领域层的「找不到实体」抛 NotFoundError（404）、
+// 「入参被业务规则拒绝」抛 ValidationError（400），系统故障由 store.ts 的 StoreIoError
+// 与 errno code 标记（500）。措辞是给人看的，改一个字不该改状态码；反过来靠中文关键词
+// 白名单分级必然漏判——同一概念换个说法就掉进另一档。
 function asDomainError(error: unknown): never {
 	if (error instanceof HttpError) throw error;
 	if (error instanceof StoreIoError) throw new HttpError(500, error.message);
+	// 这两条必须排在下面的 errno 兜底之前：领域错误类哪天加了 code 字段就会被 500 抢走
+	if (error instanceof NotFoundError) throw new HttpError(404, error.message);
+	if (error instanceof ValidationError) throw new HttpError(400, error.message);
 	// 带 errno code 的一律是文件系统故障（权限、只读挂载、磁盘满）：store.ts 里仍有
 	// mkdir/stat/unlink 等零散调用未包成 StoreIoError，这条兜底避免它们被误报成客户端错误
 	if (typeof (error as NodeJS.ErrnoException).code === "string") {
 		throw new HttpError(500, `罗盘数据读写失败：${error instanceof Error ? error.message : String(error)}`);
 	}
+	// 尚未换成领域错误类的裸 Error：按「用户输入被业务规则拒绝」兜底，与改造前一致
 	const message = error instanceof Error ? error.message : String(error);
-	if (/未找到市场|未找到候选|尚无候选卡|未找到策略|未找到快照/.test(message)) throw new HttpError(404, message);
 	throw new HttpError(400, message);
 }
 

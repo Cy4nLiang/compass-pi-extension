@@ -465,6 +465,29 @@ test("确认门：不花钱的网关形态不预扣、convert 只收确认单批
 	assert.match(convert, /mcpPayloads\.since\(ticket\.server, ticket\.issuedAt\)\.filter\(\(entry\) => ticket\.tools\.includes\(entry\.tool\)\)/u, "convert 只收确认单批的工具的返回");
 });
 
+// —— 审计 G5 的配套钉子：熔断门放行「不发请求的网关形态」之后，approve 的熔断预检就不能再用
+// 「有 server 无 tool」的合成形态发问——那正是被豁免的形状，预检会被自己的豁免打成永远放行，
+// 运营拿到一张注定中途熔断的确认单，前几次真钱照花。这条链路零行为级覆盖（测试不 import
+// index.ts），只能钉源码；锚的是**发问的那一行**（产生后果的语句本身），不是 evaluateMcpGate
+// 这个标识符或它的判定来源。
+test("compass_gaps approve 的熔断预检必须按真调用形态发问（G5）", async () => {
+	const source = await readFile(join(repoRoot, "index.ts"), "utf8");
+	const body = toolBody(source, "compass_gaps");
+	const start = body.indexOf('if (action === "approve")');
+	const end = body.indexOf('if (action === "convert")', start);
+	assert.ok(start > 0 && end > start, "抽不到 approve 分支——切片已失效");
+	const approve = body.slice(start, end);
+	// 按行抓而不是 `[^)]*`：实参里有嵌套的对象字面量与调用，字符类会在内层右括号截断造成假红
+	const asks = approve.split("\n").filter((line) => line.includes("evaluateMcpGate("));
+	assert.notEqual(asks.length, 0, "approve 分支里找不到熔断预检——切片或调用写法已变");
+	// 负向全称断言：不带 tool 的发问一条都不许有
+	assert.deepEqual(
+		asks.filter((line) => !/\btool:/u.test(line)),
+		[],
+		"预检必须带 tool（这批的第一步真工具名），否则会被「不发请求的网关形态放行」这条豁免打成永远放行",
+	);
+});
+
 // —— D-1 缺陷组 ②：毛利 Gate 阈值不得在三处以字面量比较（2026-09-05）——
 // 负向全称断言：命中行数必须为 0，而不是「≥N」。写完后把 economics.ts 那处临时改回 `< 0.4` 跑一遍确认真红。
 test("毛利 Gate 阈值不得在 economics / service / index 里以字面量比较（D-1 缺陷组 ②）", async () => {

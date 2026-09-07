@@ -399,6 +399,56 @@ test("evaluateMcpGate：禁用优先于熔断，理由说的是禁用而不是�
 	assert.doesNotMatch(blocked.reason, /monthly_call_limit/);
 });
 
+// 审计 G5：熔断后连「列出这个源有哪些工具」都被拦。列工具 / describe / search / instructions /
+// connect / auth-* 都不向服务端发 tools/call，因而不花钱——计量侧早就是同一条界线
+// （classifyMcpToolResult 对 mode !== "call" 返回 undefined），熔断门必须与它对齐。
+test("evaluateMcpGate：熔断只拦真调用，不发请求的网关形态放行（G5）", () => {
+	const store = createEmptyStore();
+	ensureDefaults(store, "tester");
+	configureBudget(store, { source: "sorftime", monthlyCallLimit: 5 });
+	const fused = { sorftime: 5 };
+	// 前提：这个池确实已经熔断（下面的放行不能是「压根没熔断」造成的假绿）
+	assert.ok(evaluateMcpGate(store, { toolName: "sorftime_ProductResearch" }, fused), "前提不成立：池没有熔断");
+
+	// 放行侧：白名单里的非调用形态
+	for (const [name, input] of [
+		["列工具", { server: "sorftime" }],
+		["describe", { server: "sorftime", describe: "sorftime_ProductResearch" }],
+		["search", { server: "sorftime", search: "keyword" }],
+		["search 带修饰参数", { server: "sorftime", search: "keyword", regex: true, includeSchemas: false, limit: 5, offset: 0 }],
+		["instructions", { server: "sorftime", instructions: "sorftime" }],
+		["connect", { server: "sorftime", connect: "sorftime" }],
+		["auth-start", { server: "sorftime", action: "auth-start" }],
+		["auth-complete", { server: "sorftime", action: "auth-complete" }],
+		["ui-messages", { server: "sorftime", action: "ui-messages" }],
+	] as const) {
+		assert.equal(evaluateMcpGate(store, { toolName: "mcp", input }, fused), undefined, `${name} 不发请求、不花钱，熔断后应放行`);
+	}
+
+	// 反向对照：真调用在熔断后照样拦。这几条不是缺陷，是护栏——放宽豁免时它们必须先红
+	for (const [name, call] of [
+		["网关规范形态", { toolName: "mcp", input: { server: "sorftime", tool: "ProductResearch" } }],
+		["网关不带 server", { toolName: "mcp", input: { tool: "sorftime_ProductResearch" } }],
+		["直连工具", { toolName: "sorftime_ProductResearch" }],
+		["mcpScript", { toolName: "mcpScript", input: { code: "await tools.sorftime_ProductResearch({})" } }],
+		// 判据是白名单：名单外的一切一律当调用照拦。「参数套进 args 里」的兼容形态会被宿主
+		// 展开后真发请求；action 的未知取值与未来新增的键同理——判不准就拦，代价只是少放行
+		// 一次免费请求，而放错要花真钱
+		["参数套进 args", { toolName: "mcp", input: { server: "sorftime", args: { keyword: "x" } } }],
+		["action 取值不在名单里", { toolName: "mcp", input: { server: "sorftime", action: "adapter_2_99_新动作" } }],
+		["名单外的新键", { toolName: "mcp", input: { server: "sorftime", newGatewayKey: 1 } }],
+	] as const) {
+		assert.ok(evaluateMcpGate(store, call, fused), `${name} 是（或可能是）真调用，熔断后必须拦`);
+	}
+
+	// 豁免只覆盖熔断，不覆盖禁用：`enabled=false` 的语义是「当前不允许使用这个源」，与花不花钱无关，
+	// 三处同口径（recordCost / compass_data_route / evaluateMcpGate）
+	configureBudget(store, { source: "sorftime", enabled: false });
+	const disabled = evaluateMcpGate(store, { toolName: "mcp", input: { server: "sorftime" } }, { sorftime: 0 });
+	assert.ok(disabled, "池被禁用时连列工具都不放行");
+	assert.match(disabled.reason, /已禁用/);
+});
+
 test("non-finite monthlyLimitCny is rejected before it can poison the store", async () => {
 	const root = await mkdtemp(join(tmpdir(), "compass-limit-nan-"));
 	try {

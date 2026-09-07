@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { parseMarketCsv } from "../csv.ts";
-import { ensureDefaults, importMarketAndScreen, verifyTodoResolution } from "../service.ts";
+import { createLead, ensureDefaults, importMarketAndScreen, verifyTodoResolution } from "../service.ts";
 import { CompassRepository } from "../store.ts";
 import { startCompassWebServer, type CompassWebServer } from "../web/server.ts";
 
@@ -796,5 +796,36 @@ test("前端调用的 /api/ 路径都在服务端路由表里（M101）", async 
 	assert.ok(called.length > 0, "前端一个 /api/ 路径都没抽到，抽取规则可能已失效");
 	for (const path of called) {
 		assert.ok(served.has(path), `前端调用了服务端没有的路径：${path}`);
+	}
+});
+
+test("找不到实体的错误按类型判 404，与错误文案里的关键词无关", async () => {
+	const { root, server } = await setupProject();
+	try {
+		await new CompassRepository(root).update((store) => {
+			ensureDefaults(store, "test");
+			createLead(store, { marketName: "typed error alpha", actor: "tester" });
+			createLead(store, { marketName: "typed error beta", actor: "tester" });
+		});
+
+		// 市场在、快照不在：文案是「尚无数据快照」，一个关键词都不含。
+		// 同一概念的另一种措辞（「未找到快照」）今天已经判 404，两种措辞两个状态码本身就是缺陷证据
+		const noSnapshot = await post(`${server.url}/api/report`, { marketRef: "typed error alpha" });
+		assert.equal(noSnapshot.status, 404, "市场下不存在快照实体应判 404，不能因为文案没写「未找到快照」就掉成 400");
+		assert.match(noSnapshot.body.error ?? "", /尚无数据快照/, "分级不得把领域文案吞掉");
+
+		// 待办 id 不存在：同样是「实体不存在」，文案同样不含任何关键词
+		const noTodo = await post(`${server.url}/api/todos/submit`, { todoId: "todo_budget_warning_absent", note: "探测未知待办的状态码" });
+		assert.equal(noTodo.status, 404, "不存在的待办 id 应判 404");
+		assert.match(noTodo.body.error ?? "", /不存在或已消失/);
+
+		// 反向对照：入参不合法仍是 400。把兜底整体改成 404 会让这两条立刻红
+		const ambiguous = await post(`${server.url}/api/report`, { marketRef: "typed error" });
+		assert.equal(ambiguous.status, 400, "市场引用不唯一是入参问题，仍应判 400");
+		assert.match(ambiguous.body.error ?? "", /不唯一/);
+		const blankRef = await post(`${server.url}/api/report`, { marketRef: "   " });
+		assert.equal(blankRef.status, 400, "空市场引用仍应判 400");
+	} finally {
+		await teardown(root, server);
 	}
 });

@@ -696,3 +696,27 @@ test("reviews 链：strict 档按确认单的 ASIN 与固定参数复核，且�
 	const deductAt = gate.indexOf("covered.remainingCalls -= 1;");
 	assert.ok(asinCheckAt > 0 && deductAt > asinCheckAt, "ASIN 复核必须排在额度预扣之前");
 });
+
+test("Web 错误分级按类型判定：asDomainError 里没有领域文案正则", async () => {
+	const source = await readFile(join(repoRoot, "web/server.ts"), "utf8");
+	// 先切到函数体再匹配：整文件搜会被上方那段注释误伤，是「假绿/假红」家族的老坑
+	const start = source.indexOf("function asDomainError");
+	assert.ok(start > 0, "web/server.ts 里找不到 asDomainError——本用例的切片锚点已失效");
+	const end = source.indexOf("\n}", start);
+	assert.ok(end > start, "asDomainError 的函数体切不出来——收尾的行首右括号找不到");
+	const body = source.slice(start, end);
+	assert.ok(body.length > 200, `asDomainError 切出的片段只有 ${body.length} 字符，切片锚点很可能已失效`);
+
+	// 分类信息必须落在类型上：函数体里出现中文实体文案就说明又在猜措辞，
+	// 改一个字状态码就错，同一概念换个措辞立刻判错
+	assert.doesNotMatch(body, /未找到|尚无/u, "asDomainError 不得按中文错误文案分级：404/400 的依据应是 NotFoundError / ValidationError");
+	assert.match(body, /error instanceof NotFoundError/u, "asDomainError 必须按类型认出「实体不存在」");
+	assert.match(body, /error instanceof ValidationError/u, "asDomainError 必须按类型认出「入参不合法」");
+
+	// 顺序承重：领域错误分支要排在 errno 兜底之前，
+	// 否则哪天领域错误类被加上 code 字段就会被 500 那条抢走
+	const notFoundAt = body.indexOf("NotFoundError");
+	const errnoAt = body.indexOf("ErrnoException");
+	assert.ok(errnoAt > 0, "找不到 errno 兜底分支——本用例的切片已失效");
+	assert.ok(notFoundAt < errnoAt, "领域错误分支必须排在 errno 兜底之前：带 code 字段的领域错误会被误判成 500");
+});

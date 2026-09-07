@@ -57,7 +57,7 @@ Agent 会先调用 `compass_tools`，按需动态激活相关工具。
 | `compass_strategy_manage` | YAML 策略 list/get/save/clone，自动版本化 |
 | `compass_pool` | 候选池管理；阶段、Gate 和最终 `go/waitlist/no_go` 状态均强制记录原因；`get` 输出附市场 Amazon 搜索链接与 Top5 竞品链接 |
 | `compass_risk_check` | 认证/IP/季节/政策/物流风险及官方证据 |
-| `compass_reviews_record` | 差评主题、Kano 可改良性、星级差 |
+| `compass_reviews_record` | 差评主题六类聚类、可改良性、预估星级差 |
 | `compass_budget` | 数据源预算与 MCP 调用计量（`cost_per_call_cny` 单价、`monthly_call_limit` 次数上限）、80% 告警、100% 熔断、市场归因 |
 | `compass_todo` | 工作台待办清单：自动推导需人工干预的事项（复核/补数/复盘/预算等 10 类），P1–P5 优先级；事项条件解决即消失，另有四类（多源偏差、预算 80% 告警、预算熔断、深研数据）的人工处理系统感知不到，走「提交处理结果 → agent 验证 → 勾选已处理」闭环，`action=submit/verify/complete/reopen` |
 | `compass_asin_history` | 本地 ASIN 跨快照历史 |
@@ -175,6 +175,8 @@ cd .pi/extensions/compass
 npm test        # 单元 + 集成测试
 npm run check   # tsc --noEmit 类型检查
 ```
+
+Node 版本以 `.nvmrc`（24）为准；CI 在 Node 22 / 24 两条线上跑同样两条命令，安装用的是 `npm ci --ignore-scripts`——本仓库不依赖任何 install 脚本，本地开发照常 `npm install` 即可。
 
 ## 复查修复兼容性说明
 

@@ -58,7 +58,7 @@ MCP 计量遵守同一约束：`tool_result` 只做**内存 pending 自增**（O
 
 进程内子代理调用（`modelRegistry.complete` 与任何 `*Dispatch(`）**视同写事务标记**：它花钱、走网络、可能等上两分钟，出现在热路径里比一次落盘更糟。`compass_dispatch` 的注册块还必须排在所有 `pi.on(...)` 之前——切片器从第一个 `pi.on` 起把后续一切归进某个 hook 片段，注册在它之后会让这条断言失效（与 `/compass-fill` 命令同一条规则）。
 
-展示预算：历史速览 ≤12 行，工具历史尾注 ≤8 行，压缩台账 ≤20 行。工具尾注实际由 `capHistoryLines(…, 7, 650)` 收口，且【补数缺口】与【历史对照】**共用这一个预算**：缺口先切 5 行 / 400 字并排在前，剩余额度才给历史对照。改任一段的行数上限都要同时改 `CLAUDE.md`、`index.ts` 的 `tool_result` 与本节。
+展示预算：历史速览 ≤12 行，工具历史尾注 ≤8 行，压缩台账 ≤20 行。工具尾注实际由 `history.ts` 导出的 `HISTORY_NOTE_LIMITS.footer`（7 行 / 650 字）收口，且【补数缺口】与【历史对照】**共用这一个预算**：缺口先切 `HISTORY_NOTE_LIMITS.gap`（5 行 / 400 字）并排在前，剩余额度才给历史对照；`renderHistoryNote` 的初切上限是 `HISTORY_NOTE_LIMITS.note`（8 行 / 1600 字）。三组数字只在 `HISTORY_NOTE_LIMITS` 定义一次，`index.ts` 的 `tool_result` 与 `/compass-import` 都读它（`tests/static-invariants.test.ts` 钉着，手写数字会红）；改上限只改常量，再同步 `CLAUDE.md` 与本节的数字。
 
 缺口派生（`gaps.ts` 的 `deriveGaps`）本身是纯内存只读，可以在热路径 hook 里跑，但**必须由调用方把已算好的 `listWorkbenchTodos` 结果传进来**：它对多来源市场会经 `metricDivergences` 触发快照明细 sidecar 的同步读，模块自己再算一遍就是白白多一次磁盘 I/O。
 

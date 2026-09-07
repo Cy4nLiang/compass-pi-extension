@@ -306,7 +306,29 @@ test("/compass-import 命令路径也挂补数缺口尾注", async () => {
 	assert.match(body, /【补数缺口】/u, "缺口段要用与工具尾注相同的标题");
 	// 与工具路径同一份展示预算，别让命令路径自己长出一套上限。
 	// 实参里嵌着 gapNoteFor(...)，用 [^)]* 会在内层右括号就截断——这条正则栽过一次
-	assert.match(body, /capHistoryLines\([\s\S]*?, 5, 400\)/u, "命令路径的缺口段必须走 5 行 / 400 字的同一预算");
+	assert.match(body, /capHistoryLines\([\s\S]*?, HISTORY_NOTE_LIMITS\.gap\.maxLines, HISTORY_NOTE_LIMITS\.gap\.maxChars\)/u, "命令路径的缺口段必须读 HISTORY_NOTE_LIMITS.gap，与工具路径同一预算");
+});
+
+test("工具尾注的展示预算只在 HISTORY_NOTE_LIMITS 定义一次（M2）", async () => {
+	const source = await readFile(join(repoRoot, "index.ts"), "utf8");
+	const history = await readFile(join(repoRoot, "history.ts"), "utf8");
+	// history.ts：renderHistoryNote 的初切上限读常量，别再手写 8 / 1600
+	const noteStart = history.indexOf("export function renderHistoryNote(");
+	assert.notEqual(noteStart, -1, "找不到 renderHistoryNote");
+	const noteBody = history.slice(noteStart, history.indexOf("\n}", noteStart));
+	assert.match(noteBody, /capHistoryLines\(lines, HISTORY_NOTE_LIMITS\.note\.maxLines, HISTORY_NOTE_LIMITS\.note\.maxChars\)/u, "renderHistoryNote 必须读 HISTORY_NOTE_LIMITS.note");
+	// index.ts tool_result：缺口份额与合并后的硬预算都读常量
+	const body = hookBodies(source).get("tool_result");
+	assert.ok(body, "找不到 tool_result 片段");
+	assert.match(body, /capHistoryLines\(rawGap, HISTORY_NOTE_LIMITS\.gap\.maxLines, HISTORY_NOTE_LIMITS\.gap\.maxChars\)/u, "tool_result 的缺口段必须读 HISTORY_NOTE_LIMITS.gap");
+	assert.match(
+		body,
+		/capHistoryLines\(rawHistory, Math\.max\(0, HISTORY_NOTE_LIMITS\.footer\.maxLines - gapNote\.length\), Math\.max\(0, HISTORY_NOTE_LIMITS\.footer\.maxChars - gapChars\)\)/u,
+		"tool_result 的历史对照段必须按 HISTORY_NOTE_LIMITS.footer 扣掉缺口已用额度",
+	);
+	// 负向全称：index.ts 里任何 capHistoryLines 调用都不得再手写数字上限。按行抓，实参里嵌套调用也不会截断
+	const handwritten = source.split("\n").filter((line) => line.includes("capHistoryLines(") && /,\s*\d[\d_]*\s*,\s*\d[\d_]*\s*\)/u.test(line));
+	assert.deepEqual(handwritten.map((line) => line.trim()), [], "index.ts 的 capHistoryLines 调用不得手写数字，一律读 HISTORY_NOTE_LIMITS");
 });
 
 test("compass_gaps 与 compass-fill 各自按 PI_LAN_SHARED 二次判定", async () => {

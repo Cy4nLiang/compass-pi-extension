@@ -23,7 +23,7 @@ import {
 	type GapOrigin,
 	type GapRecord,
 } from "../gaps.ts";
-import { capHistoryLines } from "../history.ts";
+import { HISTORY_NOTE_LIMITS, capHistoryLines } from "../history.ts";
 import { METRIC_LABELS } from "../report.ts";
 import { listWorkbenchTodos } from "../service.ts";
 import { createEmptyStore } from "../store.ts";
@@ -596,14 +596,15 @@ test("缺口行排前且合并后不超 7 行 650 字", () => {
 	// 必须是可调用形态：plan 是 action 参数的取值，不是位置参数（这一行运营最可能直接复制）
 	assert.match(note[note.length - 1], /^下一步：compass_gaps action=plan market_ref=mkt_demo_clear_bag/u);
 
-	// 与 index.ts 的合并口径完全一致：缺口先切 5 行 400 字，剩余额度再给历史对照
+	// 与 index.ts 的合并口径完全一致：缺口先切 HISTORY_NOTE_LIMITS.gap 的份额，剩余额度再给历史对照
+	const { gap, footer } = HISTORY_NOTE_LIMITS;
 	const history = ["历史对照行 A", "历史对照行 B", "历史对照行 C", "历史对照行 D", "历史对照行 E"];
-	const gapPart = capHistoryLines(note, 5, 400);
+	const gapPart = capHistoryLines(note, gap.maxLines, gap.maxChars);
 	const gapChars = gapPart.reduce((sum, line) => sum + line.length + 1, 0);
-	const historyPart = capHistoryLines(history, Math.max(0, 7 - gapPart.length), Math.max(0, 650 - gapChars));
+	const historyPart = capHistoryLines(history, Math.max(0, footer.maxLines - gapPart.length), Math.max(0, footer.maxChars - gapChars));
 	const merged = [...gapPart, ...historyPart];
-	assert.ok(merged.length <= 7, `合并后最多 7 行，实际 ${merged.length}`);
-	assert.ok(merged.reduce((sum, line) => sum + line.length + 1, 0) <= 650);
+	assert.ok(merged.length <= footer.maxLines, `合并后最多 ${footer.maxLines} 行，实际 ${merged.length}`);
+	assert.ok(merged.reduce((sum, line) => sum + line.length + 1, 0) <= footer.maxChars);
 	assert.deepEqual(merged.slice(0, gapPart.length), gapPart, "缺口行必须排在历史对照之前");
 });
 

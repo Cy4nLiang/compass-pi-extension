@@ -863,6 +863,19 @@ export function formatDelta(delta: OutcomeDelta): string {
 	return `${label} ${formatScalar(delta.metric, delta.baseline)}→${formatScalar(delta.metric, delta.current)} (${delta.direction})`;
 }
 
+/**
+ * 工具历史尾注的展示预算，全仓唯一定义处（CLAUDE.md「展示预算」段与 secure-store-write SKILL 只是镜像数字）。
+ * - note：renderHistoryNote 对单个工具结果自带历史对照行的初切，进 details.data.historyNote 之前
+ * - footer：index.ts tool_result 合并【补数缺口】与【历史对照】两段后的硬上限
+ * - gap：缺口段在 footer 里先占的份额，排在历史对照之前；/compass-import 命令路径的缺口尾注同款
+ * 改任一组数字只改这里；index.ts 手写数字会被 tests/static-invariants.test.ts 钉红。
+ */
+export const HISTORY_NOTE_LIMITS = {
+	note: { maxLines: 8, maxChars: 1_600 },
+	footer: { maxLines: 7, maxChars: 650 },
+	gap: { maxLines: 5, maxChars: 400 },
+} as const;
+
 export function capHistoryLines(lines: string[], maxLines: number, maxChars: number): string[] {
 	const output: string[] = [];
 	let chars = 0;
@@ -916,7 +929,7 @@ export function renderHistoryBrief(
 }
 
 export function renderHistoryNote(lines: string[]): string[] {
-	return capHistoryLines(lines, 8, 1_600);
+	return capHistoryLines(lines, HISTORY_NOTE_LIMITS.note.maxLines, HISTORY_NOTE_LIMITS.note.maxChars);
 }
 
 export function renderSessionLedger(items: SessionLedgerItem[]): string {

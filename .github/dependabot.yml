@@ -1,0 +1,20 @@
+# Dependabot：每月检查一次，只开 PR 不自动合并；合并前照常跑 CI（npm test + npm run check）。
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      # 三个 pi 宿主包必须同版本一起升（pi-coding-agent 自带 shrinkwrap，pi-ai / pi-tui 只为 tsc 解析而显式声明）
+      pi-host:
+        patterns:
+          - "@earendil-works/*"
+    ignore:
+      # typebox 钉 1.3.7，跟 pi 宿主捆绑的版本走、不由 Dependabot 提升级：
+      # 运行时由宿主解析提供，本仓库升了没用；且更高版本会触发 tsc TS2589 深度实例化错误（见 CLAUDE.md「关键约束」）
+      - dependency-name: typebox
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

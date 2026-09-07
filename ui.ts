@@ -112,7 +112,7 @@ export class CompassDashboard {
 		else this.renderRetro(add);
 
 		add("");
-		for (const helpLine of wrapTextWithAnsi(th.fg("dim", " ←→ / Tab 切换 · Esc 关闭 · /compass-help 手册 · /compass-import 导入 · /compass-report 报告"), renderWidth)) {
+		for (const helpLine of wrapTextWithAnsi(th.fg("dim", " ←→ / Tab 切换 · Esc 关闭 · /compass-help 手册 · /compass-import 导入 · /compass-report 报告 · /compass-web 浏览器 · /compass-retro 复盘"), renderWidth)) {
 			add(helpLine);
 		}
 		add(border);

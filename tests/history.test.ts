@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
+	HISTORY_NOTE_LIMITS,
 	actualsOutcomeVerdict,
 	buildTimeline,
 	calculateMetricDeltas,
@@ -135,8 +136,8 @@ test("due rules and injected brief stay within hard line/character budgets", () 
 	assert.ok(brief.length <= 1_200);
 	assert.match(brief, /compass_history/);
 	const note = renderHistoryNote(Array.from({ length: 20 }, (_, index) => `${index} ${"很长的历史".repeat(100)}`));
-	assert.ok(note.length <= 8);
-	assert.ok(note.join("\n").length <= 1_600);
+	assert.ok(note.length <= HISTORY_NOTE_LIMITS.note.maxLines);
+	assert.ok(note.join("\n").length <= HISTORY_NOTE_LIMITS.note.maxChars);
 	const ledger = renderSessionLedger(Array.from({ length: 30 }, (_, index) => ({ at: `2026-02-05T00:00:${String(index).padStart(2, "0")}.000Z`, marketId: "m", action: "strategy", conclusion: "结论".repeat(100), ids: [`run_${index}`] })));
 	assert.ok(ledger.split("\n").length <= 20);
 	assert.match(ledger, /compass_history timeline/);

@@ -9,8 +9,11 @@ import {
 	isToolCallEventType,
 	truncateHead,
 	withFileMutationQueue,
+	type AgentToolResult,
 	type ExtensionAPI,
 	type ExtensionContext,
+	type Theme,
+	type ToolRenderResultOptions,
 } from "@earendil-works/pi-coding-agent";
 import { Box, Markdown, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
@@ -48,7 +51,7 @@ import {
 	type GapfillMode,
 	type MutedGap,
 } from "./gaps.ts";
-import { capHistoryLines, marketMatchesPrompt, renderHistoryBrief, renderSessionLedger, retroReportFileName, type SessionLedgerItem } from "./history.ts";
+import { HISTORY_NOTE_LIMITS, capHistoryLines, marketMatchesPrompt, renderHistoryBrief, renderSessionLedger, retroReportFileName, type SessionLedgerItem } from "./history.ts";
 import { performCsvImport } from "./importer.ts";
 import {
 	backtestStrategies,
@@ -222,7 +225,7 @@ function textResult(text: string, toolDetails: CompassDetails) {
 }
 
 function renderCallLabel(label: string) {
-	return (args: Record<string, unknown>, theme: any) => {
+	return (args: Record<string, unknown>, theme: Theme) => {
 		const reference = args.market_ref ?? args.market ?? args.path ?? args.action ?? args.query ?? "";
 		return new Text(
 			theme.fg("toolTitle", theme.bold(`${label} `)) + theme.fg("muted", String(reference)),
@@ -232,7 +235,7 @@ function renderCallLabel(label: string) {
 	};
 }
 
-function renderCompassResult(result: any, options: { expanded: boolean; isPartial?: boolean }, theme: any) {
+function renderCompassResult(result: AgentToolResult<CompassDetails>, options: ToolRenderResultOptions, theme: Theme) {
 	if (options.isPartial) return new Text(theme.fg("warning", "罗盘处理中…"), 0, 0);
 	const value = result.details as CompassDetails | undefined;
 	if (!value || value.kind !== TOOL_DETAILS_KIND) {
@@ -1054,7 +1057,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "compass_reviews_record",
 		label: "Compass Reviews Record",
-		description: "保存由 AI/人工完成的 Top 竞品 1–3 星评论聚类：痛点主题、数量、Kano 类别、可改良性、证据原句和建议；同时计算预估星级差。",
+		description: "保存由 AI/人工完成的 Top 竞品 1–3 星评论聚类：痛点主题、数量、可改良性、证据原句和建议；同时计算预估星级差。",
 		parameters: Type.Object({
 			market_ref: Type.String(),
 			source_asins: Type.Array(Type.String()),
@@ -2120,8 +2123,8 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			// 补数缺口尾注挂在**工具**返回的 details.data 上，由 tool_result 钩子合并进正文；
 			// 斜杠命令不产生 tool result，那条链路整个不经过钩子。导入是唯一会产生新缺口的动作，
 			// 而 /compass-import 恰恰是运营最常用的导入入口，所以这里补一次同样的派生。
-			// 预算与工具路径一致（≤5 行 / 400 字），文案也用同一个【补数缺口】标题。
-			const importGapNote = capHistoryLines(gapNoteFor(imported.store, imported.market.id, imported.candidate.id), 5, 400);
+			// 预算与工具路径一致（HISTORY_NOTE_LIMITS.gap），文案也用同一个【补数缺口】标题。
+			const importGapNote = capHistoryLines(gapNoteFor(imported.store, imported.market.id, imported.candidate.id), HISTORY_NOTE_LIMITS.gap.maxLines, HISTORY_NOTE_LIMITS.gap.maxChars);
 			ctx.ui.notify(
 				[
 					`${imported.market.name} 已导入；粗筛=${imported.screenRun?.result.outcome ?? "未运行"}${imported.outcomeCheck ? `；复盘=${imported.outcomeCheck.verdict} (${imported.outcomeCheck.id})` : ""}`,
@@ -2478,11 +2481,11 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			const rawGap = fillMode === "off" ? [] : (data?.gapNote ?? []);
 			const rawHistory = historyBriefEnabled ? (data?.historyNote ?? []) : [];
 			if (!rawGap.length && !rawHistory.length) return;
-			// 缺口行排前，先切 5 行 / 400 字；剩余额度再给历史对照。
-			// 两段共用同一个 7 行 / 650 字的硬预算（compass/CLAUDE.md 展示预算段）
-			const gapNote = capHistoryLines(rawGap, 5, 400);
+			// 缺口行排前，先切 HISTORY_NOTE_LIMITS.gap 的份额；剩余额度再给历史对照。
+			// 两段共用 HISTORY_NOTE_LIMITS.footer 这一个硬预算；数字只在 history.ts 定义一次（compass/CLAUDE.md 展示预算段）
+			const gapNote = capHistoryLines(rawGap, HISTORY_NOTE_LIMITS.gap.maxLines, HISTORY_NOTE_LIMITS.gap.maxChars);
 			const gapChars = gapNote.reduce((sum, line) => sum + line.length + 1, 0);
-			const note = capHistoryLines(rawHistory, Math.max(0, 7 - gapNote.length), Math.max(0, 650 - gapChars));
+			const note = capHistoryLines(rawHistory, Math.max(0, HISTORY_NOTE_LIMITS.footer.maxLines - gapNote.length), Math.max(0, HISTORY_NOTE_LIMITS.footer.maxChars - gapChars));
 			if (!gapNote.length && !note.length) return;
 			const content = [...event.content];
 			const textIndex = content.findIndex((item) => item.type === "text");

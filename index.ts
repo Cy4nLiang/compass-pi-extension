@@ -18,7 +18,7 @@ import {
 import { Box, Markdown, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { DOMAIN_TOOLS, rankTools, searchTerms } from "./catalog.ts";
-import { compareSnapshotRecencyDesc, snapshotTtlDays } from "./defaults.ts";
+import { COST_REFERENCE_COEFFICIENT, COST_REFERENCE_FX_STALE_DAYS, COST_REFERENCE_MAX_PROMPTS, COST_REFERENCE_SAMPLE_SIZE, PURCHASE_COST_SOURCE_LABELS, compareSnapshotRecencyDesc, snapshotTtlDays } from "./defaults.ts";
 import {
 	DEFAULT_DISPATCH_CONFIG,
 	DISPATCH_AGENT_NAMES,
@@ -33,8 +33,9 @@ import {
 	type DispatchMaterialInfo,
 	type DispatchRegistryLike,
 } from "./dispatch.ts";
+import { computeCostReference, normalizeRows, orderCandidates } from "./cost-reference.ts";
 import { estimateProfit, normalizeProfitInput } from "./economics.ts";
-import { capturedAtForBatch, convertSorftimePayloads, createMcpPayloadCache, materializeReviewPayloads, parseSorftimeFieldMap, requestParamsOf, type McpPayloadEntry, type SorftimeFieldMap } from "./gapfill-convert.ts";
+import { capturedAtForBatch, convertSorftimePayloads, createMcpPayloadCache, materializeReviewPayloads, parseSorftimeFieldMap, requestParamsOf, resolveCostReferencePayload, type McpPayloadEntry, type SorftimeFieldMap } from "./gapfill-convert.ts";
 import {
 	hasEffectiveLimit,
 	GAPFILL_MODES,
@@ -82,6 +83,7 @@ import {
 	historyTimeline,
 	importContentHash,
 	importHistoryNote,
+	latestProfitEstimate,
 	latestSnapshotIfPresent,
 	leadHistoryNote,
 	listPoolCandidates,
@@ -93,6 +95,7 @@ import {
 	listStrategies,
 	moveCandidate,
 	recordCost,
+	recordCostReference,
 	recordMcpUsage,
 	recordProfitEstimate,
 	recordReviewAnalysis,
@@ -488,6 +491,48 @@ export default function compassExtension(pi: ExtensionAPI): void {
 		}
 	}
 
+	// 汇率表：CNY → 利润测算币种（1688 参考成本链）。与映射表一样住在宿主工作区、缺失 / 无效一律抛错不降级——
+	// 用错汇率算出的参考成本比没有更糟。approve 在花钱之前读一次，convert 在弹任何确认之前再读一次
+	const FX_PATH = ".pi/gapfill/fx.json";
+	interface FxRates {
+		rates: Record<string, number>;
+		asOf: string;
+		source?: string;
+	}
+	async function loadFxRates(ctx: ExtensionContext): Promise<FxRates> {
+		let raw: string;
+		try {
+			raw = await readFile(repository(ctx).resolveInputPath(FX_PATH), "utf8");
+		} catch {
+			throw new Error(`汇率表读不到（${FX_PATH}）：1688 参考成本要把人民币换成利润测算的币种，没有汇率就不出数。请在工作区补上这份文件（rates 与 as_of 由运营主管填）。`);
+		}
+		let parsed: { rates?: unknown; as_of?: unknown; source?: unknown };
+		try {
+			parsed = JSON.parse(raw) as { rates?: unknown; as_of?: unknown; source?: unknown };
+		} catch (error) {
+			throw new Error(`汇率表不是合法 JSON（${FX_PATH}）：${error instanceof Error ? error.message : String(error)}`);
+		}
+		const rates: Record<string, number> = {};
+		if (parsed.rates && typeof parsed.rates === "object" && !Array.isArray(parsed.rates)) {
+			for (const [key, value] of Object.entries(parsed.rates as Record<string, unknown>)) {
+				if (typeof value === "number" && Number.isFinite(value) && value > 0) rates[key.toUpperCase()] = value;
+			}
+		}
+		if (!Object.keys(rates).length) throw new Error(`汇率表还没填汇率（${FX_PATH} 的 rates 为空）：请填 1 元人民币折合多少目标币种（如 rates.USD）并写 as_of 口径日期，再重新 approve。`);
+		const asOf = typeof parsed.as_of === "string" && /^\d{4}-\d{2}-\d{2}$/u.test(parsed.as_of) ? parsed.as_of : undefined;
+		if (!asOf) throw new Error(`汇率表缺 as_of（${FX_PATH}）：必须写口径日期 YYYY-MM-DD，否则没人知道这个汇率是哪天的。`);
+		return { rates, asOf, source: typeof parsed.source === "string" && parsed.source.trim() ? parsed.source.trim() : undefined };
+	}
+	function fxRateFor(fx: FxRates, currency: string): number {
+		const rate = fx.rates[currency.toUpperCase()];
+		if (rate === undefined) throw new Error(`汇率表（${FX_PATH}）没有 CNY→${currency} 的汇率：请在 rates.${currency.toUpperCase()} 填 1 元人民币折合多少 ${currency}，并更新 as_of。`);
+		return rate;
+	}
+	// 参考成本换成哪种币：跟该市场最新利润测算走，没有测算时按利润模型的缺省 USD
+	function profitCurrencyFor(store: CompassStore, marketId: string): string {
+		return latestProfitEstimate(store, marketId)?.input.currency ?? "USD";
+	}
+
 	// —— A 档补数的确认门（ticket）——
 	// 只在内存、只活到 /reload。用**单变量**而不是 Map：「同一时刻只有一张」若靠 Map 就成了
 	// 需要自觉遵守的约定，用单变量它是结构事实——第二次 approve 直接覆盖前一张。
@@ -502,10 +547,14 @@ export default function compassExtension(pi: ExtensionAPI): void {
 		marketId: string;
 		marketName: string;
 		issuedAt: string;
-		/** snapshot = 转成市场 CSV 走导入；material = 转成差评材料交给 compass_dispatch */
-		kind: "snapshot" | "material";
+		/** snapshot = 转成市场 CSV 走导入；material = 转成差评材料交给 compass_dispatch；cost_reference = 算参考采购价写回利润测算 */
+		kind: "snapshot" | "material" | "cost_reference";
 		/** material 单批准的 ASIN。strict 档据此拦「拿着确认单去抓没批准的 ASIN」 */
 		asins: readonly string[];
+		/** cost_reference 单批准的检索关键词。strict 档据此拦「拿着确认单去搜别的词」，convert 据此只收本关键词的返回 */
+		searchName?: string;
+		/** cost_reference 单的系数：运营在弹窗上看到的那个数，convert 只读它不再读参数 */
+		coefficient?: number;
 		/** 映射表声明的固定参数（如 review_type）。门禁是同步的、读不到映射表，只能从这里复核 */
 		fixedParams?: Readonly<Record<string, string>>;
 	}
@@ -585,10 +634,27 @@ export default function compassExtension(pi: ExtensionAPI): void {
 						return `${covered.server} 补数确认单不覆盖 ASIN ${asin}（strict 档）。这张单批的是 ${covered.asins.join(" / ")}——要抓别的 ASIN 请重新跑 compass_gaps action=approve。`;
 					}
 					for (const [key, expected] of Object.entries(covered.fixedParams ?? {})) {
-						if (params[key] !== expected) {
+						if (String(params[key]) !== String(expected)) {
 							// 漏传不是「参数可选」：服务端会按默认值返回全量评论并照样计费，
 							// 而运营在弹窗上确认的是「只抓差评」
 							return `${covered.server} 补数确认单要求固定 ${key}=${expected}（strict 档），本次传的是 ${params[key] === undefined ? "（未传）" : String(params[key])}。漏传会按服务端默认值返回全量评论并照样计费——请按确认单上的步骤重发。`;
+						}
+					}
+				}
+			}
+			// 参考成本单是按关键词批准的：确认单上写着哪个词，就只能搜那个词，而且只取第 1 页
+			// （跨页排序不成立）。参数对象同样从含 search_name 的那一层读，与差评单同口径
+			if (covered.kind === "cost_reference") {
+				const params = requestParamsOf(call.input, "search_name");
+				if (params) {
+					const searchName = typeof params.search_name === "string" ? params.search_name.trim() : "";
+					if (searchName !== (covered.searchName ?? "")) {
+						return `${covered.server} 补数确认单要求关键词「${covered.searchName ?? ""}」（strict 档），本次传的是「${searchName}」。换关键词请重新跑 compass_gaps action=approve。`;
+					}
+					for (const [key, expected] of Object.entries(covered.fixedParams ?? {})) {
+						// page 漏传时服务端按第 1 页返回，与确认单一致；传了别的页才拦
+						if (params[key] !== undefined && String(params[key]) !== String(expected)) {
+							return `${covered.server} 补数确认单要求 ${key}=${expected}（strict 档），本次传的是 ${String(params[key])}。跨页排序不成立，参考成本只取第 1 页——请按确认单上的步骤重发。`;
 						}
 					}
 				}
@@ -1566,8 +1632,8 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			"选品数据缺口清单与补数计划（只读派生，不写库、不花钱、不自动抓取）。",
 			"list（默认）：把策略缺指标、待办、CSV 缺列告警、利润缺 CPC 与假设默认值、风险缺证据链接、差评缺原句、复盘缺实绩汇成一份清单，按成本档分组。",
 			"plan：给某个市场的每条缺口列出候选来源、预计调用次数、预算池可用性与写回入口；人工缺口给通用填空模板。",
-			"approve：**唯一会花钱的子命令**。当面确认后发一张 10 分钟有效的确认单，授权按映射表声明的链路调用 Sorftime 补齐某个市场的完整快照；只在 TUI 会话里可用，扣次数不等于拿到数据。",
-			"convert：把确认单期间收到的 Sorftime 返回体按点路径映射成一份可直接导入的市场 CSV（不经 LLM 猜数字），并归档原始 JSON。两类行（listing 与关键词）必须同时拿到，否则拒绝写文件——残缺快照会让指标静默消失。",
+			"approve：**唯一会花钱的子命令**。当面确认后发一张 10 分钟有效的确认单，授权按映射表声明的链路调用 Sorftime：补齐某个市场的完整快照（缺省）、抓差评材料（origin=review_evidence + asins）、或取 1688 参考成本（origin=purchase_cost_source + search_name=<中文品类词>，1 次）；只在 TUI 会话里可用，扣次数不等于拿到数据。",
+			"convert：把确认单期间收到的 Sorftime 返回体确定性地转成产物（不经 LLM 猜数字），并归档原始 JSON。快照单转成可直接导入的市场 CSV（两类行必须同时拿到，否则拒绝写文件——残缺快照会让指标静默消失）；差评单转成材料文件；参考成本单在 TUI 逐条弹同款确认后按规则算出参考采购价并写回 store。",
 			"缺数据一律按缺数据处理：模板里的 {{占位符}} 没拿到就留空，绝不猜数字或替运营填。",
 		].join("\n"),
 		parameters: Type.Object({
@@ -1580,6 +1646,10 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			// maxItems 是字面量 5——参数表在同步工厂体内求值，读不到运行期才载入的映射表；
 			// 映射表的 asins_per_ticket_max 只能在 execute 里把上限**收紧**，不能放宽
 			asins: Type.Optional(Type.Array(Type.String({ pattern: "^[A-Z0-9]{10}$" }), { minItems: 1, maxItems: 5, description: "差评补数要抓的 ASIN（每个 1 次调用）" })),
+			// 只用于 1688 参考成本链（origin=purchase_cost_source）：检索关键词与系数。系数只在这一次 approve 有效，
+			// 存进确认单后 convert 只读确认单
+			search_name: Type.Optional(Type.String({ minLength: 1, maxLength: 60, description: "1688 参考成本链的中文品类词（只在 origin=purchase_cost_source 时有效）" })),
+			coefficient: Type.Optional(Type.Number({ exclusiveMinimum: 0, maximum: 1, description: "参考成本系数，缺省 0.9（只在 origin=purchase_cost_source 时有效）" })),
 		}),
 		// approve 会弹窗等运营按键、convert 会写文件并删临时文件：都不能与别的工具调用并发，
 		// 否则两次 approve 会抢同一张确认单、两次 convert 会互相删对方还没读的溢写文件
@@ -1612,7 +1682,10 @@ export default function compassExtension(pi: ExtensionAPI): void {
 				// 映射表先校验：3 次调用花出去之后才发现映射表坏了，点数是要不回来的
 				const map = await loadSorftimeFieldMap(ctx);
 
-				const confirmGaps = filtered.filter((gap) => gap.autoTier === "A_confirm");
+				// 选链规则：1688 参考成本链（writeBack profit_estimate）只在显式 origin=purchase_cost_source 时入选。
+				// 任何做过手填测算的市场都会同时挂着它与快照链，不排除的话下面「A 档产物唯一」的检查
+				// 会把运营照旧只写 market_ref 的 approve 一律拒绝（2026-09-07 挑刺复核第 1 条）
+				const confirmGaps = filtered.filter((gap) => gap.autoTier === "A_confirm" && (params.origin !== undefined || gap.origin !== "purchase_cost_source"));
 				if (!confirmGaps.length) {
 					// 池没有可生效上限时，缺口层会把 A 档整体降级成 manual（gaps.ts 的 limitConfigured），
 					// 于是这里得到的永远是「没有 A 档缺口」而不是「池没配上限」——真正的原因得自己说出来。
@@ -1645,14 +1718,17 @@ export default function compassExtension(pi: ExtensionAPI): void {
 					throw new Error(`这批缺口的 A 档产物不唯一（${paidWriteBacks.join("、")}）：快照补数与差评补数的调用方式和产物都不同，一张确认单覆盖不了；请用 origin= 缩小到同一类再确认。`);
 				}
 				const isMaterial = paidWriteBacks[0] === "reviews_record";
+				const isCostReference = paidWriteBacks[0] === "profit_estimate";
 
-				// 差评链按 ASIN 逐个调，次数 = ASIN 个数；快照链是固定几步的链路，次数 = 链长
-				const chain = isMaterial ? map.reviews?.chain ?? [] : map.chain ?? [];
+				// 差评链按 ASIN 逐个调，次数 = ASIN 个数；快照链是固定几步的链路，次数 = 链长；参考成本链只有 1 步
+				const chain = isMaterial ? map.reviews?.chain ?? [] : isCostReference ? map.costReference?.chain ?? [] : map.chain ?? [];
 				if (!chain.length) {
 					throw new Error(
 						isMaterial
 							? `补数映射表（${GAPFILL_MAP_PATH}）没有声明 reviews 链：差评补数需要它才能把返回体映射成材料，无法确认。`
-							: `补数映射表（${GAPFILL_MAP_PATH}）没有声明 chain：不知道按什么顺序调几次，无法确认。`,
+							: isCostReference
+								? `补数映射表（${GAPFILL_MAP_PATH}）没有声明 cost_reference 链：1688 参考成本需要它才能把返回体映射成候选行，无法确认。`
+								: `补数映射表（${GAPFILL_MAP_PATH}）没有声明 chain：不知道按什么顺序调几次，无法确认。`,
 					);
 				}
 				const asins = [...new Set(params.asins ?? [])];
@@ -1668,6 +1744,16 @@ export default function compassExtension(pi: ExtensionAPI): void {
 				} else if (asins.length) {
 					throw new Error("asins= 只用于差评补数（origin=review_evidence）；快照补数不按 ASIN 调用，请去掉这个参数。");
 				}
+				// 参考成本链的两个专属参数：关键词必填、系数可选；另两条链传了它们一律拒绝（同 asins= 只属差评链）
+				const searchName = params.search_name?.trim() || undefined;
+				if (isCostReference) {
+					if (!searchName) throw new Error("1688 参考成本链需要 search_name=<中文品类词>：不给关键词就不知道在 1688 搜什么（用 1688 常见的中文品类词，2–6 字，别直译英文标题）。");
+				} else if (params.search_name !== undefined || params.coefficient !== undefined) {
+					throw new Error("search_name= 与 coefficient= 只用于 1688 参考成本链（origin=purchase_cost_source）；快照补数与差评补数不按关键词检索，请去掉这两个参数。");
+				}
+				const coefficient = params.coefficient ?? COST_REFERENCE_COEFFICIENT;
+				// 汇率也要在花钱之前校验：convert 时才发现缺汇率，那 1 次调用已经扣了
+				if (isCostReference) fxRateFor(await loadFxRates(ctx), profitCurrencyFor(store, market.id));
 				const calls = isMaterial ? asins.length : chain.length;
 
 				const pending = pendingCallCounts();
@@ -1706,7 +1792,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 				);
 				const confirmOption = `确认：现在调用 ${calls} 次`;
 				const explainOption = `先看这 ${calls} 次分别做什么（不调用）`;
-				const scopeText = isMaterial ? `每 ASIN 1 次：${asins.join("、")}` : `${chain.length} 步链路`;
+				const scopeText = isMaterial ? `每 ASIN 1 次：${asins.join("、")}` : isCostReference ? `1688 参考成本 · 关键词「${searchName ?? ""}」· 系数 ${coefficient}` : `${chain.length} 步链路`;
 				// 弹窗只回显次数与上限，**不回显池的 note**——note 是自由文本，实测会漂移（写着
 				// 「设为 1」而上限早就是 10），拿它当口径会让运营照着一个假数字做决定
 				const choice = await ctx.ui.select(
@@ -1736,8 +1822,10 @@ export default function compassExtension(pi: ExtensionAPI): void {
 					marketId: market.id,
 					marketName: market.name,
 					issuedAt: new Date().toISOString(),
-					kind: isMaterial ? "material" : "snapshot",
+					kind: isMaterial ? "material" : isCostReference ? "cost_reference" : "snapshot",
 					asins,
+					searchName: isCostReference ? searchName : undefined,
+					coefficient: isCostReference ? coefficient : undefined,
 					// 固定参数存进确认单而不是让门禁去读映射表：门禁是同步函数、跑在 tool_call 热路径上，
 					// 而映射表要 await readFile。运营确认的就是这一组固定值，存下来复核最贴近原意
 					fixedParams: chain[0]?.fixed,
@@ -1745,7 +1833,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 				const lines = [
 					`已批准：${server} ${calls} 次调用，确认单 10 分钟内有效。`,
 					...steps,
-					`拿到返回后回来跑：compass_gaps action=convert market_ref=${market.id}`,
+					`拿到返回后回来跑：compass_gaps action=convert market_ref=${market.id}${isCostReference ? "（会逐条弹同款确认，请运营留在终端旁）" : ""}`,
 					"注意：扣了次数不等于拿到数据——调用失败同样计费，失败就重新 approve，不要在同一张单里反复重试。",
 				];
 				return textResult(lines.join("\n"), details({
@@ -1819,6 +1907,155 @@ export default function compassExtension(pi: ExtensionAPI): void {
 						summary: `差评材料 ${made.reviewsTotal} 条 · ${ticket.marketName}`,
 						lines: materialLines,
 						data: resultData({ payload: { material: made.materialPath, reviewsTotal: made.reviewsTotal, perAsin: made.perAsin, missingAsins: made.missingAsins } }),
+					}));
+				}
+				if (ticket.kind === "cost_reference") {
+					// 逐条同款确认要当面按键，与 approve 同一道 TUI 门
+					if (!ctx.hasUI) throw new Error("1688 参考成本的转换要逐条当面确认同款，而当前会话没有 UI（print / json 模式）。请在 pi 的 TUI 里执行。");
+					if (ctx.mode !== "tui") throw new Error(`1688 参考成本的转换只在 TUI 会话里放行（当前 mode=${ctx.mode}）：同款要运营本人逐条确认。`);
+					const costMap = map.costReference;
+					if (!costMap) throw new Error(`补数映射表（${GAPFILL_MAP_PATH}）没有声明 cost_reference 段：无法把返回体映射成参考成本，请先在工作区补上再试。`);
+					// 只收本关键词的返回：窗口内同一工具换个词再调，返回体形状完全相同，不按关键词过滤会把别的品类混进样本
+					const keyed = entries.filter((entry) => entry.requestSearchName === ticket.searchName);
+					if (!keyed.length) {
+						throw new Error(`确认单发出后没有收到关键词「${ticket.searchName ?? ""}」的 ${ticket.server} 返回：可能调用还没做、关键词与确认单不一致，或中途 /reload 过（载荷缓存只活到 reload）。请按确认单上的关键词重新调用后再转换。`);
+					}
+					// 汇率与币种在解析之前取：缺汇率时一条都别弹，运营不该确认完 12 条才被告知算不出来
+					const fx = await loadFxRates(ctx);
+					const currency = profitCurrencyFor(store, ticket.marketId);
+					const fxRate = fxRateFor(fx, currency);
+					const parsed = await resolveCostReferencePayload(
+						{ repo: repository(ctx) },
+						{ payloads: keyed, map, marketName: ticket.marketName, capturedDate, source: ticket.server },
+					);
+					if (parsed.emptyResult) {
+						// 无结果是正常空值：钱已经花了、原文已归档；换关键词要重新 approve，这张单没有别的用处了
+						mcpPayloads.forget(keyed.map((entry) => entry.toolCallId));
+						gapfillTicket = undefined;
+						const emptyLines = [
+							`关键词「${ticket.searchName ?? ""}」在 1688 检索无结果（或返回 0 行），参考成本不出数，采购价出处缺口保持人工档。`,
+							"下一步：换一个更常见的中文品类词重新 compass_gaps action=approve origin=purchase_cost_source search_name=…（会再花 1 次调用），或改用供应商报价。",
+						];
+						return textResult(emptyLines.join("\n"), details({ title: "参考成本", status: "warning", summary: `1688 检索无结果 · ${ticket.marketName}`, lines: emptyLines }));
+					}
+					const candidates = orderCandidates(normalizeRows(parsed.rows, costMap.fields));
+					// 逐条同款确认是硬步骤（E0c：按销量排序的前几名可能整批不是同款）。循环在写事务**之外**，
+					// 上界 COST_REFERENCE_MAX_PROMPTS；超时 / Esc 即中止且不清单不清缓存，可重新 convert 继续
+					const SAME_OPTION = "是同款，纳入样本";
+					const DIFFERENT_OPTION = "不是同款，跳过";
+					const STOP_OPTION = "停止确认，用已纳入的样本计算";
+					const accepted: typeof candidates = [];
+					let prompted = 0;
+					let rejected = 0;
+					for (const row of candidates) {
+						if (accepted.length >= COST_REFERENCE_SAMPLE_SIZE || prompted >= COST_REFERENCE_MAX_PROMPTS) break;
+						prompted += 1;
+						const unit = row.unit;
+						const priceLabel = !unit
+							? "无价"
+							: unit.priceField === "tier_median"
+								? `阶梯中位 ¥${unit.priceCny.toFixed(2)}（${unit.tierCount} 档${row.moq !== undefined ? `，起批 ${row.moq}` : ""}）`
+								: `头价 ¥${unit.priceCny.toFixed(2)}`;
+						const choice = await ctx.ui.select(
+							`同款确认 第 ${prompted} 条（已纳入 ${accepted.length}/${COST_REFERENCE_SAMPLE_SIZE}）· ${row.title.slice(0, 40)} · 30 天销量 ${row.salesOf30d} · ${priceLabel}${row.url ? ` · ${row.url}` : ""}`,
+							[SAME_OPTION, DIFFERENT_OPTION, STOP_OPTION],
+							{ timeout: 60_000 },
+						);
+						if (choice === undefined) {
+							const summary = `同款确认中断（已纳入 ${accepted.length} 条），参考成本未写入、确认单未清；可重新 compass_gaps action=convert 继续`;
+							return textResult(summary, details({ title: "参考成本", status: "info", summary }));
+						}
+						if (choice === STOP_OPTION) break;
+						if (choice === SAME_OPTION) accepted.push(row);
+						else rejected += 1;
+					}
+					const computation = computeCostReference(accepted, { coefficient: ticket.coefficient, fxRate, fxAsOf: fx.asOf, currency });
+					if (!computation) {
+						// 一条同款都没纳入：这张单已经没有可用样本，换关键词要重新 approve
+						mcpPayloads.forget(keyed.map((entry) => entry.toolCallId));
+						gapfillTicket = undefined;
+						const summary = `没有纳入任何同款样本（弹了 ${prompted} 条，否了 ${rejected} 条），参考成本不出数；换关键词请重新 approve`;
+						return textResult(summary, details({ title: "参考成本", status: "warning", summary }));
+					}
+					const warnings = [...computation.warnings];
+					const fxAgeDays = Math.floor((Date.now() - Date.parse(fx.asOf)) / 86_400_000);
+					if (Number.isFinite(fxAgeDays) && fxAgeDays > COST_REFERENCE_FX_STALE_DAYS) warnings.push(`汇率已超过 ${COST_REFERENCE_FX_STALE_DAYS} 天未更新（口径日 ${fx.asOf}）`);
+					// 最终确认：写不写、写多深由运营定。「更新利润测算」只在该市场已有测算时提供——克隆的是它的其余输入
+					const WRITE_AND_UPDATE = "写入参考成本并更新利润测算";
+					const SAVE_ONLY = "只保存参考成本";
+					const hasEstimate = latestProfitEstimate(store, ticket.marketId) !== undefined;
+					const finalChoice = await ctx.ui.select(
+						`参考成本 ¥${computation.medianCny.toFixed(2)} × ${computation.coefficient} = ¥${computation.referenceCostCny.toFixed(2)} → ${currency} ${computation.referenceCost.toFixed(4)}（汇率 ${fxRate}@${fx.asOf}）· 样本 ${computation.sampleSize}（零销量 ${computation.zeroSalesCount}）· 警告 ${warnings.length} 条`,
+						[...(hasEstimate ? [WRITE_AND_UPDATE] : []), SAVE_ONLY, "取消"],
+						{ timeout: 60_000 },
+					);
+					if (finalChoice !== WRITE_AND_UPDATE && finalChoice !== SAVE_ONLY) {
+						const summary = finalChoice === undefined ? "确认超时或已取消，参考成本未写入、确认单未清；可重新 convert" : "已取消，参考成本未写入、确认单未清；可重新 convert";
+						return textResult(summary, details({ title: "参考成本", status: "info", summary }));
+					}
+					const actor = actorName();
+					const written = await mutateStore(ctx, (store) => {
+						const candidate = store.candidates
+							.filter((item) => item.marketId === ticket.marketId && item.stage !== "archived")
+							.reduce<Candidate | undefined>((best, item) => (!best || Date.parse(item.updatedAt) > Date.parse(best.updatedAt) ? item : best), undefined);
+						const reference = recordCostReference(store, {
+							marketId: ticket.marketId,
+							candidateId: candidate?.id,
+							source: ticket.server,
+							tool: ticket.tools[0] ?? "",
+							keyword: ticket.searchName ?? "",
+							page: 1,
+							capturedAt,
+							actor,
+							currency,
+							fxRate,
+							fxAsOf: fx.asOf,
+							fxSource: fx.source,
+							coefficient: computation.coefficient,
+							method: computation.method,
+							medianCny: computation.medianCny,
+							referenceCostCny: computation.referenceCostCny,
+							referenceCost: computation.referenceCost,
+							sampleSize: computation.sampleSize,
+							samples: computation.samples,
+							prompted,
+							rejected,
+							warnings,
+							archivedRaw: parsed.archivedRaw,
+						});
+						let estimateId: string | undefined;
+						if (finalChoice === WRITE_AND_UPDATE) {
+							// 用事务内的 store 重新取最新测算：确认循环可长达 12 分钟，循环前那份已过期
+							const latest = latestProfitEstimate(store, ticket.marketId);
+							if (latest) {
+								const input = normalizeProfitInput({ ...latest.input, purchaseCost: reference.referenceCost, purchaseCostSource: "ali1688_reference", costReferenceId: reference.id });
+								estimateId = recordProfitEstimate(store, input, estimateProfit(input, gateThresholds(store)), actor).id;
+							}
+						}
+						return { reference, estimateId };
+					});
+					mcpPayloads.forget(keyed.map((entry) => entry.toolCallId));
+					gapfillTicket = undefined;
+					const gapNote = gapNoteFor(written.store, ticket.marketId, written.result.reference.candidateId);
+					const sampleLines = computation.samples.map(
+						(sample) =>
+							`${sample.productId} · ${sample.priceField === "tier_median" ? `阶梯中位（${sample.tierCount} 档）` : "头价"} ¥${sample.priceCny.toFixed(2)} · 30 天销量 ${sample.salesOf30d}${sample.zeroSales ? "（零销量补位）" : ""}${sample.url ? ` · ${sample.url}` : ""}`,
+					);
+					const summary = `1688 参考成本：¥${computation.medianCny.toFixed(2)} × ${computation.coefficient} = ¥${computation.referenceCostCny.toFixed(2)} → ${currency} ${computation.referenceCost.toFixed(4)}（汇率 ${fxRate}@${fx.asOf}）· 样本 ${computation.sampleSize}（零销量 ${computation.zeroSalesCount}，否 ${rejected}）`;
+					const lines = [
+						...sampleLines,
+						...warnings.map((warning) => `警告：${warning}`),
+						written.result.estimateId
+							? `已更新利润测算 estimate_id=${written.result.estimateId}（采购价出处：${PURCHASE_COST_SOURCE_LABELS.ali1688_reference}，其余输入沿用上一次）`
+							: `下一步：compass_profit_estimate market_ref=${ticket.marketId} cost_reference_ref=latest …（其余输入照常给）；拿到供应商报价后改填 purchase_cost 并标 purchase_cost_source=supplier_quote`,
+						`参考成本记录 ${written.result.reference.id} · 原始返回已归档 ${parsed.archivedRaw.length} 份`,
+					];
+					return textResult([summary, ...lines].join("\n"), details({
+						title: "参考成本",
+						status: warnings.length ? "warning" : "success",
+						summary,
+						lines,
+						data: resultData({ payload: { costReferenceId: written.result.reference.id, referenceCost: computation.referenceCost, currency, warnings, estimateId: written.result.estimateId }, gapNote }),
 					}));
 				}
 				let result: Awaited<ReturnType<typeof convertSorftimePayloads>>;

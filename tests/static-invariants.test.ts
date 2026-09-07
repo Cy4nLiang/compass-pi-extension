@@ -766,3 +766,64 @@ test("Web 错误分级按类型判定：asDomainError 里没有领域文案正�
 	assert.ok(errnoAt > 0, "找不到 errno 兜底分支——本用例的切片已失效");
 	assert.ok(notFoundAt < errnoAt, "领域错误分支必须排在 errno 兜底之前：带 code 字段的领域错误会被误判成 500");
 });
+
+// —— 1688 参考成本链（compass-1688-cost-reference，2026-09-07）——
+// 四条切片钉子，每条写完都把被钉的那行改坏跑过一次确认真红（根 CLAUDE.md「源码切片断言」教训）。
+// 用例名统一含「参考成本」，任务书 Proof 表按它选行。
+
+function costReferenceConvertSlice(source: string): string {
+	const body = toolBody(source, "compass_gaps");
+	const start = body.indexOf('if (ticket.kind === "cost_reference")');
+	const end = body.indexOf("let result: Awaited<ReturnType<typeof convertSorftimePayloads>>;", start);
+	assert.ok(start > 0 && end > start, "抽不到 convert 里的参考成本分支——切片已失效");
+	return body.slice(start, end);
+}
+
+test("参考成本 ①：convert 的同款确认与最终确认弹窗都在写事务之前，事务里不弹窗", async () => {
+	const source = await readFile(join(repoRoot, "index.ts"), "utf8");
+	const slice = costReferenceConvertSlice(source);
+	const lastSelect = slice.lastIndexOf("await ctx.ui.select(");
+	const mutate = slice.indexOf("await mutateStore(");
+	assert.ok(lastSelect > 0, "参考成本分支里找不到 ctx.ui.select");
+	assert.ok(mutate > 0, "参考成本分支里找不到 mutateStore");
+	assert.ok(lastSelect < mutate, "所有弹窗必须在 mutateStore 之前：写事务里等运营按键会把 store 锁住几分钟");
+	assert.equal(slice.indexOf("await ctx.ui.select(", mutate), -1, "mutateStore 之后不得再弹窗");
+});
+
+test("参考成本 ②：同款确认循环的上界是 COST_REFERENCE_MAX_PROMPTS，不是手写数字", async () => {
+	const source = await readFile(join(repoRoot, "index.ts"), "utf8");
+	const slice = costReferenceConvertSlice(source);
+	const loopStart = slice.indexOf("for (const row of candidates) {");
+	const loopEnd = slice.indexOf("const computation = computeCostReference(", loopStart);
+	assert.ok(loopStart > 0 && loopEnd > loopStart, "抽不到同款确认循环——切片已失效");
+	const loop = slice.slice(loopStart, loopEnd);
+	assert.match(loop, /if \(accepted\.length >= COST_REFERENCE_SAMPLE_SIZE \|\| prompted >= COST_REFERENCE_MAX_PROMPTS\) break;/u, "循环上界必须读常量：纳满 5 条或弹到上限就停");
+	assert.match(loop, /timeout: 60_000/u, "逐条确认同样要带 timeout：宿主没有工具超时兜底");
+});
+
+test("参考成本 ③：strict 档固定参数用 String() 比对，且参考成本单按关键词复核", async () => {
+	const source = await readFile(join(repoRoot, "index.ts"), "utf8");
+	const gateStart = source.indexOf("function gapfillTicketGate(");
+	const gateEnd = source.indexOf("function refundTicketCall(");
+	assert.ok(gateStart > 0 && gateEnd > gateStart, "抽不到 gapfillTicketGate 的函数体——切片已失效");
+	const gate = source.slice(gateStart, gateEnd);
+	// 差评单的 review_type 是字符串、参考成本单的 page 在 schema 里是整数：不 String() 化就会把合规的 page=1 当成不符
+	assert.match(gate, /String\(params\[key\]\) !== String\(expected\)/u, "固定参数比对必须两边都 String()");
+	assert.doesNotMatch(gate, /if \(params\[key\] !== expected\)/u, "裸比对会把整数 page=1 判成与 \"1\" 不符");
+	assert.match(gate, /covered\.kind === "cost_reference"/u, "参考成本单要有自己的复核分支");
+	assert.match(gate, /requestParamsOf\(call\.input, "search_name"\)/u, "参考成本单按 search_name 取参数对象，与差评单按 asin 同口径");
+});
+
+test("参考成本 ④：approve 在 origin 缺省时排除参考成本链，既有快照链的 approve 不受新缺口影响", async () => {
+	const source = await readFile(join(repoRoot, "index.ts"), "utf8");
+	const body = toolBody(source, "compass_gaps");
+	const start = body.indexOf('if (action === "approve")');
+	const end = body.indexOf('if (action === "convert")', start);
+	assert.ok(start > 0 && end > start, "抽不到 approve 分支——切片已失效");
+	const approve = body.slice(start, end);
+	assert.match(
+		approve,
+		/const confirmGaps = filtered\.filter\(\(gap\) => gap\.autoTier === "A_confirm" && \(params\.origin !== undefined \|\| gap\.origin !== "purchase_cost_source"\)\);/u,
+		"选链规则：任何做过手填测算的市场都会同时挂着快照链与参考成本链，不在 origin 缺省时排除后者，「A 档产物唯一」检查会把运营照旧只写 market_ref 的 approve 一律拒绝",
+	);
+});

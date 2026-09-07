@@ -46,7 +46,7 @@ description: Amazon US 中小卖家精铺选品工作流。用于市场 CSV 导�
 
 ### 2. 深研与单位经济
 
-调用 `compass_profit_estimate`。所有金额输入必须使用同一币种，百分比使用 0–1 小数。
+调用 `compass_profit_estimate`。所有金额输入必须使用同一币种，百分比使用 0–1 小数。采购价二选一：运营给了数就填 `purchase_cost`（供应商报价标 `purchase_cost_source=supplier_quote`，其它手填缺省 manual）；运营说用参考成本就传 `cost_reference_ref=latest`（数字取自该市场的 1688 参考成本记录，**不要自己填数字**，该市场还没有记录时先走下面的参考成本链）。结果里的「采购价出处」要转述给运营。
 
 公式：
 
@@ -108,7 +108,8 @@ description: Amazon US 中小卖家精铺选品工作流。用于市场 CSV 导�
 - **approve 之后扣了次数不等于拿到数据**：超时与中途中断同样计费。失败了就重新 approve，不要在同一张确认单里反复重试。
 - convert 有一条硬规则：listing 行与关键词行**必须同时拿到**才写文件。只拿到一份时它会拒绝并说明缺哪一边——残缺快照会让策略指标静默消失，而导入链对此零告警。
 - convert 产出的 CSV 是全英文表头，导入时**必须显式写 `source=sorftime`**（否则会被识别成通用 CSV，在同一个市场里凭空造出「多来源」）；`captured_at` 照抄 convert 给的完整时间戳（这批载荷最后一次收到返回的时刻），不要改成纯日期——纯日期按 UTC 零点解释，会被同一天早些时候导入的快照压成「旧快照」。
-- **A 档有两条链，产物不同**：快照补数（`origin` 缺省）走「approve → 按 chain 调三步 → convert 写 CSV → `compass_import_csv` 导入」；差评补数（`origin=review_evidence`）走「approve 带 `asins=` → 每 ASIN 1 次 `product_reviews` → convert 写材料文件 → `compass_dispatch` 聚类」。后者按 ASIN 计次而不是按链长，一张单最多 5 个 ASIN；调用时 `amz_site=US` 与 `review_type=Negative` 都必须显式写，漏传 `review_type` 会按服务端默认返回全量评论并照样计费，strict 档会当场拒绝。材料不进导入目录，也不能走 `compass_import_csv`。
+- **A 档有三条链，产物不同**：快照补数（`origin` 缺省）走「approve → 按 chain 调三步 → convert 写 CSV → `compass_import_csv` 导入」；差评补数（`origin=review_evidence`）走「approve 带 `asins=` → 每 ASIN 1 次 `product_reviews` → convert 写材料文件 → `compass_dispatch` 聚类」。后者按 ASIN 计次而不是按链长，一张单最多 5 个 ASIN；调用时 `amz_site=US` 与 `review_type=Negative` 都必须显式写，漏传 `review_type` 会按服务端默认返回全量评论并照样计费，strict 档会当场拒绝。材料不进导入目录，也不能走 `compass_import_csv`。
+- **1688 参考成本链（`origin=purchase_cost_source`）**：approve 必须显式带 `origin=purchase_cost_source search_name=<中文品类词>`（`coefficient=` 可选，缺省 0.9；`origin` 缺省时这条链不会入选），确认后调 1 次 `ali1688_similar_product`（`search_name` 与确认单一致、`page` 只认 1，strict 档换词或翻页会被拦）。convert 时罗盘在 TUI **逐条弹同款确认**（运营亲自判，你不代答、不催），按「有销量前 5 → 阶梯价中位数 → 升序取中位 × 系数 → 按 `.pi/gapfill/fx.json` 汇率换算」算出参考采购价，最终弹窗由运营选「写入并更新利润测算」（克隆上次测算的其余输入）或「只保存参考成本」。关键词要用 1688 常见的中文品类词、别直译英文标题——两个语素的词会被按字拆开匹配，销量前几名可能整批不是同款，所以运营判「不是同款」是正常结果；无结果时不出数、不写库，换词要重新 approve（再花 1 次）。样本不足 3 条取最小值并告警、零销量补位会写明条数、最低价不到中位一半提示疑似占位价——这些警告都要转述给运营。
 - **差评材料的「完整」与快照不同**：没抓到评论的 ASIN 被点名进 `missing_asins`，材料照写——差评是逐 ASIN 独立的证据，少一个不影响另一个的聚类。那几次的钱已经花了，要补就重新 approve 只批那几个，不要在同一张单里重试。
 - 三档分工：**C 档**（重导带列 CSV、查本地历史）可以直接做；**A 档**（付费数据源）必须走上面的 approve 当面确认，agent 不得自行发起；**人工**（供应商报价、官方证据链接、店铺实绩、预估星级）只能由运营给。
 - **缺数据一律按缺数据处理**：填空模板里的 `{{占位符}}` 没拿到就留空，绝不猜数字、绝不替运营填。百分比大于 1 时换算并回显「按 0.15 记」。

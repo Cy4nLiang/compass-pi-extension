@@ -18,11 +18,12 @@ import {
 	renderSessionLedger,
 	replayOutcomeVerdict,
 	retroDueConfig,
+	type RetroDueConfig,
 	retroReportFileName,
 	similarMarkets,
 } from "../history.ts";
 import { createEmptyStore } from "../store.ts";
-import type { CompassStore, DecisionStatus, Lesson, Market, MetricEvidence, OutcomeCheck, OutcomeVerdict, RuleEvaluation, StrategyEvaluation, StrategyRun } from "../types.ts";
+import type { CompassStore, DecisionLog, DecisionStatus, Lesson, Market, MetricEvidence, OutcomeCheck, OutcomeVerdict, RuleEvaluation, StrategyEvaluation, StrategyRun } from "../types.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const at = "2026-01-01T00:00:00.000Z";
@@ -155,6 +156,48 @@ test("due list covers waitlist, no_go sampling, and review without checks", () =
 	}
 	const due = dueRetroItems(store, "2026-04-15T00:00:00.000Z");
 	assert.deepEqual(new Set(due.map((item) => item.group)), new Set(["waitlist", "no_go", "review"]));
+});
+
+// 停留超上限的到期判定锚在「本次进入 testing 的时刻」。goDays 特意调到 365，
+// 让节奏到期（2027-01-01）永远晚于停留到期，把断言唯一地钉在 stageAt 这个变量上。
+const STALE_TESTING_CONFIG: RetroDueConfig = { goDays: 365, testingStaleDays: 60, waitlistDays: 45, noGoDays: 90, reviewDays: 30 };
+
+function staleTestingStore(move: Partial<DecisionLog>): CompassStore {
+	const store = createEmptyStore(at);
+	store.markets.push(market("m", "market", []));
+	store.candidates.push({
+		id: "cand",
+		marketId: "m",
+		stage: "testing",
+		tags: [],
+		decisionStatus: "go",
+		decisionAt: "2026-01-01T00:00:00.000Z",
+		createdAt: "2025-12-20T00:00:00.000Z",
+		// 例行 CSV 导入会刷新 updatedAt：解析不到阶段迁移时到期项会被它无限期推后
+		updatedAt: "2026-03-25T00:00:00.000Z",
+	});
+	store.decisionLog.push({ id: "mv", candidateId: "cand", marketId: "m", type: "stage_move", conclusion: "", reason: "进入测品", actor: "tester", createdAt: "2026-01-02T00:00:00.000Z", ...move });
+	return store;
+}
+
+function assertStaleTestingDue(due: ReturnType<typeof dueRetroItems>): void {
+	assert.equal(due.length, 1);
+	assert.equal(due[0]?.reason, "testing 阶段停留超过上限");
+	assert.equal(due[0]?.dueAt, "2026-03-03T00:00:00.000Z");
+	assert.equal(due[0]?.overdueDays, 29);
+}
+
+test("stale testing due item reads structured toStage even when the conclusion wording changed", () => {
+	const move: Partial<DecisionLog> = { conclusion: "候选进入测品" };
+	// 见 todo.test.ts 同款注释：可选字段落地前用 Object.assign 才不会红在 tsc
+	Object.assign(move, { fromStage: "decision", toStage: "testing" });
+	const due = dueRetroItems(staleTestingStore(move), "2026-04-01T00:00:00.000Z", STALE_TESTING_CONFIG);
+	assertStaleTestingDue(due);
+});
+
+test("stale testing due item still parses the legacy arrow conclusion when no structured stage is stored", () => {
+	const due = dueRetroItems(staleTestingStore({ conclusion: "decision → testing" }), "2026-04-01T00:00:00.000Z", STALE_TESTING_CONFIG);
+	assertStaleTestingDue(due);
 });
 
 test("timeline merges snapshots, strategy runs, decisions, and outcome checks", () => {

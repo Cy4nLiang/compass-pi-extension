@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { configureBudget, ensureDefaults, listWorkbenchTodos, recordMcpUsage } from "../service.ts";
 import { createEmptyStore } from "../store.ts";
-import { deriveTodos, divergenceWatermarks, type DeriveTodosInput, type TodoBudgetPool } from "../todo.ts";
-import type { Candidate, CandidateStage, CompassStore, MetricMap, ResolvableTodoKind, TodoResolution } from "../types.ts";
+import { deriveTodos, divergenceWatermarks, stageEntryTimes, type DeriveTodosInput, type TodoBudgetPool } from "../todo.ts";
+import type { Candidate, CandidateStage, CompassStore, DecisionLog, MetricMap, ResolvableTodoKind, TodoResolution } from "../types.ts";
 
 const NOW = "2026-08-26T00:00:00.000Z";
 
@@ -535,6 +535,20 @@ test("deep stage anchor falls back to candidate.createdAt when no stage_move tra
 	assert.equal(derive(store, complete).filter((todo) => todo.kind === "deep_missing_data").length, 0);
 	candidate.updatedAt = "2026-08-25T00:00:00.000Z";
 	assert.equal(derive(store, complete).filter((todo) => todo.kind === "deep_missing_data").length, 0);
+});
+
+test("stage anchor reads structured toStage even when the conclusion wording changed", () => {
+	const store = baseStore();
+	addMarket(store, "m1", "alpha");
+	const candidate = addCandidate(store, "c1", "m1", "deep_research");
+	// conclusion 是纯展示串（会随措辞、中文标签、备注变化），阶段周期锚必须落在结构化字段上
+	const move: DecisionLog = { id: "d1", candidateId: "c1", marketId: "m1", type: "stage_move", conclusion: "阶段调整（粗筛⇒深研）", reason: "r", actor: "t", createdAt: "2026-08-10T00:00:00.000Z" };
+	// 用 Object.assign 而不是对象字面量：这两个是可选字段、存量记录本来就没有，
+	// 顺带让本用例在实现落地前也只红在断言、不红在 tsc（失败测试先行那一笔要能过 npm run check）
+	Object.assign(move, { fromStage: "screen", toStage: "deep_research" });
+	store.decisionLog.push(move);
+	assert.equal(stageEntryTimes(store, "deep_research").get("c1"), "2026-08-10T00:00:00.000Z");
+	assert.notEqual(stageEntryTimes(store, "deep_research").get("c1"), candidate.createdAt);
 });
 
 test("resolution records that cannot match an active todo are defensively ignored", () => {

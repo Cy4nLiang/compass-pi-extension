@@ -185,10 +185,9 @@ npm run check   # tsc --noEmit 类型检查
 这是一个可运行的本地优先 Extension，不是假装完成整个服务端平台：
 
 - 已完成：核心数字化、策略、终端工作台、历史检索、三层复盘与本地策略回测；
-- 已预留：P2 连接器侧数据路由执行与跨源预算调度（本地 sorftime 计量与熔断拦截已落地）；
 - 未内置：卖家精灵/Keepa/SP-API 凭据连接器、Playwright 集群、Chrome MV3 插件、自动联网采集。
 
-这些 P2/P3 能力需要账号资质、API key、代理/隔离环境和后端服务，后续应以独立连接器接入，而不是把凭据写进 Extension。
+这些能力需要账号资质、API key、代理/隔离环境和后端服务，Extension 不持有任何平台凭据，也不自动登录或联网采集。在线数据只经宿主接入的 MCP（如 Sorftime）按次计量进入，由本地预算池与熔断门约束；卖家精灵、Sorftime、Keepa 等工具的离线导出 CSV 照常经 `/compass-import` 导入。
 
 ## License
 

@@ -1687,7 +1687,11 @@ export default function compassExtension(pi: ExtensionAPI): void {
 				// 模拟「这批最后一次调用发出之前」的计数。熔断判据是 callCount >= limit，第 N 次调用
 				// 之前的计数是「已用 + N-1」；写成「已用 + calls」会把「刚好用完最后 3 次」误判成配额不够
 				const projected = { ...pending, [server]: (pending[server] ?? 0) + calls - 1 };
-				const blocked = evaluateMcpGate(store, { toolName: "mcp", input: { server } }, projected);
+				// 必须带 tool 发问：熔断门对「不发请求的网关形态」（列工具 / describe / search…）放行，
+				// 而「有 server 无 tool」正是那个形状——不写 tool 这条预检会被自己的豁免打成永远放行，
+				// 运营拿到一张注定中途熔断的确认单，前几次真钱照花。chain 非空已在上面校验过，
+				// chain[0].tool 就是这批的第一步真工具名，与确认单的工具白名单同源
+				const blocked = evaluateMcpGate(store, { toolName: "mcp", input: { server, tool: chain[0].tool } }, projected);
 				if (blocked) throw new Error(`补数确认被拒绝：这批要 ${calls} 次调用，做不完就会熔断。${blocked.reason}`);
 
 				const limitText = pool.monthlyCallLimit !== undefined ? `限 ${pool.monthlyCallLimit} 次` : `限 ¥${pool.monthlyLimitCny}`;

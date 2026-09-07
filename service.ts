@@ -1425,6 +1425,40 @@ export function mcpCallTargetServers(store: CompassStore, call: { toolName: stri
 	return [];
 }
 
+// 网关（`mcp` 工具）的**非调用形态白名单**：这些键的组合不向服务端发 tools/call，因而不花钱。
+// 依据是 pi-mcp-adapter 2.27.0 的分派链——ui-messages / auth-start / auth-complete / tool /
+// connect / describe / instructions / search / 列工具 / status，只有 `tool` 为真那一支进
+// executeCall。`tool` 与 `args` 刻意不在名单里：前者就是调用本身，后者是「参数被套进 args 里」
+// 的兼容形态，宿主会把嵌套的 tool 展开后真发请求。
+const MCP_NON_CALL_GATEWAY_KEYS = new Set([
+	"server",
+	"connect",
+	"describe",
+	"instructions",
+	"search",
+	"regex",
+	"includeSchemas",
+	"limit",
+	"offset",
+	"action",
+]);
+const MCP_NON_CALL_GATEWAY_ACTIONS = new Set(["ui-messages", "auth-start", "auth-complete"]);
+
+// 判据必须是**白名单**而不是「没有 tool 就当不是调用」：名单之外的一切——未来新增的键、
+// args 兼容形态、action 的未知取值——一律当调用照常拦。放行方向宁少勿滥，判不准就拦，
+// 代价只是少放行一次免费请求，而放错要花真钱。
+// 与 index.ts 的 isGatewayCall（确认单预扣与在途预占用的那份）的关系：本函数**严格更保守**，
+// 白名单判非调用 ⇒ 那边也判非调用，反之不成立。熔断是硬边界，只放行能自证不发请求的形态。
+export function isMcpNonCallGateway(input: Record<string, unknown> | undefined): boolean {
+	if (!input) return true;
+	for (const key of Object.keys(input)) {
+		if (!MCP_NON_CALL_GATEWAY_KEYS.has(key)) return false;
+	}
+	const action = input.action;
+	if (action !== undefined && (typeof action !== "string" || !MCP_NON_CALL_GATEWAY_ACTIONS.has(action))) return false;
+	return true;
+}
+
 // tool_call 拦截判定：只读，不写 store。两类拦截——① 预算池被禁用（enabled=false，
 // 手册定义「当前不允许使用」，不看上限也不看熔断）；② 「配置了上限」（monthlyCallLimit 或
 // monthlyLimitCny>0）且当月已熔断。默认 sorftime 池（enabled、¥0、无次数上限）
@@ -1436,6 +1470,11 @@ export function evaluateMcpGate(
 ): { server: string; reason: string } | undefined {
 	const servers = mcpCallTargetServers(store, call);
 	if (!servers.length) return undefined;
+	// 熔断口径必须等于计量口径：不发请求的网关形态既不花钱也不该被熔断拦，否则池一熔断
+	// agent 连「这个源有哪些工具」都问不出来（审计 G5）。计量侧早就是同一条界线——
+	// classifyMcpToolResult 对 `mode !== "call"` 返回 undefined。豁免只覆盖熔断，
+	// 禁用（enabled=false）照拦，见下面的判定顺序
+	const nonCallGateway = call.toolName === "mcp" && isMcpNonCallGateway(call.input);
 	const budgets = budgetStatus(store, undefined, pendingCalls);
 	for (const server of servers) {
 		const pool = budgets.find((item) => item.source === server);
@@ -1448,6 +1487,10 @@ export function evaluateMcpGate(
 				reason: `${server} 预算池已禁用：当前不允许调用该数据源。恢复：compass_budget configure source=${server} enabled=true。`,
 			};
 		}
+		// 位置是有意的：排在禁用之后、熔断之前。「禁用」说的是「当前不允许使用这个源」，
+		// 与这次请求花不花钱无关，三处同口径（recordCost / compass_data_route / 本函数）；
+		// 熔断说的才是「钱/次数用完了」，不花钱的请求不该受它约束
+		if (nonCallGateway) continue;
 		if (pool.monthlyCallLimit === undefined && pool.monthlyLimitCny <= 0) continue;
 		if (pool.state !== "fused") continue;
 		const callsText = pool.monthlyCallLimit !== undefined

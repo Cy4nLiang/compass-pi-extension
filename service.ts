@@ -1396,6 +1396,81 @@ export function recordMcpUsage(
 	return events;
 }
 
+// pi-mcp-adapter 2.27.0 的 hasGatewayMode 键集（index.ts:914-921）：顶层出现其中**任一个**
+// 时 adapter 按顶层参数分派、不展开 `args`。判据是 `!== undefined` 而不是真值——顶层写
+// `server: ""` 也算「已进网关模式」，那种形态最终落 executeStatus、不发请求。
+// **它不是 MCP_NON_CALL_GATEWAY_KEYS**：那份是 G5 的「拦不拦」白名单（10 个键，含
+// regex / limit 而刻意不含 tool 与 args），语义是「不发请求」。两份集合成员与方向都不同，
+// 混用会同时造成漏拦（少归池）与误拦（把免费形态归了池）。
+const MCP_GATEWAY_MODE_KEYS = ["tool", "connect", "describe", "instructions", "search", "server", "action"] as const;
+
+// adapter 里排在 `if (dispatchParams.tool)`（index.ts:994）**之前**的三个 action 分派
+// （:962 ui-messages / :965 auth-start / :976 auth-complete）：命中就到不了 executeCall。
+// 刻意写成独立字面量而不是复用 MCP_NON_CALL_GATEWAY_ACTIONS——那份回答的是「这个形态发不发
+// 请求」（G5 的放行白名单），这份回答的是「这个 action 会不会抢在 tool 之前分派」。今天两者
+// 恰好同值纯属巧合：将来往 G5 那份加一个**不**短路 tool 的取值，复用会静默把一种付费形态
+// 踢出归池（漏拦方向，比误拦危险）。两处注释互指，改一处先看另一处。
+const MCP_GATEWAY_ACTIONS_BEFORE_TOOL = new Set(["ui-messages", "auth-start", "auth-complete"]);
+
+// 「网关参数被套进 `args` 里」的兼容形态解析（审计 N-AUD-4）：回答「adapter 展开之后这次调用
+// 打向哪个池」。依据 pi-mcp-adapter 2.27.0 的 index.ts:912-931（展开条件）与 :962-1013
+// （分派链）逐条镜像，只认**会落到 executeCall 的形态**；不展开、adapter 直接 throw、或展开后
+// 落到 describe / search / connect / instructions / 列工具 / 三个已知 action 这些不发请求的
+// 分支，一律返回 undefined 保持今天的行为。
+// 方向：宁可少归（维持现状）也不误归。`args` 被刻意排除在 G5 的非调用白名单之外，嵌套侧一旦
+// 误归就没有任何东西替它放行——熔断后连「这个源有哪些工具」都问不出来，正是 G5 刚修好的毛病。
+// 已知的过度拦截（刻意承担，方向安全）：内层 args 是坏 JSON、或 regex / limit 这类键类型不对时，
+// adapter 会在展开阶段 throw、请求根本发不出去，而这里照样归池——代价只是熔断时运营看到熔断
+// 文案而不是 adapter 的报错，不损失任何免费请求。
+function nestedGatewayCallTarget(byLength: BudgetPool[], input: Record<string, unknown> | undefined): string | undefined {
+	if (!input) return undefined;
+	// 顶层出现任一网关键（哪怕值是空串）⇒ adapter 走顶层分派，`args` 原样当实参
+	for (const key of MCP_GATEWAY_MODE_KEYS) {
+		if (input[key] !== undefined) return undefined;
+	}
+	const raw = input.args;
+	let nested: Record<string, unknown>;
+	if (typeof raw === "string") {
+		// adapter 的 parseArgs：空串回 undefined（落 :930 的 throw），坏 JSON 直接 throw
+		if (!raw) return undefined;
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(raw);
+		} catch {
+			return undefined;
+		}
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+		nested = parsed as Record<string, unknown>;
+	} else if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+		nested = raw as Record<string, unknown>;
+	} else {
+		return undefined;
+	}
+	// 内层网关键出现非字符串值 ⇒ validateNestedGatewayParams 抛错（index.ts:890-911），
+	// 请求根本发不出去。「内层一个网关键都没有」（adapter :928 抛「Gateway params were nested
+	// inside `args`」，`{args:{args:{…}}}` 这种双层嵌套也落在这里——展开是一次性 if、没有循环）
+	// 不必单判：那种形态的内层 tool 必然缺席，被下面的真值判定一并挡住
+	for (const key of MCP_GATEWAY_MODE_KEYS) {
+		const value = nested[key];
+		if (value !== undefined && typeof value !== "string") return undefined;
+	}
+	// 这三个 action 的分派排在 `if (dispatchParams.tool)` 之前（index.ts:962/965/976），
+	// 命中就到不了 executeCall——带着 tool 也一样
+	if (typeof nested.action === "string" && MCP_GATEWAY_ACTIONS_BEFORE_TOOL.has(nested.action)) return undefined;
+	// `if (dispatchParams.tool)` 是**真值**判定：空串一路滑到 executeStatus，不发请求
+	const tool = nested.tool;
+	if (typeof tool !== "string" || !tool) return undefined;
+	// 内层 server 就是 executeCall 的 serverOverride（proxy-modes.ts:806），优先于工具名前缀，
+	// 内层 tool 因此可以完全没有池前缀。与顶层口径一致：即使它不是任何预算池也原样返回，
+	// 由 evaluateMcpGate 的 budgets.find 自然跳过
+	const server = nested.server;
+	if (typeof server === "string" && server) return server;
+	for (const pool of byLength) {
+		if (tool === pool.source || tool.startsWith(`${pool.source}_`)) return pool.source;
+	}
+	return undefined;
+}
+
 // 导出给 index.ts 的 strict 档确认单判定用：与熔断门解析同一个「这次调用打向哪个池」，
 // 两边各写一份迟早分裂成「熔断按 A 池算、确认单按 B 池算」
 export function mcpCallTargetServers(store: CompassStore, call: { toolName: string; input?: Record<string, unknown> }): string[] {
@@ -1412,7 +1487,11 @@ export function mcpCallTargetServers(store: CompassStore, call: { toolName: stri
 				if (tool === pool.source || tool.startsWith(`${pool.source}_`)) return [pool.source];
 			}
 		}
-		return [];
+		// 顶层两条路径都落空时，才看「网关参数被套进 args 里」的兼容形态（审计 N-AUD-4）：
+		// adapter 会把它展开成真调用、事后照常计费，此前解析成空数组等于熔断门 / 补数确认单
+		// 预扣 / 在途预占三处一起放行。顶层解析一字未动，嵌套解析只排在它们之后
+		const nested = nestedGatewayCallTarget(byLength, call.input);
+		return nested ? [nested] : [];
 	}
 	if (call.toolName === "mcpScript") {
 		// 脚本内部调用不逐条上报，无法精确归因；按池名子串做提示性匹配（spec 2.1 非目标）。
@@ -1429,7 +1508,8 @@ export function mcpCallTargetServers(store: CompassStore, call: { toolName: stri
 // 依据是 pi-mcp-adapter 2.27.0 的分派链——ui-messages / auth-start / auth-complete / tool /
 // connect / describe / instructions / search / 列工具 / status，只有 `tool` 为真那一支进
 // executeCall。`tool` 与 `args` 刻意不在名单里：前者就是调用本身，后者是「参数被套进 args 里」
-// 的兼容形态，宿主会把嵌套的 tool 展开后真发请求。
+// 的兼容形态，宿主会把嵌套的 tool 展开后真发请求（那种形态打向哪个池由上面的
+// nestedGatewayCallTarget 回答——**两份键集不可互相复用**，见那里的注释）。
 const MCP_NON_CALL_GATEWAY_KEYS = new Set([
 	"server",
 	"connect",
@@ -1442,6 +1522,8 @@ const MCP_NON_CALL_GATEWAY_KEYS = new Set([
 	"offset",
 	"action",
 ]);
+// 这三个取值与上面的 MCP_GATEWAY_ACTIONS_BEFORE_TOOL 今天同值纯属巧合：那份问的是「会不会
+// 抢在 tool 之前分派」，这份问的是「发不发请求」。往任一份加值前先读另一份的注释
 const MCP_NON_CALL_GATEWAY_ACTIONS = new Set(["ui-messages", "auth-start", "auth-complete"]);
 
 // 判据必须是**白名单**而不是「没有 tool 就当不是调用」：名单之外的一切——未来新增的键、

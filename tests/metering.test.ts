@@ -497,8 +497,14 @@ test("mcpCallTargetServers：顶层既无 server 也无 tool、网关参数全�
 		["顶层 args 是数组", { args: [{ tool: "sorftime_ProductResearch" }] }],
 		// validateNestedGatewayParams：七个网关键必须是字符串，否则 adapter 抛错、请求发不出去
 		["内层 tool 不是字符串", { args: { tool: 123 } }],
+		// 内层 server 也必须是字符串。这条形态的内层 tool 前缀本来命中得了 sorftime——
+		// 只有类型镜像挡得住它，删掉那道判断就会误归一个 adapter 当场抛错的形态
+		["内层 server 不是字符串", { args: { server: 123, tool: "sorftime_ProductResearch" } }],
 		// `if (dispatchParams.tool)` 是**真值**判定：空串一路滑到 executeStatus，不发请求
 		["内层 tool 是空串", { args: { tool: "" } }],
+		// 带内层 server 时空串 tool 才钉得住真值判定：不带 server 的空串会被工具名前缀匹配
+		// 顺手挡掉，那条挡的是别的东西。adapter 这时落 executeList，不发请求
+		["内层 tool 是空串但带内层 server", { args: { server: "sorftime", tool: "" } }],
 		// 展开后落到不发请求的分支（describe / search / connect / instructions / 列工具）
 		["内层 describe", { args: { describe: "sorftime_ProductResearch" } }],
 		["内层 search", { args: { search: "keyword" } }],

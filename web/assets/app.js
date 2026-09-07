@@ -2167,6 +2167,11 @@ function buildDecisionProfitPanelHtml(profit) {
 		["BE-CPC", `${profit.breakEvenCpc.toFixed(2)} ${profit.currency}`],
 		["CPC 承受度", profit.cpcRatio !== null ? profit.cpcRatio.toFixed(2) : "—"],
 		["启动资金", `${profit.startupCapital.toFixed(0)} ${profit.currency}`],
+		// 采购价出处（compass-1688-cost-reference）：存量记录显示「未标注」；1688 参考成本带样本数与采样日
+		[
+			"采购价",
+			`${typeof profit.purchaseCost === "number" ? `${profit.purchaseCost.toFixed(2)} ${profit.currency}` : "—"}（${profit.purchaseCostSourceLabel ?? "未标注"}${profit.costReference ? ` · 样本 ${profit.costReference.sampleSize} · 采样 ${String(profit.costReference.capturedAt).slice(0, 10)}` : ""}）`,
+		],
 	].map(([label, value]) => `<div class="fact-row"><span class="cell-muted">${escapeHtml(label)}</span><span class="mono cell-right">${escapeHtml(value)}</span></div>`).join("");
 	return `<div class="panel"><div class="panel-title">利润测算 <span class="mono cell-muted" style="font-weight:400;">${escapeHtml(profit.createdAt.slice(0, 10))}</span></div>${rows}</div>`;
 }

@@ -34,7 +34,9 @@ import {
 	mainCpcForMarket,
 	resolveProfitCpc,
 	moveCandidate,
+	recordCostReference,
 	recordProfitEstimate,
+	resolvePurchaseCostInput,
 	recordRetroActuals,
 	recordReviewAnalysis,
 	recordRisk,
@@ -2103,4 +2105,105 @@ test("引用全部合法标识符的策略必须仍能保存（M17 反向对照�
 
 	const saved = saveStrategyVersion(store, { yaml, actor: "tester" });
 	assert.equal(saved.definition.stages[0].rules.length, metricNames.length + 2);
+});
+
+// —— 1688 参考成本（compass-1688-cost-reference）：利润测算的采购价出处 ——
+// 用例名含「costReferences」，任务书 Proof 表按它选行（与上面的迁移 / 往返两条同一模式）。
+function seedCostReferenceMarket(): { store: CompassStore; marketId: string; candidateId: string } {
+	const store = createEmptyStore("2026-09-01T00:00:00.000Z");
+	ensureDefaults(store, "tester");
+	const lead = createLead(store, { marketName: "demo basket", actor: "tester" });
+	recordCostReference(store, {
+		marketId: lead.market.id,
+		candidateId: lead.candidate.id,
+		source: "sorftime",
+		tool: "ali1688_similar_product",
+		keyword: "demo",
+		page: 1,
+		capturedAt: "2026-09-07T00:00:00.000Z",
+		actor: "tester",
+		currency: "USD",
+		fxRate: 0.14,
+		fxAsOf: "2026-09-01",
+		coefficient: 0.9,
+		method: "median",
+		medianCny: 10,
+		referenceCostCny: 9,
+		referenceCost: 1.26,
+		sampleSize: 3,
+		samples: [],
+		prompted: 3,
+		rejected: 0,
+		warnings: [],
+		archivedRaw: [],
+	});
+	return { store, marketId: lead.market.id, candidateId: lead.candidate.id };
+}
+
+test("costReferences：利润测算的采购价二选一——purchase_cost 与 cost_reference_ref 都给或都不给都被拒，引用必须带市场", () => {
+	const { store, marketId } = seedCostReferenceMarket();
+	assert.throws(() => resolvePurchaseCostInput(store, { marketId, purchaseCost: 4, costReferenceRef: "latest", currency: "USD" }), /只能给一个/u);
+	assert.throws(() => resolvePurchaseCostInput(store, { marketId, currency: "USD" }), /必须给一个/u);
+	assert.throws(() => resolvePurchaseCostInput(store, { costReferenceRef: "latest", currency: "USD" }), /market_ref/u);
+});
+
+test("costReferences：cost_reference_ref=latest 取该市场最新一条并把出处固定为 ali1688_reference；按 id 引用与跨市场引用各按规则判", () => {
+	const { store, marketId } = seedCostReferenceMarket();
+	const first = (store.costReferences ?? [])[0];
+	assert.ok(first);
+	const newer = recordCostReference(store, {
+		marketId,
+		source: "sorftime",
+		tool: "ali1688_similar_product",
+		keyword: "demo",
+		page: 1,
+		capturedAt: "2026-09-08T00:00:00.000Z",
+		actor: "tester",
+		currency: "USD",
+		fxRate: 0.14,
+		fxAsOf: "2026-09-01",
+		coefficient: 0.9,
+		method: "median",
+		medianCny: 11,
+		referenceCostCny: 9.9,
+		referenceCost: 1.386,
+		sampleSize: 5,
+		samples: [],
+		prompted: 5,
+		rejected: 0,
+		warnings: [],
+		archivedRaw: [],
+	});
+	const latest = resolvePurchaseCostInput(store, { marketId, costReferenceRef: "latest", currency: "USD" });
+	assert.deepEqual(latest, { purchaseCost: newer.referenceCost, purchaseCostSource: "ali1688_reference", costReferenceId: newer.id });
+	const byId = resolvePurchaseCostInput(store, { marketId, costReferenceRef: first.id, currency: "USD" });
+	assert.deepEqual(byId, { purchaseCost: first.referenceCost, purchaseCostSource: "ali1688_reference", costReferenceId: first.id });
+	// 引用参考成本时出处固定，不接受 purchase_cost_source 另说
+	assert.throws(() => resolvePurchaseCostInput(store, { marketId, costReferenceRef: "latest", purchaseCostSource: "supplier_quote", currency: "USD" }), /出处固定/u);
+	// 跨市场：参考成本是按该市场的关键词搜出来的
+	const other = createLead(store, { marketName: "demo other", actor: "tester" });
+	assert.throws(() => resolvePurchaseCostInput(store, { marketId: other.market.id, costReferenceRef: first.id, currency: "USD" }), /属于市场/u);
+	assert.throws(() => resolvePurchaseCostInput(store, { marketId: other.market.id, costReferenceRef: "latest", currency: "USD" }), /还没有 1688 参考成本记录/u);
+});
+
+test("costReferences：币种不符时拒绝引用；手填采购价出处缺省 manual、可标 supplier_quote；五维报告 §3 写出出处与差值", async () => {
+	const { store, marketId } = seedCostReferenceMarket();
+	assert.throws(() => resolvePurchaseCostInput(store, { marketId, costReferenceRef: "latest", currency: "CNY" }), /币种/u);
+	assert.deepEqual(resolvePurchaseCostInput(store, { marketId, purchaseCost: 4, currency: "USD" }), { purchaseCost: 4, purchaseCostSource: "manual" });
+	assert.deepEqual(resolvePurchaseCostInput(store, { marketId, purchaseCost: 1.5, purchaseCostSource: "supplier_quote", currency: "USD" }), { purchaseCost: 1.5, purchaseCostSource: "supplier_quote" });
+
+	// 报告要有快照才能生成：导入示例 CSV 后落两条测算——先一条无出处（存量形态），再一条供应商报价
+	const csv = await readFile(join(here, "../examples/demo-market.csv"), "utf8");
+	const parsed = parseMarketCsv(csv, { source: "sellersprite", capturedAt: "2026-09-06T00:00:00.000Z" });
+	importMarketAndScreen(store, { marketName: "demo basket", parsed, capturedAt: "2026-09-06T00:00:00.000Z", actor: "tester", runScreen: true });
+	const legacy = normalizeProfitInput({ marketId, salePrice: 19.99, purchaseCost: 4, fbaFee: 4.5 });
+	recordProfitEstimate(store, legacy, estimateProfit(legacy), "tester");
+	const legacyReport = generateMarketReport(store, marketId).markdown;
+	assert.match(legacyReport, /- 采购价 USD 4\.00（出处：未标注）/u, "存量记录没有出处字段，报告标「未标注」");
+
+	const quoted = normalizeProfitInput({ marketId, salePrice: 19.99, purchaseCost: 1.5, fbaFee: 4.5, purchaseCostSource: "supplier_quote" });
+	recordProfitEstimate(store, quoted, estimateProfit(quoted), "tester");
+	const quotedReport = generateMarketReport(store, marketId).markdown;
+	assert.match(quotedReport, /- 采购价 USD 1\.50（出处：供应商报价）/u);
+	assert.match(quotedReport, /与 1688 参考成本 USD 1\.26 相差 \+0\.24（\+19\.0%）/u, "报价与参考成本并存时给差值");
 });

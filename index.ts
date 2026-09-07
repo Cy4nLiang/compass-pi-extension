@@ -18,7 +18,7 @@ import {
 import { Box, Markdown, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { DOMAIN_TOOLS, rankTools, searchTerms } from "./catalog.ts";
-import { COST_REFERENCE_COEFFICIENT, COST_REFERENCE_FX_STALE_DAYS, COST_REFERENCE_MAX_PROMPTS, COST_REFERENCE_SAMPLE_SIZE, PURCHASE_COST_SOURCE_LABELS, compareSnapshotRecencyDesc, snapshotTtlDays } from "./defaults.ts";
+import { COST_REFERENCE_COEFFICIENT, COST_REFERENCE_FX_STALE_DAYS, COST_REFERENCE_MAX_PROMPTS, COST_REFERENCE_SAMPLE_SIZE, PURCHASE_COST_SOURCE_LABELS, compareSnapshotRecencyDesc, purchaseCostSourceLabel, snapshotTtlDays } from "./defaults.ts";
 import {
 	DEFAULT_DISPATCH_CONFIG,
 	DISPATCH_AGENT_NAMES,
@@ -103,6 +103,7 @@ import {
 	recordRisk,
 	reopenTodoResolution,
 	resolveProfitCpc,
+	resolvePurchaseCostInput,
 	retireLesson,
 	runStrategy,
 	saveLesson,
@@ -873,11 +874,13 @@ export default function compassExtension(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "compass_profit_estimate",
 		label: "Compass Profit Estimate",
-		description: "按内置利润模型计算落地成本、毛利率、盈亏平衡 CPC、CPC 承受度、退货损失、TACOS 三情景净利、启动资金与回本周期；关联市场时写入证据链。",
+		description: "按内置利润模型计算落地成本、毛利率、盈亏平衡 CPC、CPC 承受度、退货损失、TACOS 三情景净利、启动资金与回本周期；关联市场时写入证据链。采购价二选一：手填 purchase_cost（出处缺省 manual，供应商报价标 purchase_cost_source=supplier_quote），或 cost_reference_ref=latest 引用该市场的 1688 参考成本记录（数字取自记录、出处固定为 1688 参考成本）。",
 		parameters: Type.Object({
 			market_ref: Type.Optional(Type.String()),
 			sale_price: Type.Number({ exclusiveMinimum: 0 }),
-			purchase_cost: Type.Number({ minimum: 0 }),
+			purchase_cost: Type.Optional(Type.Number({ minimum: 0, description: "手填采购价（与 cost_reference_ref 二选一）" })),
+			cost_reference_ref: Type.Optional(Type.String({ description: "引用 1688 参考成本记录：latest 或记录 id；需要 market_ref，币种必须一致" })),
+			purchase_cost_source: Type.Optional(StringEnum(["supplier_quote", "manual"] as const)),
 			first_mile_cost: Type.Optional(Type.Number({ minimum: 0 })),
 			tariff_cost: Type.Optional(Type.Number({ minimum: 0 })),
 			referral_rate: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
@@ -907,10 +910,22 @@ export default function compassExtension(pi: ExtensionAPI): void {
 				marketId = market.id;
 				cpc = resolveProfitCpc(store, market.id, cpc);
 			}
+			// 采购价二选一（compass-1688-cost-reference）：引用参考成本时数字取自记录、出处固定，agent 不经手数字
+			const purchase = resolvePurchaseCostInput(store, {
+				marketId,
+				purchaseCost: params.purchase_cost,
+				costReferenceRef: params.cost_reference_ref,
+				purchaseCostSource: params.purchase_cost_source,
+				currency: params.currency ?? "USD",
+			});
+			const referenced = purchase.costReferenceId ? (store.costReferences ?? []).find((item) => item.id === purchase.costReferenceId) : undefined;
+			const sourceLine = `采购价出处：${purchaseCostSourceLabel(purchase.purchaseCostSource)}${referenced ? ` · 记录 ${referenced.id} · 样本 ${referenced.sampleSize} · ×${referenced.coefficient} · 汇率 ${referenced.fxRate}@${referenced.fxAsOf} · 采样 ${referenced.capturedAt.slice(0, 10)}` : ""}`;
 			const input = normalizeProfitInput({
 				marketId,
 				salePrice: params.sale_price,
-				purchaseCost: params.purchase_cost,
+				purchaseCost: purchase.purchaseCost,
+				purchaseCostSource: purchase.purchaseCostSource,
+				costReferenceId: purchase.costReferenceId,
 				firstMileCost: params.first_mile_cost,
 				tariffCost: params.tariff_cost,
 				referralRate: params.referral_rate,
@@ -943,7 +958,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			}
 			const scenarios = result.netMarginScenarios.map((scenario, index) => `TACOS ${(scenario.tacos * 100).toFixed(0)}% => 净利率 ${(scenario.netMargin * 100).toFixed(1)}%，月净利 ${result.monthlyNetProfitScenarios[index].monthlyNetProfit.toFixed(2)}，回本 ${result.paybackMonthsScenarios[index].paybackMonths ?? "不可"} 月`);
 			const summary = `毛利 ${(result.grossMargin * 100).toFixed(1)}% · BE-CPC ${result.breakEvenCpc.toFixed(2)} · CPC承受度 ${result.cpcRatio?.toFixed(2) ?? "缺数据"} · 启动资金 ${result.startupCapital.toFixed(2)}`;
-			return textResult([summary, ...scenarios, ...result.warnings.map((warning) => `警告：${warning}`), estimateId ? `estimate_id=${estimateId}` : "未关联市场，未持久化"].join("\n"), details({ title: "利润测算", status: result.warnings.length === 0 ? "success" : "warning", summary, lines: [...scenarios, ...result.warnings], data: resultData({ gapNote }) }));
+			return textResult([summary, sourceLine, ...scenarios, ...result.warnings.map((warning) => `警告：${warning}`), estimateId ? `estimate_id=${estimateId}` : "未关联市场，未持久化"].join("\n"), details({ title: "利润测算", status: result.warnings.length === 0 ? "success" : "warning", summary, lines: [sourceLine, ...scenarios, ...result.warnings], data: resultData({ gapNote }) }));
 		},
 		renderCall: renderCallLabel("compass_profit_estimate"),
 		renderResult: renderCompassResult,

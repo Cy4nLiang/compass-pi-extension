@@ -253,6 +253,9 @@ export const PURCHASE_COST_SOURCE_LABELS: Readonly<Record<PurchaseCostSource, st
 	manual: "手填",
 });
 export const PURCHASE_COST_SOURCE_UNLABELED = "未标注";
+export function purchaseCostSourceLabel(source: PurchaseCostSource | undefined): string {
+	return source === undefined ? PURCHASE_COST_SOURCE_UNLABELED : PURCHASE_COST_SOURCE_LABELS[source];
+}
 
 
 // ---- 「最新快照」排序：全系统唯一口径 ----

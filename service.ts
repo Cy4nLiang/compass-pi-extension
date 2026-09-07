@@ -57,6 +57,7 @@ import type {
 	ProfitEstimate,
 	ProfitInput,
 	ProfitResult,
+	PurchaseCostSource,
 	ResolvableTodoKind,
 	ReviewAnalysis,
 	ReviewTheme,
@@ -564,6 +565,43 @@ export function resolveCostReferenceForEstimate(store: CompassStore, marketId: s
 	}
 	if (found.marketId !== market.id) throw new ValidationError(`参考成本 ${found.id} 属于市场 ${found.marketId}，不能用于 ${market.id}：参考成本是按该市场的关键词搜出来的`);
 	return found;
+}
+
+export interface PurchaseCostInput {
+	marketId?: string;
+	purchaseCost?: number;
+	costReferenceRef?: string;
+	/** 手填时的出处；引用参考成本时不得再传（出处固定为 ali1688_reference） */
+	purchaseCostSource?: Exclude<PurchaseCostSource, "ali1688_reference">;
+	currency: string;
+}
+
+export interface ResolvedPurchaseCost {
+	purchaseCost: number;
+	purchaseCostSource: PurchaseCostSource;
+	costReferenceId?: string;
+}
+
+/**
+ * compass_profit_estimate 的采购价：手填 `purchase_cost`（出处缺省 manual、可标 supplier_quote）
+ * 与引用 `cost_reference_ref` 二选一。引用时数字取自记录、出处固定为 ali1688_reference，
+ * 币种必须与本次测算一致——不同币种的数直接混进利润模型，毛利率会错得看不出来。
+ */
+export function resolvePurchaseCostInput(store: CompassStore, input: PurchaseCostInput): ResolvedPurchaseCost {
+	const hasCost = input.purchaseCost !== undefined;
+	const reference = input.costReferenceRef?.trim() || undefined;
+	if (hasCost && reference) throw new ValidationError("purchase_cost 与 cost_reference_ref 只能给一个：要么手填采购价，要么引用 1688 参考成本记录");
+	if (!hasCost && !reference) throw new ValidationError("purchase_cost 与 cost_reference_ref 必须给一个：手填采购价，或用 cost_reference_ref=latest 引用 1688 参考成本");
+	if (reference) {
+		if (!input.marketId) throw new ValidationError("引用参考成本必须带 market_ref：参考成本是按市场的关键词搜出来的，没有市场就不知道引用哪条");
+		if (input.purchaseCostSource !== undefined) throw new ValidationError("引用参考成本时出处固定为 1688 参考成本，不要再传 purchase_cost_source");
+		const found = resolveCostReferenceForEstimate(store, input.marketId, reference);
+		if (found.currency.toUpperCase() !== input.currency.toUpperCase()) {
+			throw new ValidationError(`参考成本 ${found.id} 的币种是 ${found.currency}，与本次测算的 ${input.currency} 不一致：币种不同不能直接引用，先统一 currency 或重新取参考成本`);
+		}
+		return { purchaseCost: found.referenceCost, purchaseCostSource: "ali1688_reference", costReferenceId: found.id };
+	}
+	return { purchaseCost: input.purchaseCost as number, purchaseCostSource: input.purchaseCostSource ?? "manual" };
 }
 
 function overallRisk(input: {
@@ -2629,6 +2667,9 @@ export function generateMarketReport(
 	const risk = latestBy(store.riskRecords.filter((item) => item.marketId === market.id), (item) => item.createdAt);
 	const review = latestBy(store.reviewAnalyses.filter((item) => item.marketId === market.id), (item) => item.createdAt);
 	const profit = latestBy(store.profitEstimates.filter((item) => item.marketId === market.id), (item) => item.createdAt);
+	// 1688 参考成本：测算指名引用的那条优先，否则取该市场最新一条（报价到达后报告仍能给出与参考成本的差值）
+	const references = (store.costReferences ?? []).filter((item) => item.marketId === market.id);
+	const costReference = (profit?.input.costReferenceId ? references.find((item) => item.id === profit.input.costReferenceId) : undefined) ?? latestBy(references, (item) => item.createdAt);
 	const attributedCostCny = store.costEvents.filter((item) => item.marketId === market.id).reduce((sum, item) => sum + item.amountCny, 0);
 	const fusedBudgetSources = budgetStatus(store).filter((pool) => pool.state === "fused").map((pool) => pool.source);
 	const data: MarketReportData = {
@@ -2641,6 +2682,7 @@ export function generateMarketReport(
 		risk,
 		review,
 		profit,
+		costReference,
 		decisions,
 		outcomeChecks: store.outcomeChecks.filter((item) => item.marketId === market.id).sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
 		lessons: matchingLessonsForMarket(store, market.id),

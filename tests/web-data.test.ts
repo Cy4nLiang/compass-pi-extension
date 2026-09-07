@@ -5,7 +5,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { parseMarketCsv } from "../csv.ts";
 import { estimateProfit, normalizeProfitInput } from "../economics.ts";
-import { createLead, ensureDefaults, importMarketAndScreen, recordProfitEstimate, recordRisk } from "../service.ts";
+import { createLead, ensureDefaults, importMarketAndScreen, recordCostReference, recordProfitEstimate, recordRisk } from "../service.ts";
 import { createEmptyStore } from "../store.ts";
 import type { CompassStore } from "../types.ts";
 import {
@@ -376,4 +376,64 @@ test("markets freshness 覆盖 screen_only 档且 30 天边界仍算粗筛可用
 	assert.equal(markets.freshnessCounts.screen_only, 1);
 	assert.equal(markets.freshnessCounts.stale, 1);
 	assert.equal(overviewData(store, NOW).kpi.staleMarkets30d, 1, "边界 30 天不计入待补数");
+});
+
+// —— 1688 参考成本（compass-1688-cost-reference）：决策页利润面板要看得出采购价出处 ——
+test("pool candidate detail profit summary carries purchaseCostSource and the cost reference it points to", async () => {
+	const store = await seededStore();
+	const marketId = store.markets.find((market) => market.name === "fresh market")?.id;
+	assert.ok(marketId);
+	// 存量形态：没有出处字段 → null 与「未标注」，costReference 为 null
+	const legacy = normalizeProfitInput({ marketId, salePrice: 25.99, purchaseCost: 3.5, fbaFee: 5.2 });
+	recordProfitEstimate(store, legacy, estimateProfit(legacy), "tester");
+	const before = poolCandidateData(store, "fresh market");
+	assert.equal(before.profitSummary?.purchaseCost, 3.5);
+	assert.equal(before.profitSummary?.purchaseCostSource, null);
+	assert.equal(before.profitSummary?.purchaseCostSourceLabel, "未标注");
+	assert.equal(before.profitSummary?.costReference, null);
+
+	// 1688 参考成本：测算引用记录，面板带样本数与采样日
+	const reference = recordCostReference(store, {
+		marketId,
+		source: "sorftime",
+		tool: "ali1688_similar_product",
+		keyword: "demo",
+		page: 1,
+		capturedAt: "2026-09-07T00:00:00.000Z",
+		actor: "tester",
+		currency: "USD",
+		fxRate: 0.14,
+		fxAsOf: "2026-09-01",
+		coefficient: 0.9,
+		method: "median",
+		medianCny: 10,
+		referenceCostCny: 9,
+		referenceCost: 1.26,
+		sampleSize: 5,
+		samples: [],
+		prompted: 6,
+		rejected: 1,
+		warnings: ["零销量补位 1 条：这几条 30 天销量为 0，只是按返回顺序凑满样本"],
+		archivedRaw: [],
+	});
+	const sourced = normalizeProfitInput({ marketId, salePrice: 25.99, purchaseCost: reference.referenceCost, fbaFee: 5.2, purchaseCostSource: "ali1688_reference", costReferenceId: reference.id });
+	const sourcedEstimate = recordProfitEstimate(store, sourced, estimateProfit(sourced), "tester");
+	// 两条测算在同一毫秒落库时 poolCandidateData 的 sort(desc)[0] 会取到先插入的那条（盘点 A5 的并列坑，
+	// 本专题不修它）：把第二条的时间戳显式推后，本用例只钉出处字段的透传
+	sourcedEstimate.createdAt = "2026-09-08T00:00:00.000Z";
+	const after = poolCandidateData(store, "fresh market");
+	assert.equal(after.profitSummary?.purchaseCost, 1.26);
+	assert.equal(after.profitSummary?.purchaseCostSource, "ali1688_reference");
+	assert.equal(after.profitSummary?.purchaseCostSourceLabel, "1688 参考成本");
+	assert.deepEqual(after.profitSummary?.costReference, {
+		id: reference.id,
+		sampleSize: 5,
+		capturedAt: "2026-09-07T00:00:00.000Z",
+		coefficient: 0.9,
+		fxRate: 0.14,
+		fxAsOf: "2026-09-01",
+		warnings: reference.warnings,
+	});
+	// 无测算时 profitSummary 仍是 null（既有钉子）
+	assert.equal(poolCandidateData(store, "stale market").profitSummary, null);
 });

@@ -1,7 +1,8 @@
-import { FRESHNESS_SHORT_LABELS, snapshotFreshness } from "./defaults.ts";
+import { FRESHNESS_SHORT_LABELS, purchaseCostSourceLabel, snapshotFreshness } from "./defaults.ts";
 import { strategyTargetMonthlyUnits } from "./strategy.ts";
 import type {
 	Candidate,
+	CostReference,
 	DecisionLog,
 	GateOutcome,
 	Lesson,
@@ -155,6 +156,8 @@ export interface MarketReportData {
 	risk?: RiskRecord;
 	review?: ReviewAnalysis;
 	profit?: ProfitEstimate;
+	/** 1688 参考成本：测算指名引用的那条，或该市场最新一条（用于报价到达后给差值） */
+	costReference?: CostReference;
 	decisions: DecisionLog[];
 	outcomeChecks: OutcomeCheck[];
 	lessons: Lesson[];
@@ -164,7 +167,7 @@ export interface MarketReportData {
 }
 
 export function renderMarketReport(data: MarketReportData): GeneratedReport {
-	const { market, snapshot, strategy, metrics, evaluation, candidate, risk, review, profit, decisions, outcomeChecks, lessons, divergences, attributedCostCny, fusedBudgetSources } = data;
+	const { market, snapshot, strategy, metrics, evaluation, candidate, risk, review, profit, costReference, decisions, outcomeChecks, lessons, divergences, attributedCostCny, fusedBudgetSources } = data;
 	const ageDays = Math.max(0, Math.floor((Date.now() - Date.parse(snapshot.capturedAt)) / 86_400_000));
 	const freshness = FRESHNESS_SHORT_LABELS[snapshotFreshness(ageDays)];
 	const targetMonthlyUnits = strategyTargetMonthlyUnits(strategy.definition);
@@ -211,8 +214,22 @@ export function renderMarketReport(data: MarketReportData): GeneratedReport {
 
 	lines.push("## 3. 单位经济情景", "");
 	if (profit) {
+		// 采购价出处（compass-1688-cost-reference）：存量记录没有出处字段，标「未标注」；
+		// 引用 1688 参考成本时把样本数 / 系数 / 汇率 / 采样日带上，报价到达后给出与参考成本的差值
+		const referenced = profit.input.purchaseCostSource === "ali1688_reference" && costReference && costReference.id === profit.input.costReferenceId ? costReference : undefined;
+		const referenceDetail = referenced
+			? ` · 样本 ${referenced.sampleSize} · ×${referenced.coefficient} · 汇率 ${referenced.fxRate}@${referenced.fxAsOf} · 采样 ${referenced.capturedAt.slice(0, 10)}`
+			: "";
 		lines.push(
 			`- 售价 ${profit.input.currency} ${profit.input.salePrice.toFixed(2)}；落地成本 ${profit.result.landedCost.toFixed(2)}；佣金 ${profit.result.referralFee.toFixed(2)}；FBA ${profit.input.fbaFee.toFixed(2)}。`,
+			`- 采购价 ${profit.input.currency} ${profit.input.purchaseCost.toFixed(2)}（出处：${purchaseCostSourceLabel(profit.input.purchaseCostSource)}${referenceDetail}）。`,
+		);
+		if (profit.input.purchaseCostSource !== "ali1688_reference" && costReference && costReference.currency === profit.input.currency && costReference.referenceCost > 0) {
+			const delta = profit.input.purchaseCost - costReference.referenceCost;
+			const sign = delta >= 0 ? "+" : "−";
+			lines.push(`- 与 1688 参考成本 ${costReference.currency} ${costReference.referenceCost.toFixed(2)} 相差 ${sign}${Math.abs(delta).toFixed(2)}（${sign}${((Math.abs(delta) / costReference.referenceCost) * 100).toFixed(1)}%）。`);
+		}
+		lines.push(
 			`- 毛利率 **${(profit.result.grossMargin * 100).toFixed(1)}%**；BE-CPC **${profit.result.breakEvenCpc.toFixed(2)}**；CPC 承受度 **${profit.result.cpcRatio?.toFixed(2) ?? "缺主词CPC"}**。`,
 			`- 启动资金 **${profit.input.currency} ${profit.result.startupCapital.toFixed(2)}**（首批备货 ${profit.result.firstInventoryCost.toFixed(2)}）。`,
 			"",

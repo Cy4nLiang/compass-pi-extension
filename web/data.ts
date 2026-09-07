@@ -1,4 +1,4 @@
-import { FRESHNESS_LABELS, snapshotFreshness, snapshotNeedsRefresh, type SnapshotFreshness } from "../defaults.ts";
+import { FRESHNESS_LABELS, purchaseCostSourceLabel, snapshotFreshness, snapshotNeedsRefresh, type SnapshotFreshness } from "../defaults.ts";
 import { outcomeStatistics } from "../history.ts";
 import { confidenceLabel, DIMENSIONS, formatMetric, METRIC_LABELS, outcomeLabel } from "../report.ts";
 import {
@@ -505,6 +505,8 @@ export function poolCandidateData(store: CompassStore, reference: string) {
 		.filter((item) => item.marketId === candidate.marketId)
 		.sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
 	const links = marketAmazonLinks(store, candidate.marketId);
+	// 采购价出处（compass-1688-cost-reference）：引用了参考成本记录就把它的样本数 / 采样日带给面板
+	const costReference = profit?.input.costReferenceId ? (store.costReferences ?? []).find((item) => item.id === profit.input.costReferenceId) : undefined;
 	return {
 		candidate: pickCandidate(candidate, marketName),
 		decisions: decisions.slice(0, 50).map(pickDecision),
@@ -531,6 +533,20 @@ export function poolCandidateData(store: CompassStore, reference: string) {
 				startupCapital: profit.result.startupCapital,
 				currency: profit.input.currency,
 				createdAt: profit.createdAt,
+				purchaseCost: profit.input.purchaseCost,
+				purchaseCostSource: profit.input.purchaseCostSource ?? null,
+				purchaseCostSourceLabel: purchaseCostSourceLabel(profit.input.purchaseCostSource),
+				costReference: costReference
+					? {
+						id: costReference.id,
+						sampleSize: costReference.sampleSize,
+						capturedAt: costReference.capturedAt,
+						coefficient: costReference.coefficient,
+						fxRate: costReference.fxRate,
+						fxAsOf: costReference.fxAsOf,
+						warnings: [...costReference.warnings],
+					}
+					: null,
 			}
 			: null,
 		riskSummary: risk

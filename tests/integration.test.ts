@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { parseMarketCsv } from "../csv.ts";
 import { DEFAULT_DISPATCH_CONFIG, normalizeDispatchConfig } from "../dispatch.ts";
 import { outcomeStatistics } from "../history.ts";
-import { DEFAULT_STRATEGY_ID, DEFAULT_STRATEGY_YAML } from "../defaults.ts";
+import { DEFAULT_STRATEGY_ID, DEFAULT_STRATEGY_YAML, KNOWN_METRIC_NAMES } from "../defaults.ts";
 import { estimateProfit, normalizeProfitInput } from "../economics.ts";
 import {
 	backtestStrategies,
@@ -2013,6 +2013,21 @@ test("引用全部合法标识符的策略必须仍能保存（M17 反向对照�
 	for (const probe of ["listing_count", "qualify_rank_depth", "gross_margin", "capital_share", "risk_overall", "est_rating_gap"]) {
 		assert.ok(metricNames.includes(probe), `${probe} 应由真实生产者产出，夹具不完整会让本用例失去意义`);
 	}
+
+	// 防漂移（双向集合等式）：手维护的白名单必须与真实生产者的键集**完全相等**。
+	// 少登记 → 运营写对的策略被拒收；多登记 → 那个名字的拼写错误又会静默退回 missing，
+	// 也就是 M17 原样复发。写成两个方向的差集为空数组（而不是计数），红的时候能点名。
+	const known: readonly string[] = KNOWN_METRIC_NAMES;
+	assert.deepEqual(
+		metricNames.filter((name) => !known.includes(name)),
+		[],
+		"这些指标由生产者产出却没登记进 defaults.ts 的 KNOWN_METRIC_NAMES，引用它们的策略会被误拒",
+	);
+	assert.deepEqual(
+		known.filter((name) => !metricNames.includes(name)),
+		[],
+		"这些名字在 KNOWN_METRIC_NAMES 里但没有任何生产者产出，白名单该删掉它们",
+	);
 
 	const rules = metricNames.map((name, index) =>
 		`      - id: probe_metric_${index}\n        when: "${name} != red"\n        action: review_if_fail\n        label: "指标 ${name}"`

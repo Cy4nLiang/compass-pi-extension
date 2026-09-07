@@ -195,7 +195,7 @@ function fieldsOf(gaps: readonly GapRecord[]): string[] {
 	return gaps.map((gap) => gap.field).sort();
 }
 
-// ── 十二种 origin ─────────────────────────────────────────────────────────────
+// ── 十三种 origin ─────────────────────────────────────────────────────────────
 
 // 一个尽量覆盖全部来源的 store：五条缺列告警 + 两种 run + 深研待办 + 风险 + 差评 + 实绩 + 静默默认
 function fullCoverageStore(): CompassStore {
@@ -236,7 +236,7 @@ function fullCoverageStore(): CompassStore {
 	return store;
 }
 
-test("十二种 origin 各至少产出一条缺口", () => {
+test("十三种 origin 各至少产出一条缺口", () => {
 	const store = fullCoverageStore();
 	const gaps = deriveGaps(store, {
 		todos: listWorkbenchTodos(store, NOW),
@@ -679,6 +679,104 @@ test("A 档差评缺口的尾注给出带 origin 与 asins 的 approve 命令", 
 	assert.deepEqual(unconfigured, [], "池没配可生效上限时，差评缺口不该升到 A 档");
 });
 
+// ── 采购价出处（compass-1688-cost-reference）───────────────────────────────────
+
+test("purchase_cost_source：最新测算没有出处或出处为手填时出缺口，出处为 1688 参考或供应商报价时不出", () => {
+	const store = baseStore();
+	addMarket(store, "mkt_demo_src", "demo src");
+	addCandidate(store, "cand_demo_src", "mkt_demo_src", "deep_research");
+	addSnapshot(store, "snap_src", "mkt_demo_src", "2026-09-01T00:00:00.000Z");
+	addProfit(store, "est_src", "mkt_demo_src", []);
+	const unsourced = derive(store).find((gap) => gap.field === "purchase_cost_source");
+	assert.ok(unsourced, "存量记录（没有出处字段）要出缺口");
+	assert.equal(unsourced.origin, "purchase_cost_source");
+	assert.equal(unsourced.priority, 4, "P4：最低一级，不与 defaults_silent 观察期抢注意力");
+	assert.match(unsourced.reason, /采购价无出处/u);
+	assert.equal(unsourced.label, "采购价出处");
+
+	const estimate = store.profitEstimates.at(-1);
+	assert.ok(estimate);
+	estimate.input.purchaseCostSource = "manual";
+	assert.ok(derive(store).some((gap) => gap.field === "purchase_cost_source"), "手填同样算无出处");
+	estimate.input.purchaseCostSource = "supplier_quote";
+	assert.equal(derive(store).some((gap) => gap.field === "purchase_cost_source"), false, "供应商报价是出处");
+	estimate.input.purchaseCostSource = "ali1688_reference";
+	assert.equal(derive(store).some((gap) => gap.field === "purchase_cost_source"), false, "1688 参考成本是出处");
+});
+
+test("purchase_cost_source：没有利润测算时深研及之后阶段才出缺口，粗筛阶段不出", () => {
+	const store = baseStore();
+	addMarket(store, "mkt_demo_noest", "demo noest");
+	const candidate = addCandidate(store, "cand_demo_noest", "mkt_demo_noest", "screen");
+	addSnapshot(store, "snap_noest", "mkt_demo_noest", "2026-09-01T00:00:00.000Z");
+	assert.equal(derive(store).some((gap) => gap.field === "purchase_cost_source"), false, "粗筛阶段还谈不上采购价");
+	candidate.stage = "deep_research";
+	const gap = derive(store).find((item) => item.field === "purchase_cost_source");
+	assert.ok(gap, "深研阶段没有测算就该提示先取参考成本");
+	assert.match(gap.reason, /尚无利润测算/u);
+});
+
+test("purchase_cost_source：有测算时出处判定不看阶段——粗筛阶段的无出处测算同样出缺口", () => {
+	const store = baseStore();
+	addMarket(store, "mkt_demo_screen", "demo screen");
+	addCandidate(store, "cand_demo_screen", "mkt_demo_screen", "screen");
+	addSnapshot(store, "snap_screen", "mkt_demo_screen", "2026-09-01T00:00:00.000Z");
+	addProfit(store, "est_screen", "mkt_demo_screen", []);
+	const gap = derive(store).find((item) => item.field === "purchase_cost_source");
+	assert.ok(gap, "owner 2026-09-07 拍板：不限定范围，凡是无出处的测算都提");
+	assert.match(gap.reason, /采购价无出处/u);
+});
+
+test("purchase_cost_source：sorftime 配了上限时是 A 档并给出带 origin 与 search_name 的 approve 命令，没配上限时是人工", () => {
+	const store = baseStore();
+	addMarket(store, "mkt_demo_cref", "demo cref");
+	addCandidate(store, "cand_demo_cref", "mkt_demo_cref", "deep_research");
+	addSnapshot(store, "snap_cref", "mkt_demo_cref", "2026-09-01T00:00:00.000Z");
+	addProfit(store, "est_cref", "mkt_demo_cref", []);
+	const confirm = derive(store, { budgets: [SORFTIME_CONFIGURED] }).find((gap) => gap.field === "purchase_cost_source");
+	assert.ok(confirm);
+	assert.equal(confirm.autoTier, "A_confirm");
+	const line = gapActionLine(confirm);
+	// origin 与 search_name 缺一不可：approve 在 origin 缺省时排除本链，没有关键词则根本不知道搜什么
+	assert.match(line, /compass_gaps action=approve market_ref=\S+ origin=purchase_cost_source search_name=/u, `实得：${line}`);
+	assert.match(line, /1 次/u, "要说清只花 1 次调用");
+	assert.match(line, /同款/u, "要说清还要逐条确认同款");
+
+	const manual = derive(store, { budgets: [SORFTIME_UNCONFIGURED] }).find((gap) => gap.field === "purchase_cost_source");
+	assert.ok(manual);
+	assert.equal(manual.autoTier, "manual", "池没配可生效上限时退到人工（供应商报价）");
+	assert.match(gapActionLine(manual), /^人工：/u);
+	assert.match(gapActionLine(manual), /供应商报价/u);
+});
+
+test("purchase_cost_source：路由表有专门条目（sorftime 1 次 + 人工报价），cost_inputs 仍只有人工", () => {
+	assert.equal(gapRouteKey("purchase_cost_source"), "purchase_cost_source");
+	const sources = GAP_SOURCE_MATRIX.purchase_cost_source;
+	assert.ok(sources);
+	assert.deepEqual(
+		sources.map((template) => [template.source, template.tier, template.writeBack, template.estimatedCalls ?? null]),
+		[["sorftime", "A", "profit_estimate", 1], ["manual", "manual", "profit_estimate", null]],
+	);
+	assert.deepEqual(GAP_SOURCE_MATRIX.cost_inputs.map((template) => template.source), ["manual"], "头程 / 关税那条路由不该被 1688 链污染");
+	assert.equal(gapLabel("purchase_cost_source"), "采购价出处");
+});
+
+test("purchase_cost_source：与同一市场的 defaults_silent 缺口各自独立成条、互不合并", () => {
+	const store = baseStore();
+	addMarket(store, "mkt_demo_both", "demo both");
+	addCandidate(store, "cand_demo_both", "mkt_demo_both", "deep_research");
+	addSnapshot(store, "snap_both", "mkt_demo_both", "2026-09-01T00:00:00.000Z");
+	// firstMileCost 等于系统默认 0 → defaults_silent；没有出处 → purchase_cost_source
+	addProfit(store, "est_both", "mkt_demo_both", [], { firstMileCost: 0 });
+	const gaps = derive(store);
+	const silent = gaps.find((gap) => gap.field === "firstMileCost");
+	const source = gaps.find((gap) => gap.field === "purchase_cost_source");
+	assert.ok(silent && silent.origin === "defaults_silent");
+	assert.ok(source && source.origin === "purchase_cost_source");
+	assert.notEqual(silent.id, source.id);
+	assert.equal(summarizeGaps(gaps).manual >= 2, true, "两条都是人工档（没配 sorftime 池）");
+});
+
 // ── 路由表与公开仓库卫生 ──────────────────────────────────────────────────────
 
 test("GAP_SOURCE_MATRIX 只用预算池已有的来源名，且不含内部 SOP 线索", () => {
@@ -716,6 +814,7 @@ test("每个 routeKey 都能在矩阵里找到条目，没有静默落到 generi
 		"metric_divergence",
 		"deep_research_confirm",
 		"market_ref",
+		"purchase_cost_source",
 	];
 	for (const field of fields) {
 		const key = gapRouteKey(field);

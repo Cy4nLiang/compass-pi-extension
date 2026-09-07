@@ -36,6 +36,8 @@ export const GAP_ORIGINS = [
 	"risk_url",
 	"review_evidence",
 	"retro_actuals",
+	// 采购价出处（compass-1688-cost-reference）：最新利润测算没有出处 / 出处为手填，或深研阶段尚无测算
+	"purchase_cost_source",
 ] as const;
 export type GapOrigin = (typeof GAP_ORIGINS)[number];
 
@@ -163,21 +165,45 @@ const MANUAL_MAIN_CPC: GapSourceTemplate = {
 	template: "主词 CPC＝{{金额}} {{币种}}（口径：{{关键词}}）",
 };
 
+// 1688 参考成本链（compass-1688-cost-reference）：按关键词检索 1 次，convert 在 TUI 逐条确认同款后
+// 由 cost-reference.ts 算出参考采购价并写回利润测算。writeBack 是 profit_estimate 而 source 是 sorftime——
+// approve 靠这对组合把它与快照链（import_csv）、差评链（reviews_record）分流；origin 缺省时它不入选
+const SORFTIME_1688_COST_REFERENCE: GapSourceTemplate = {
+	source: "sorftime",
+	tier: "A",
+	auto: "partial",
+	estimatedCalls: 1,
+	writeBack: "profit_estimate",
+	how: "Sorftime 按关键词检索 1688 同款，取有销量前 5 条的阶梯价中位数再取中位、乘系数作参考采购价；需运营逐条确认同款并当面确认后才写入",
+	template: "关键词＝{{中文品类词}}",
+};
+
+const MANUAL_SUPPLIER_QUOTE: GapSourceTemplate = {
+	source: "manual",
+	tier: "manual",
+	auto: "no",
+	writeBack: "profit_estimate",
+	how: "向供应商取报价后用 compass_profit_estimate purchase_cost_source=supplier_quote 记录",
+	template: "供应商报价＝{{金额}} {{币种}}　起订量＝{{件}}　报价日＝{{YYYY-MM-DD}}",
+};
+
 export const GAP_SOURCE_MATRIX: Record<string, readonly GapSourceTemplate[]> = {
 	csv_column: [REIMPORT_CSV, SORFTIME_FULL_SNAPSHOT],
 	main_cpc: [LOCAL_CPC_HISTORY, SORFTIME_FULL_SNAPSHOT, MANUAL_MAIN_CPC],
 	waist_rating_median: [REIMPORT_CSV, SORFTIME_FULL_SNAPSHOT],
 	snapshot: [REIMPORT_CSV, SORFTIME_FULL_SNAPSHOT],
+	// 头程 / 关税 / 整体毛利仍只能人工：1688 链只帮采购价一项，挂在这里会被头程缺口误当成可花钱补
 	cost_inputs: [
 		{
 			source: "manual",
 			tier: "manual",
 			auto: "no",
 			writeBack: "profit_estimate",
-			how: "向供应商 / 货代取报价后填进利润测算；未取到的项留空不猜",
+			how: "向供应商 / 货代取报价后填进利润测算；未取到的项留空不猜（采购价一项可先走 1688 参考成本链，见「采购价出处」缺口）",
 			template: "售价＝{{金额}}　采购＝{{金额}}　头程＝{{金额}}　关税＝{{金额}}　FBA＝{{金额}}（同币种；未回答的项不填）",
 		},
 	],
+	purchase_cost_source: [SORFTIME_1688_COST_REFERENCE, MANUAL_SUPPLIER_QUOTE],
 	conversion_inputs: [
 		{
 			source: "manual",
@@ -351,6 +377,8 @@ const ORIGIN_PRIORITY: Record<GapOrigin, TodoPriority> = {
 	risk_url: 3,
 	review_evidence: 3,
 	retro_actuals: 4,
+	// owner 2026-09-07：不限定范围、全部冒出，但压到最低一级，不与 defaults_silent 观察期抢注意力
+	purchase_cost_source: 4,
 };
 
 // 同一个 (marketId, field) 上多条来源撞车时谁做主键：越靠前越具体、越指向明确的补数动作
@@ -361,6 +389,7 @@ const ORIGIN_PRECEDENCE: readonly GapOrigin[] = [
 	"review_evidence",
 	"retro_actuals",
 	"defaults_silent",
+	"purchase_cost_source",
 	"todo_deep_missing",
 	"todo_risk_missing",
 	"todo_snapshot_stale",
@@ -393,6 +422,7 @@ export const FIELD_LABEL_EXTRA: Record<string, string> = {
 	tariffCost: "关税",
 	cvr: "转化率",
 	returnRate: "退货率",
+	purchase_cost_source: "采购价出处",
 };
 
 // ── 小工具 ────────────────────────────────────────────────────────────────────
@@ -463,6 +493,7 @@ export function gapRouteKey(field: string): string {
 	if (field === "waist_rating_median") return "waist_rating_median";
 	if (field === "snapshot") return "snapshot";
 	if (field === "gross_margin" || field === "firstMileCost" || field === "tariffCost") return "cost_inputs";
+	if (field === "purchase_cost_source") return "purchase_cost_source";
 	if (field === "cvr" || field === "returnRate") return "conversion_inputs";
 	if (field === "capital_share" || field === "portfolio_capital") return "capital_share";
 	if (field === "risk_evidence_url") return "risk_evidence_url";
@@ -633,6 +664,23 @@ function seedsForMarket(store: CompassStore, candidate: Candidate, todos: readon
 				evidence: `est:${estimate.id}`,
 			});
 		}
+	}
+
+	// ⑧ 采购价出处（compass-1688-cost-reference）：有测算就看出处，不看阶段（owner 2026-09-07：不限定范围）；
+	// 没有测算时只在深研及之后的阶段提——粗筛阶段还谈不上采购价
+	if (estimate) {
+		const source = estimate.input.purchaseCostSource;
+		if (source === undefined || source === "manual") {
+			seeds.push({
+				...base,
+				field: "purchase_cost_source",
+				origin: "purchase_cost_source",
+				reason: "采购价无出处：既非 1688 参考成本也非供应商报价（落库值只有一个数字）",
+				evidence: `est:${estimate.id}`,
+			});
+		}
+	} else if (REVIEW_RELEVANT_STAGES.includes(candidate.stage)) {
+		seeds.push({ ...base, field: "purchase_cost_source", origin: "purchase_cost_source", reason: "尚无利润测算；采购价可先取 1688 参考成本", evidence: "est:none" });
 	}
 
 	// ⑤ 风险缺官方 URL：判据与 recordRisk 的自动降级条件同源，
@@ -819,6 +867,10 @@ export function gapActionLine(gap: GapRecord): string {
 		// 与 review_evidence 同属一个 origin，而预估星级只能由人给，不该被打成「可花钱补」
 		if (paid?.writeBack === "reviews_record") {
 			return `A 档 ${paid.source} 可补（会花钱，每 ASIN 1 次）：compass_gaps action=approve market_ref=${gap.marketId} origin=review_evidence asins=<ASIN…> 当面确认后抓差评原文`;
+		}
+		// 1688 参考成本链：approve 在 origin 缺省时排除它（否则与快照链的产物撞车），命令里必须带 origin 与关键词
+		if (paid?.writeBack === "profit_estimate" && paid.source === "sorftime") {
+			return `A 档 ${paid.source} 可补（会花钱，${paid.estimatedCalls ?? 1} 次）：compass_gaps action=approve market_ref=${gap.marketId} origin=purchase_cost_source search_name=<中文品类词> 逐条确认同款后写入参考成本`;
 		}
 		return `A 档 ${paid?.source ?? "sorftime"} 可补（会花钱）：compass_gaps action=approve market_ref=${gap.marketId} 当面确认后自动补齐`;
 	}

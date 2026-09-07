@@ -1545,7 +1545,10 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			else if (params.stage === "deep_research") {
 				if (missing.some((field) => ["main_cpc", "cpc_ratio"].includes(field))) plan.push(available("sorftime") ? "A档：Sorftime 完整快照补主词 CPC / CPC 比（compass_gaps action=plan 规划并给出预计次数、approve 确认后才花钱）" : "降级：compass_keyword_metrics 查本地历史 CPC 作参考，或人工从广告后台取主词 CPC 手填（sorftime 预算不可用）");
 				if (missing.some((field) => ["history", "demand_cv", "season_flag"].includes(field))) plan.push("人工：历史曲线/需求波动靠按期重导 CSV 积累多期快照，或由运营手填历史证据；季节性经 compass_risk_check 记录；不自动取付费数据");
-				if (missing.some((field) => ["gross_margin", "fba_fee"].includes(field))) plan.push("人工：FBA 费用与毛利按官方费用计算器 / 供应商与货代报价取数后填进 compass_profit_estimate");
+				if (missing.some((field) => ["gross_margin", "fba_fee"].includes(field))) {
+					plan.push("人工：FBA 费用与毛利按官方费用计算器 / 供应商与货代报价取数后填进 compass_profit_estimate");
+					plan.push(available("sorftime") ? "A档：采购价可先经 compass_gaps action=approve origin=purchase_cost_source search_name=<中文品类词> 取 1688 参考成本（1 次调用，convert 时逐条确认同款后写入）" : "降级：采购价等供应商报价手填（sorftime 预算不可用，1688 参考成本链不提供）");
+				}
 			}
 			else if (params.stage === "risk") plan.push("官方源优先：USPTO/Google Patents/CPSC/FDA/FCC/EPA；AI 只生成检索式并初筛，证据 URL 必须留痕");
 			else plan.push("人工：测品实绩（日销 / TACOS / 退货率）由运营从卖家后台导出后经 compass_retro action=record_actuals 录入；不用第三方估算替代经营实绩");

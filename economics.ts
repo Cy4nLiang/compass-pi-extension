@@ -39,6 +39,9 @@ export function normalizeProfitInput(input: Partial<ProfitInput> & Pick<ProfitIn
 		tacosScenarios: input.tacosScenarios?.length ? input.tacosScenarios : [0.1, 0.15, 0.2],
 		currency: input.currency ?? "USD",
 	};
+	// 采购价出处只在传了的时候才落键：存量路径不能多出 { x: undefined }（deepEqual 会判成不同对象）
+	if (input.purchaseCostSource !== undefined) normalized.purchaseCostSource = input.purchaseCostSource;
+	if (input.costReferenceId !== undefined) normalized.costReferenceId = input.costReferenceId;
 
 	for (const [name, value] of Object.entries({
 		salePrice: normalized.salePrice,
@@ -161,7 +164,7 @@ export function profitMetrics(input: ProfitInput, result: ProfitResult, captured
 	});
 	const metrics: MetricMap = {
 		landed_cost: metric(result.landedCost),
-		gross_margin: metric(result.grossMargin, "不含广告与退货；输入成本口径决定精度"),
+		gross_margin: metric(result.grossMargin, `不含广告与退货；输入成本口径决定精度${input.purchaseCostSource === "ali1688_reference" ? "；采购价为 1688 参考成本" : ""}`),
 		break_even_cpc: metric(result.breakEvenCpc, "售价×毛利率×CVR"),
 		cpc_ratio: metric(result.cpcRatio ?? null, "主词建议CPC÷盈亏平衡CPC"),
 		return_loss_rate: metric(result.returnLossRate),

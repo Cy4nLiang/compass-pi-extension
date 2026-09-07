@@ -1,4 +1,4 @@
-import type { BudgetPool, CandidateStage, DecisionLog } from "./types.ts";
+import type { BudgetPool, CandidateStage, DecisionLog, PurchaseCostSource } from "./types.ts";
 
 // 口径缺省值：策略 meta 未声明时全系统统一按这两个数走（DEFAULT_STRATEGY_YAML 由下面的常量插值生成，不再各写一份字面量）
 export const DEFAULT_TARGET_MONTHLY_UNITS = 300;
@@ -231,6 +231,28 @@ export const SOURCE_BASE_CONFIDENCE: Record<string, number> = {
 	manual_csv: 0.72,
 	generic_csv: 0.62,
 };
+
+// ---- 1688 参考成本（compass-1688-cost-reference）：口径常量的唯一来源 ----
+// 系数缺省 0.9（owner 2026-09-07 原话「中位数 × 0.9」），approve 参数可按次覆盖、确认单存下来后 convert 只读确认单。
+export const COST_REFERENCE_COEFFICIENT = 0.9;
+// 极小值防线：纳入样本里最小价低于中位价的这个比例就告警（不剔除，样本是运营亲手纳入的）
+export const COST_REFERENCE_BAIT_RATIO = 0.5;
+// 「取前 5 个商品」
+export const COST_REFERENCE_SAMPLE_SIZE = 5;
+// convert 里逐条同款确认最多弹几次：纳满 5 条或弹到这个数就停，防止零销量补位把运营问到天黑
+export const COST_REFERENCE_MAX_PROMPTS = 12;
+// 阶梯为空时头价至少要这么多元才当价看：抽样里 61% 的头价恰好为 0，是占位不是价
+export const COST_REFERENCE_MIN_HEADLINE_CNY = 1;
+// 汇率口径日期超过这么多天只告警不阻断
+export const COST_REFERENCE_FX_STALE_DAYS = 30;
+
+// 采购价出处的展示标签：工具结果、五维报告、Web 决策页三处共用，存量记录没有出处时显示 PURCHASE_COST_SOURCE_UNLABELED
+export const PURCHASE_COST_SOURCE_LABELS: Readonly<Record<PurchaseCostSource, string>> = Object.freeze({
+	ali1688_reference: "1688 参考成本",
+	supplier_quote: "供应商报价",
+	manual: "手填",
+});
+export const PURCHASE_COST_SOURCE_UNLABELED = "未标注";
 
 
 // ---- 「最新快照」排序：全系统唯一口径 ----

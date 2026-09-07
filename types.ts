@@ -179,7 +179,15 @@ export interface ProfitInput {
 	portfolioCapital?: number;
 	tacosScenarios: number[];
 	currency: string;
+	// 采购价出处（compass-1688-cost-reference）：缺失 = 存量记录，展示为「未标注」。
+	// 写侧由 compass_profit_estimate / convert 填；assertStore 不为它加硬校验，存量不回填。
+	purchaseCostSource?: PurchaseCostSource;
+	// 出处为 ali1688_reference 时指向 store.costReferences 里的记录
+	costReferenceId?: string;
 }
+
+export const PURCHASE_COST_SOURCES = ["ali1688_reference", "supplier_quote", "manual"] as const;
+export type PurchaseCostSource = (typeof PURCHASE_COST_SOURCES)[number];
 
 export interface ProfitResult {
 	landedCost: number;
@@ -206,6 +214,53 @@ export interface ProfitEstimate {
 	result: ProfitResult;
 	createdAt: string;
 	actor: string;
+}
+
+/** 1688 参考成本的一条样本：运营在 TUI 里逐条确认过的同款商品，带取价字段与档数以便复核 */
+export interface CostReferenceSample {
+	productId: string;
+	title: string;
+	url?: string;
+	salesOf30d: number;
+	zeroSales: boolean;
+	priceCny: number;
+	priceField: "tier_median" | "headline";
+	tierCount: number;
+	moq?: number;
+}
+
+/**
+ * 1688 参考成本记录（compass-1688-cost-reference）：compass_gaps convert 按 owner 规则算出，
+ * 利润测算经 costReferenceId 引用它。不写 decisionLog（回滚红线：旧版 assertStore 对 type 是严格白名单），
+ * 审计链由记录自身的 actor / createdAt 承载。
+ */
+export interface CostReference {
+	id: string;
+	marketId: string;
+	candidateId?: string;
+	source: string;
+	tool: string;
+	keyword: string;
+	page: number;
+	capturedAt: string;
+	createdAt: string;
+	actor: string;
+	currency: string;
+	fxRate: number;
+	fxAsOf: string;
+	fxSource?: string;
+	coefficient: number;
+	method: "median" | "min";
+	medianCny: number;
+	referenceCostCny: number;
+	referenceCost: number;
+	sampleSize: number;
+	samples: CostReferenceSample[];
+	/** 弹了几条同款确认、运营否了几条 */
+	prompted: number;
+	rejected: number;
+	warnings: string[];
+	archivedRaw: string[];
 }
 
 export interface RiskEvidenceItem {
@@ -610,4 +665,6 @@ export interface CompassStore {
 	costEvents: CostEvent[];
 	// 可选顶层集合（走 ensureDefaults 回填 + load 迁移回写）：旧版扩展回滚后忽略本字段
 	todoResolutions?: TodoResolution[];
+	// 1688 参考成本记录，同上模式（compass-1688-cost-reference）
+	costReferences?: CostReference[];
 }

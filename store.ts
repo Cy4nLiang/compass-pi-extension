@@ -54,6 +54,7 @@ export function createEmptyStore(now = new Date().toISOString()): CompassStore {
 		budgetPools: [],
 		costEvents: [],
 		todoResolutions: [],
+		costReferences: [],
 	};
 }
 
@@ -115,6 +116,13 @@ function assertStore(value: unknown): asserts value is CompassStore {
 	arrays.outcomeChecks = assertRecordArray(record, "outcomeChecks", true);
 	arrays.lessons = assertRecordArray(record, "lessons", true);
 	arrays.todoResolutions = assertRecordArray(record, "todoResolutions", true);
+	// 1688 参考成本：只做最小校验（load 与 save 共用本函数，一条过严的校验会让 store 既读不出也写不进）
+	arrays.costReferences = assertRecordArray(record, "costReferences", true);
+	for (const [index, reference] of arrays.costReferences.entries()) {
+		const path = `costReferences[${index}]`;
+		for (const field of ["id", "marketId"]) assertString(reference, field, path);
+		if (!Array.isArray(reference.samples)) throw new Error(`罗盘数据字段 ${path}.samples 损坏`);
+	}
 
 	for (const [index, market] of arrays.markets.entries()) {
 		assertString(market, "id", `markets[${index}]`);
@@ -460,7 +468,8 @@ export class CompassRepository {
 		try {
 			const text = await readFile(this.storePath, "utf8");
 			const parsed = JSON.parse(text) as unknown;
-			const needsMigrationWrite = isRecord(parsed) && (parsed.outcomeChecks === undefined || parsed.lessons === undefined || parsed.todoResolutions === undefined);
+			const needsMigrationWrite =
+				isRecord(parsed) && (parsed.outcomeChecks === undefined || parsed.lessons === undefined || parsed.todoResolutions === undefined || parsed.costReferences === undefined);
 			assertStore(parsed);
 			if (needsMigrationWrite) Object.defineProperty(parsed, STORE_NEEDS_MIGRATION_WRITE, { value: true, configurable: true, enumerable: false, writable: true });
 			this.installLazySnapshotData(parsed);

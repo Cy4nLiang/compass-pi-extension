@@ -85,3 +85,26 @@ test("毛利 Gate 警告按传入阈值判定，文案回显阈值而不是写�
 	assert.match(byDefault[0], /40%/);
 	assert.equal(DEFAULT_GATE_THRESHOLDS.grossMargin, 0.4);
 });
+
+
+// —— 1688 参考成本（compass-1688-cost-reference）：采购价出处随利润输入落库 ——
+// normalizeProfitInput 逐字段重建对象，新字段不显式列出就会被静默丢掉；
+// 出处只在传了的时候才落键——deepEqual 会把 { x: undefined } 与 {} 判成不同，存量路径不能多出键。
+test("采购价出处：normalizeProfitInput 透传 purchaseCostSource 与 costReferenceId，没传就不落键", () => {
+	const sourced = normalizeProfitInput({ salePrice: 20, purchaseCost: 4, fbaFee: 5, purchaseCostSource: "ali1688_reference", costReferenceId: "cref_demo1" });
+	assert.equal(sourced.purchaseCostSource, "ali1688_reference");
+	assert.equal(sourced.costReferenceId, "cref_demo1");
+	const plain = normalizeProfitInput({ salePrice: 20, purchaseCost: 4, fbaFee: 5 });
+	assert.equal(Object.hasOwn(plain, "purchaseCostSource"), false);
+	assert.equal(Object.hasOwn(plain, "costReferenceId"), false);
+});
+
+test("采购价出处：profitMetrics 的 gross_margin note 在出处为 1688 参考成本时标注口径", () => {
+	const sourced = normalizeProfitInput({ salePrice: 20, purchaseCost: 4, fbaFee: 5, purchaseCostSource: "ali1688_reference", costReferenceId: "cref_demo1" });
+	const note = profitMetrics(sourced, estimateProfit(sourced), "2026-09-07T00:00:00.000Z").gross_margin.note ?? "";
+	assert.ok(note.includes("1688 参考成本"), note);
+	const quoted = normalizeProfitInput({ salePrice: 20, purchaseCost: 4, fbaFee: 5, purchaseCostSource: "supplier_quote" });
+	const quotedNote = profitMetrics(quoted, estimateProfit(quoted), "2026-09-07T00:00:00.000Z").gross_margin.note ?? "";
+	assert.equal(quotedNote.includes("1688 参考成本"), false);
+	assert.ok(quotedNote.includes("输入成本口径决定精度"), "既有 note 原文保留");
+});

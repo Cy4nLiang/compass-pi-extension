@@ -398,6 +398,70 @@ test("todo resolutions survive a full save/load round-trip", async () => {
 	}
 });
 
+// —— 1688 参考成本（compass-1688-cost-reference）：新可选顶层集合走同一套迁移模式 ——
+test("legacy schemaVersion 1 stores gain costReferences and write them back lazily", async () => {
+	const root = await mkdtemp(join(tmpdir(), "compass-cost-reference-migration-"));
+	try {
+		const repo = new CompassRepository(root);
+		const legacy = createEmptyStore() as unknown as Record<string, unknown>;
+		delete legacy.costReferences;
+		await mkdir(dirname(repo.storePath), { recursive: true });
+		await writeFile(repo.storePath, JSON.stringify(legacy), "utf8");
+		const loaded = await repo.load();
+		assert.deepEqual(loaded.costReferences, []);
+		await repo.update(() => false, { shouldSave: () => false });
+		const persisted = JSON.parse(await readFile(repo.storePath, "utf8")) as Record<string, unknown>;
+		assert.deepEqual(persisted.costReferences, []);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("costReferences survive a full save/load round-trip", async () => {
+	const root = await mkdtemp(join(tmpdir(), "compass-cost-reference-roundtrip-"));
+	try {
+		const repo = new CompassRepository(root);
+		const store = createEmptyStore("2026-09-07T00:00:00.000Z");
+		ensureDefaults(store, "tester");
+		store.costReferences = [{
+			id: "cref_roundtrip",
+			marketId: "mkt_demo",
+			candidateId: "cand_demo",
+			source: "sorftime",
+			tool: "ali1688_similar_product",
+			keyword: "demo",
+			page: 1,
+			capturedAt: "2026-09-07T00:00:00.000Z",
+			createdAt: "2026-09-07T00:00:01.000Z",
+			actor: "tester",
+			currency: "USD",
+			fxRate: 0.14,
+			fxAsOf: "2026-09-01",
+			fxSource: "demo",
+			coefficient: 0.9,
+			method: "median",
+			medianCny: 9,
+			referenceCostCny: 8.1,
+			referenceCost: 1.134,
+			sampleSize: 3,
+			samples: [
+				{ productId: "1688DEMO0001", title: "Demo 1", url: "https://detail.1688.com/offer/1688DEMO0001.html", salesOf30d: 120, zeroSales: false, priceCny: 9, priceField: "tier_median", tierCount: 1, moq: 2 },
+				{ productId: "1688DEMO0002", title: "Demo 2", salesOf30d: 0, zeroSales: true, priceCny: 8, priceField: "headline", tierCount: 0 },
+				{ productId: "1688DEMO0003", title: "Demo 3", salesOf30d: 40, zeroSales: false, priceCny: 10, priceField: "tier_median", tierCount: 3 },
+			],
+			prompted: 4,
+			rejected: 1,
+			warnings: ["零销量补位 1 条：这几条 30 天销量为 0，只是按返回顺序凑满样本"],
+			archivedRaw: [],
+		}];
+		await repo.save(store);
+		const loaded = await repo.load();
+		assert.deepEqual(loaded.costReferences, store.costReferences);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
 test("corrupted store elements fail with a path-aware diagnostic", async () => {
 	const root = await mkdtemp(join(tmpdir(), "compass-corrupt-"));
 	try {

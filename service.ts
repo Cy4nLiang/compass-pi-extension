@@ -165,6 +165,11 @@ export function ensureDefaults(store: CompassStore, actor = "compass"): boolean 
 		store.todoResolutions = [];
 		changed = true;
 	}
+	// 1688 参考成本记录：同上，回填后下游可无条件按数组消费
+	if (!Array.isArray(store.costReferences)) {
+		store.costReferences = [];
+		changed = true;
+	}
 	if (!store.strategies.some((strategy) => strategy.id === DEFAULT_STRATEGY_ID)) {
 		const definition = parseStrategyYaml(DEFAULT_STRATEGY_YAML);
 		store.strategies.push({

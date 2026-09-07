@@ -1336,9 +1336,23 @@ export function classifyMcpToolResult(toolName: string, details: unknown): McpCa
 	if (record.mode !== undefined && record.mode !== "call") return undefined;
 	if (record.error !== undefined && typeof record.error !== "string") return undefined;
 	const billable = record.error === undefined || !NON_BILLABLE_MCP_ERRORS.has(record.error);
+	// 归因回退链，顺序不许动：details.tool → details.resourceUri → 工具名前缀 → "unknown"。
+	// 第三档是 G3 的修复：direct 工具的失败分支（tool_error / call_failed / aborted /
+	// url_elicitation_required）在 details 里只有 `{error, server}`，唯独成功分支带 tool，
+	// 于是这些计费调用整体落进 unknown 桶——recordMcpUsage 按 `server + tool` 合并，
+	// 同一批里几个不同工具的失败会撞成一条「unknown × N」，工具维度事后不可恢复。
+	// 只截 `${server}_` 前缀（adapter 默认 toolPrefix="server"）：宿主把前缀配成 none /
+	// short / 自定义时截不出来，仍回 "unknown"——那是降级，不是错误。含点的工具名被 adapter
+	// 换成下划线，会与成功路径的 details.tool 分成两个桶，属已知可接受偏差。
+	// 归因只改 tool，**不动 billable**：计费口径仍只由 NON_BILLABLE_MCP_ERRORS 这份拒绝名单决定。
+	const prefixed = toolName.startsWith(`${server}_`) ? toolName.slice(server.length + 1) : "";
 	const tool = typeof record.tool === "string" && record.tool
 		? record.tool
-		: typeof record.resourceUri === "string" && record.resourceUri ? record.resourceUri : "unknown";
+		: typeof record.resourceUri === "string" && record.resourceUri
+			? record.resourceUri
+			// 截出空串（toolName 恰为 `${server}_`）必须回落 "unknown"：载荷缓存没有
+			// recordMcpUsage 的 `|| "unknown"` 兜底，一条 tool:"" 会让 convert 的跳过文案指不出是谁
+			: prefixed || "unknown";
 	return { server, tool, billable };
 }
 

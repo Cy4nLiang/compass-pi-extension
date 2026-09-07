@@ -1,5 +1,6 @@
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
-import { DEFAULT_GATE_THRESHOLDS, DEFAULT_TARGET_DAILY_UNITS, DEFAULT_TARGET_MONTHLY_UNITS, type GateThresholds } from "./defaults.ts";
+import { DEFAULT_GATE_THRESHOLDS, DEFAULT_TARGET_DAILY_UNITS, DEFAULT_TARGET_MONTHLY_UNITS, KNOWN_METRIC_NAMES, type GateThresholds } from "./defaults.ts";
+import { ValidationError } from "./errors.ts";
 import { qualifyRankDepth } from "./metrics.ts";
 import type {
 	ListingRecord,
@@ -215,7 +216,11 @@ export function parseStrategyYaml(yaml: string): StrategyDefinition {
 			if (ruleIds.has(ruleValue.id)) throw new Error(`规则 id 重复：${ruleValue.id}，同一策略内必须全局唯一`);
 			ruleIds.add(ruleValue.id);
 			// Parse once during validation so invalid expressions fail before a version is saved.
-			evaluateExpression(ruleValue.when, { metrics: {}, listings: [] });
+			// strict 打开后这一次 dry run 同时拦下拼错的指标名与函数名（M17）：空 metrics 下
+			// 合法名与拼错名的**求值结果**完全一致（都 missing），只有按白名单判才分得开。
+			// 两个写入口（默认安装 ensureDefaults 与 saveStrategyVersion）共用这一处，
+			// 不存在第三条解析路径，所以不必也不该在 service.ts 里各写一遍。
+			evaluateExpression(ruleValue.when, { metrics: {}, listings: [] }, { ruleId: ruleValue.id });
 			return {
 				id: ruleValue.id,
 				when: ruleValue.when,
@@ -371,16 +376,69 @@ const LITERALS: Record<string, unknown> = {
 	unknown: "unknown",
 };
 
+// 表达式里合法的函数名（当前只有 qualify_rank_depth）。它与 callFunction 里的分支是两处，
+// 加新函数时两边都要改；**漏改的方向是安全的**——strict 会在保存期把用到新函数的策略拒收，
+// 功能当场不可用且报错点名，而不是像 M17 那样静默判 missing 造出一个假结论。
+const STRATEGY_FUNCTION_NAMES: readonly string[] = ["qualify_rank_depth"];
+
+// 合法指标名集合（M17）。只在解析期（strict）用于判定「这个标识符是不是拼错了」，
+// 运行期取值仍一律走 readMetricValue，缺数据照常传播 missing。
+const KNOWN_METRICS = new Set<string>(KNOWN_METRIC_NAMES);
+
+/**
+ * 解析期的严格标识符校验（M17）：未知的指标名 / 函数名直接抛错，而不是折成 missing。
+ * 只由 parseStrategyYaml 的那次 dry run 打开——运行期求值路径一字不动，存量 store 里的
+ * definition 绕过 parseStrategyYaml，不会因为白名单收紧而读不出来。
+ */
+export interface StrictIdentifiers {
+	/** 报错时点名是哪条规则：解析器自己看不到规则 id */
+	ruleId: string;
+}
+
+// Levenshtein 距离，只用于给拼错的指标名推荐近似写法（名字都很短，36 次比较可忽略）
+function editDistance(a: string, b: string): number {
+	let previous = Array.from({ length: b.length + 1 }, (_, index) => index);
+	for (let i = 1; i <= a.length; i++) {
+		const current = [i];
+		for (let j = 1; j <= b.length; j++) {
+			current[j] = Math.min(
+				previous[j] + 1,
+				current[j - 1] + 1,
+				previous[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1),
+			);
+		}
+		previous = current;
+	}
+	return previous[b.length];
+}
+
+// 拒绝文案必须能让运营直接改对：点名规则、点名标识符、给出最接近的合法名。
+// 这正是本缺陷要换掉的那句话——修前它显示的是「缺少指标：gros_margin，转人工复核」。
+function unknownMetricError(ruleId: string, name: string): ValidationError {
+	const near = KNOWN_METRIC_NAMES
+		.map((known) => ({ known, distance: editDistance(name, known) }))
+		.filter((item) => item.distance <= Math.max(2, Math.floor(name.length / 4)))
+		.sort((a, b) => a.distance - b.distance || a.known.localeCompare(b.known))
+		.slice(0, 3)
+		.map((item) => item.known);
+	const hint = near.length
+		? `最接近的可用指标：${near.join("、")}`
+		: `可用指标共 ${KNOWN_METRIC_NAMES.length} 个，没有拼写相近的`;
+	return new ValidationError(`规则 ${ruleId} 引用了未知指标名「${name}」，请检查拼写；${hint}`);
+}
+
 class ExpressionParser {
 	private index = 0;
 	private readonly tokens: Token[];
 	private readonly context: StrategyContext;
+	private readonly strict?: StrictIdentifiers;
 	// 本次表达式里带阈值的函数调用产出的证据，evaluateExpression 在顶层一次性带出
 	readonly derivedEvidence = new Map<string, MetricEvidence>();
 
-	constructor(tokens: Token[], context: StrategyContext) {
+	constructor(tokens: Token[], context: StrategyContext, strict?: StrictIdentifiers) {
 		this.tokens = tokens;
 		this.context = context;
+		this.strict = strict;
 	}
 
 	parse(): EvalValue {
@@ -510,6 +568,9 @@ class ExpressionParser {
 				return this.callFunction(name, args);
 			}
 			if (Object.hasOwn(LITERALS, name)) return { value: LITERALS[name], missing: false, references: new Set() };
+			// M17：拼错的指标名与真缺数据在运行期走的是同一条路（都折成 missing），
+			// 只有解析期分得清——这里是唯一能把它们分开的位置。
+			if (this.strict && !KNOWN_METRICS.has(name)) throw unknownMetricError(this.strict.ruleId, name);
 			const value = readMetricValue(this.context.metrics, name);
 			return {
 				value: value ?? undefined,
@@ -522,6 +583,14 @@ class ExpressionParser {
 
 	private callFunction(name: string, args: EvalValue[]): EvalValue {
 		const references = new Set<string>([name, ...args.flatMap((arg) => [...arg.references])]);
+		// M17：函数名的校验必须排在下面那条 missing 早退**之前**。早退在前时，
+		// qualify_rank_dept(gross_margin) 这种拼错的函数名会被实参的 missing 整条吞掉，
+		// 只有实参写成数字字面量时才会走到本函数末尾那条 throw。
+		// **只在 strict（解析期）提前**：非 strict 提前会改变存量策略的运行期留痕文案
+		// （今天是 status=missing「缺少指标」，提前后变成 status=error「规则执行错误」）。
+		if (this.strict && !STRATEGY_FUNCTION_NAMES.includes(name)) {
+			throw new ValidationError(`规则 ${this.strict.ruleId} 里不支持的策略函数：${name}；可用函数只有 ${STRATEGY_FUNCTION_NAMES.join(" / ")}`);
+		}
 		if (args.some((arg) => arg.missing)) return { value: undefined, missing: true, references };
 		if (name === "qualify_rank_depth") {
 			if (args.length !== 1) throw new Error("qualify_rank_depth(q) 需要一个参数");
@@ -568,8 +637,8 @@ class ExpressionParser {
 	}
 }
 
-export function evaluateExpression(expression: string, context: StrategyContext): EvalValue {
-	const parser = new ExpressionParser(tokenize(expression), context);
+export function evaluateExpression(expression: string, context: StrategyContext, strict?: StrictIdentifiers): EvalValue {
+	const parser = new ExpressionParser(tokenize(expression), context, strict);
 	const result = parser.parse();
 	return parser.derivedEvidence.size
 		? { ...result, derived: Object.fromEntries(parser.derivedEvidence) }

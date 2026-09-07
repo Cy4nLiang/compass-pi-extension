@@ -24,6 +24,66 @@ export const DEFAULT_GATE_THRESHOLDS: Readonly<GateThresholds> = Object.freeze({
 	qrdMinDepth: 20,
 });
 
+// 策略表达式里合法的**指标名全集**（M17）。策略保存与默认安装按它拒收未知标识符：
+// 修前拼错的名字会被 readMetricValue 折成 null → 规则判 missing → 结论 review，
+// 运营看到的是「缺少指标：gros_margin，转人工复核」——把「你的策略写错了」伪装成
+// 「这个市场缺数据」，还会一路落进 strategyRuns、报告与待办。
+//
+// ⚠️ 这是**手维护**清单，加指标时必须同步登记到这里。今天没有可派生的单一来源：
+// `MetricMap` 是 `Record<string, MetricEvidence>` 纯索引签名，四个生产者也都没有
+// as const 数组或具名 key 联合；唯一完整的既有表（report.ts 的 METRIC_LABELS）缺三个
+// 名字，拿它当判据会当场误拒内置策略自己的 volume_feasibility 规则。想在生产代码里
+// 探测生产者取 Object.keys 同样走不通：riskMetrics / reviewMetrics 是 service.ts 的
+// 模块私有函数，而 service.ts → strategy.ts 是既有单向依赖，反向 import 会成环。
+// 漂移由 tests/integration.test.ts 的双向集合等式用例守着：它从真实 store 取
+// buildStrategyContext 的键与本清单逐名比对，漏登记或多登记当场红并点名那个字符串。
+//
+// 放在本文件而不是 metrics.ts：这四组名字分属四个模块，谁都不该单独拥有全集；
+// 而 defaults.ts 只 `import type`，是任何层都能顺向 import 的叶子。
+export const KNOWN_METRIC_NAMES = [
+	// metrics.ts calculateMarketMetrics 的对象字面量（19 个，无条件产出）
+	"listing_count",
+	"category_monthly_sales",
+	"category_monthly_revenue",
+	"waist_monthly_sales",
+	"price_p25",
+	"price_p50",
+	"price_p75",
+	"cr3",
+	"cr5",
+	"cr10",
+	"hhi",
+	"amz_share",
+	"new_listing_share_12m",
+	"waist_review_median",
+	"waist_rating_median",
+	"top20_age_months_median",
+	"keyword_search_volume",
+	"main_cpc",
+	"traffic_concentration",
+	// metrics.ts targetDependentMetrics（2 个，随策略 meta.monthly_units_q 重算）
+	"qualify_rank_depth",
+	"low_rating_high_sales_count",
+	// economics.ts profitMetrics（6 个无条件 + capital_share，后者只在给了总选品资金时产出）
+	"landed_cost",
+	"gross_margin",
+	"break_even_cpc",
+	"cpc_ratio",
+	"return_loss_rate",
+	"startup_capital",
+	"capital_share",
+	// service.ts riskMetrics（6 个，该市场没有风险清单时整组缺席）
+	"risk_overall",
+	"cert_status",
+	"ip_risk_level",
+	"season_flag",
+	"policy_flag",
+	"logistics_risk",
+	// service.ts reviewMetrics（2 个，该市场没有差评分析时整组缺席）
+	"est_rating_gap",
+	"pain_fixability",
+] as const;
+
 // 内置 YAML 里的数字全部由常量插值：小数固定两位（"0.40"），百分比取整（"40%"），
 // 与此前手写的字面量逐字节相同——tests/strategy.test.ts 用 .replace("gross_margin >= 0.40", …) 之类的
 // 精确替换构造变体，格式一变那些用例就会静默失去替换目标。

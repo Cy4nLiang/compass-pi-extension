@@ -294,7 +294,7 @@ test("classifyMcpToolResult 按拒绝名单计费：请求发出去了就算钱�
 // 审计 G3：direct 工具的失败分支（tool_error / call_failed / aborted）在 details 里**不带 tool**，
 // 只有成功分支带（pi-mcp-adapter 2.27.0 的 guardedMcpDetails 只产 mcpResult / outputGuard）。
 // 后果不是「钱算错了」——金额与次数只读 calls / amountCny——而是 recordMcpUsage 的
-// `server tool` 合并键把同一批里不同工具的失败撞成一条「unknown × N」，工具维度事后不可恢复。
+// `server\u0000tool` 合并键把同一批里不同工具的失败撞成一条「unknown × N」，工具维度事后不可恢复。
 test("classifyMcpToolResult：direct 失败结果按工具名前缀归因，不落 unknown 桶（G3）", () => {
 	for (const [name, details] of [
 		["directToolError", ADAPTER_DETAILS.directToolError],
@@ -479,6 +479,15 @@ test("mcpCallTargetServers：顶层既无 server 也无 tool、网关参数全�
 		// limit / offset / regex / includeSchemas 不在 adapter 的 hasGatewayMode 七键里，
 		// 顶层带着它们照样展开
 		["顶层带 limit 仍会展开", { limit: 5, args: { tool: "sorftime_ProductResearch" } }],
+		// 内层 server 是**空串**时 serverOverride 落空，adapter 回退到工具名前缀档、照样发请求。
+		// 这条钉住 `typeof server === "string" && server` 里的真值那一半：删掉它会 return ""，
+		// 归成一个不存在的池 ⇒ evaluateMcpGate 的 budgets.find 找不到 ⇒ 真调用被放行（漏拦真钱）
+		["内层 server 是空串、靠 tool 前缀归池", { args: { server: "", tool: "sorftime_ProductResearch" } }],
+		// adapter 的 findToolByName（tool-metadata.ts:158-159）把传入名与元数据名**两侧**都
+		// `replace(/-/g, "_")` 后全等比对，所以短横线写法打向同一个服务端工具、一样花钱。
+		// 归池只认下划线的话，这两条与 N-AUD-4 同因同后果：三门全绕
+		["顶层 tool 用短横线", { tool: "sorftime-ProductResearch" }],
+		["内层 tool 用短横线", { args: { tool: "sorftime-ProductResearch", args: { keyword: "x" } } }],
 	];
 	for (const [name, input] of expandedToCall) {
 		assert.deepEqual(mcpCallTargetServers(store, { toolName: "mcp", input }), ["sorftime"], `${name}：宿主会展开成真调用，必须归到 sorftime 池`);
@@ -495,6 +504,10 @@ test("mcpCallTargetServers：顶层既无 server 也无 tool、网关参数全�
 		["顶层 args 是空串", { args: "" }],
 		["顶层 args 不是 JSON", { args: "not json" }],
 		["顶层 args 是数组", { args: [{ tool: "sorftime_ProductResearch" }] }],
+		// JSON.parse("null") 回 null 而 `typeof null === "object"`：少了 `!parsed` 这道判断
+		// 就会拿 null 当内层对象往下走并抛 TypeError，被 tool_call 钩子最外层的 catch 静默吞掉，
+		// 三道门整体放行——正是 N-AUD-4 本身的故障形状
+		["顶层 args 是 JSON null 串", { args: "null" }],
 		// validateNestedGatewayParams：七个网关键必须是字符串，否则 adapter 抛错、请求发不出去
 		["内层 tool 不是字符串", { args: { tool: 123 } }],
 		// 内层 server 也必须是字符串。这条形态的内层 tool 前缀本来命中得了 sorftime——

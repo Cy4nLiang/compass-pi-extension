@@ -1422,6 +1422,21 @@ const MCP_GATEWAY_ACTIONS_BEFORE_TOOL = new Set(["ui-messages", "auth-start", "a
 // 已知的过度拦截（刻意承担，方向安全）：内层 args 是坏 JSON、或 regex / limit 这类键类型不对时，
 // adapter 会在展开阶段 throw、请求根本发不出去，而这里照样归池——代价只是熔断时运营看到熔断
 // 文案而不是 adapter 的报错，不损失任何免费请求。
+// 网关工具名 → 池：adapter 的 findToolByName（tool-metadata.ts:158-159）把传入名与元数据名
+// **两侧**都 `replace(/-/g, "_")` 后全等比对，所以 `<池名>-Xxx` 与 `<池名>_Xxx` 打向同一个
+// 服务端工具、一样花钱。只认下划线的话，短横线写法会整条绕过三道门（与 N-AUD-4 同因同后果）。
+// 两侧都归一是对齐 adapter，不是放宽：池名本身含短横线时也要跟着归一才对得上。
+// **只用于网关（toolName === "mcp"）路径**——直连工具名来自宿主的注册表而不是模型自己写的
+// 字符串，模型拼不出一个没注册过的变体，所以上面那条直连前缀循环保持原样。
+function gatewayToolPool(byLength: BudgetPool[], tool: string): string | undefined {
+	const normalized = tool.replace(/-/g, "_");
+	for (const pool of byLength) {
+		const source = pool.source.replace(/-/g, "_");
+		if (normalized === source || normalized.startsWith(`${source}_`)) return pool.source;
+	}
+	return undefined;
+}
+
 function nestedGatewayCallTarget(byLength: BudgetPool[], input: Record<string, unknown> | undefined): string | undefined {
 	if (!input) return undefined;
 	// 顶层出现任一网关键（哪怕值是空串）⇒ adapter 走顶层分派，`args` 原样当实参
@@ -1465,10 +1480,7 @@ function nestedGatewayCallTarget(byLength: BudgetPool[], input: Record<string, u
 	// 由 evaluateMcpGate 的 budgets.find 自然跳过
 	const server = nested.server;
 	if (typeof server === "string" && server) return server;
-	for (const pool of byLength) {
-		if (tool === pool.source || tool.startsWith(`${pool.source}_`)) return pool.source;
-	}
-	return undefined;
+	return gatewayToolPool(byLength, tool);
 }
 
 // 导出给 index.ts 的 strict 档确认单判定用：与熔断门解析同一个「这次调用打向哪个池」，
@@ -1483,9 +1495,8 @@ export function mcpCallTargetServers(store: CompassStore, call: { toolName: stri
 		if (typeof call.input?.server === "string" && call.input.server) return [call.input.server];
 		const tool = call.input?.tool;
 		if (typeof tool === "string") {
-			for (const pool of byLength) {
-				if (tool === pool.source || tool.startsWith(`${pool.source}_`)) return [pool.source];
-			}
+			const matched = gatewayToolPool(byLength, tool);
+			if (matched) return [matched];
 		}
 		// 顶层两条路径都落空时，才看「网关参数被套进 args 里」的兼容形态（审计 N-AUD-4）：
 		// adapter 会把它展开成真调用、事后照常计费，此前解析成空数组等于熔断门 / 补数确认单

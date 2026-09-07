@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { mock } from "node:test";
 import { DEFAULT_BUDGET_POOLS } from "../defaults.ts";
-import { budgetStatus, classifyMcpToolResult, configureBudget, ensureDefaults, evaluateMcpGate, listWorkbenchTodos, recordMcpUsage } from "../service.ts";
+import { budgetStatus, classifyMcpToolResult, configureBudget, ensureDefaults, evaluateMcpGate, listWorkbenchTodos, mcpCallTargetServers, recordMcpUsage } from "../service.ts";
 import { CompassRepository, createEmptyStore } from "../store.ts";
 import type { CompassStore, CostEvent } from "../types.ts";
 import { budgetData, overviewData } from "../web/data.ts";
@@ -447,6 +447,101 @@ test("evaluateMcpGate：熔断只拦真调用，不发请求的网关形态放�
 	const disabled = evaluateMcpGate(store, { toolName: "mcp", input: { server: "sorftime" } }, { sorftime: 0 });
 	assert.ok(disabled, "池被禁用时连列工具都不放行");
 	assert.match(disabled.reason, /已禁用/);
+});
+
+// 审计 N-AUD-4：网关参数被套进 `args` 里的兼容形态。pi-mcp-adapter 2.27.0 会把它们展开成真调用
+// （index.ts:912-931 的展开条件 + :994 的 `if (dispatchParams.tool)` → executeCall），返回的
+// details.mode === "call" 事后照常计费；而归池此前只看**顶层** server / tool，解析成空数组，于是
+// 熔断门 / 补数确认单预扣 / 在途预占三处共用的第一句 `if (!servers.length) return undefined`
+// 把它整体放行——钱花了、门没拦。归池口径必须与 adapter 的「展开 + 分派」逐条对齐：
+// 只有会落到 executeCall 的形态才归池，其余一律保持今天的行为（宁可少归也不误归）。
+test("mcpCallTargetServers：顶层既无 server 也无 tool、网关参数全套进 args 时仍要归池，三道门不得整体绕过（N-AUD-4）", () => {
+	const store = createEmptyStore();
+	ensureDefaults(store, "tester");
+	configureBudget(store, { source: "sorftime", monthlyCallLimit: 5 });
+	const fused = { sorftime: 5 };
+	// 前提：这个池确实已经熔断（下面「必须拦」的断言不能是「压根没熔断」造成的假绿）
+	assert.ok(evaluateMcpGate(store, { toolName: "sorftime_ProductResearch" }, fused), "前提不成立：池没有熔断");
+
+	// ①② 宿主会展开成 executeCall 的形态：必须归到该池，且熔断后真被拦
+	const expandedToCall: Array<[string, Record<string, unknown>]> = [
+		["对象形态", { args: { tool: "sorftime_ProductResearch" } }],
+		["对象形态带实参", { args: { tool: "sorftime_ProductResearch", args: { keyword: "x" } } }],
+		// 内层 server 就是 executeCall 的 serverOverride：内层 tool 可以完全没有池前缀，
+		// 只看 tool 前缀会漏掉这一形态
+		["内层 server 定归属、内层 tool 无前缀", { args: { server: "sorftime", tool: "ProductResearch" } }],
+		// ② args 是 JSON 字符串：adapter 的 parseArgs 先 JSON.parse 再照常展开
+		["顶层 args 是 JSON 字符串", { args: '{"tool":"sorftime_ProductResearch","args":{"keyword":"x"}}' }],
+		["内层 args 是 JSON 字符串", { args: { tool: "sorftime_ProductResearch", args: '{"keyword":"x"}' } }],
+		// action 的**未知**取值不短路 tool：adapter 那三个 === 全不命中，直落 tool 分支。
+		// 写成「内层有 action 就当不是调用」会漏掉这条真付费形态（漏拦方向，最危险）
+		["action 是未知取值", { args: { tool: "sorftime_ProductResearch", action: "adapter_2_99_新动作" } }],
+		// limit / offset / regex / includeSchemas 不在 adapter 的 hasGatewayMode 七键里，
+		// 顶层带着它们照样展开
+		["顶层带 limit 仍会展开", { limit: 5, args: { tool: "sorftime_ProductResearch" } }],
+	];
+	for (const [name, input] of expandedToCall) {
+		assert.deepEqual(mcpCallTargetServers(store, { toolName: "mcp", input }), ["sorftime"], `${name}：宿主会展开成真调用，必须归到 sorftime 池`);
+		assert.ok(evaluateMcpGate(store, { toolName: "mcp", input }, fused), `${name}：是真调用，熔断后必须拦`);
+	}
+
+	// ③ 反向对照·不得误归。这些形态要么 adapter 根本不展开、要么展开后落到不发请求的分支、
+	// 要么直接 throw——归了池就一定被熔断拦掉一个免费请求：`args` 被刻意排除在 G5 的
+	// MCP_NON_CALL_GATEWAY_KEYS 之外，嵌套侧一旦归池，没有任何东西替它放行
+	const notCalls: Array<[string, Record<string, unknown>]> = [
+		// adapter 展开只做一次，没有循环：内层只有 args 键 ⇒ 抛「Gateway params were nested inside args」
+		["双层嵌套", { args: { args: { tool: "sorftime_ProductResearch" } } }],
+		["内层没有任何网关键", { args: {} }],
+		["顶层 args 是空串", { args: "" }],
+		["顶层 args 不是 JSON", { args: "not json" }],
+		["顶层 args 是数组", { args: [{ tool: "sorftime_ProductResearch" }] }],
+		// validateNestedGatewayParams：七个网关键必须是字符串，否则 adapter 抛错、请求发不出去
+		["内层 tool 不是字符串", { args: { tool: 123 } }],
+		// `if (dispatchParams.tool)` 是**真值**判定：空串一路滑到 executeStatus，不发请求
+		["内层 tool 是空串", { args: { tool: "" } }],
+		// 展开后落到不发请求的分支（describe / search / connect / instructions / 列工具）
+		["内层 describe", { args: { describe: "sorftime_ProductResearch" } }],
+		["内层 search", { args: { search: "keyword" } }],
+		["内层 search 带 server", { args: { search: "keyword", server: "sorftime" } }],
+		["内层 connect", { args: { connect: "sorftime" } }],
+		["内层 instructions", { args: { instructions: "sorftime" } }],
+		["内层只有 server（列工具）", { args: { server: "sorftime" } }],
+		// 这三个 action 的分派**排在** `if (dispatchParams.tool)` 之前，带着 tool 也到不了 executeCall
+		["内层 action=ui-messages 且带 tool", { args: { action: "ui-messages", tool: "sorftime_ProductResearch" } }],
+		["内层 action=auth-start 且带 tool", { args: { action: "auth-start", server: "sorftime", tool: "sorftime_ProductResearch" } }],
+		["内层 action=auth-complete 且带 tool", { args: { action: "auth-complete", server: "sorftime", tool: "sorftime_ProductResearch" } }],
+		// hasGatewayMode 的判据是 `!== undefined` 而不是真值：顶层出现空串照样算「已进网关模式」，
+		// adapter 不展开 args，最终落 executeStatus。按真值判断的实现会在这里误归并误拦
+		["顶层 server 是空串", { server: "", args: { tool: "sorftime_ProductResearch" } }],
+		["顶层 tool 是空串", { tool: "", args: { tool: "sorftime_ProductResearch" } }],
+		["顶层 describe 是空串", { describe: "", args: { tool: "sorftime_ProductResearch" } }],
+		// 不存在的池：与顶层 `{tool:"keepa_product"}` 遇到未建池时同口径，不得误归到任何池
+		["内层 tool 不属于任何池", { args: { tool: "nosuchpool_x" } }],
+	];
+	for (const [name, input] of notCalls) {
+		assert.deepEqual(mcpCallTargetServers(store, { toolName: "mcp", input }), [], `${name}：不会向服务端发 tools/call，不得归池`);
+		assert.equal(evaluateMcpGate(store, { toolName: "mcp", input }, fused), undefined, `${name}：熔断后仍须放行，否则免费请求也被拦`);
+	}
+
+	// ③ 反向对照·别的池不得被 sorftime 的熔断牵连；内层 server 指向未建池时与顶层同口径原样返回
+	assert.deepEqual(mcpCallTargetServers(store, { toolName: "mcp", input: { args: { tool: "keepa_product" } } }), ["keepa"]);
+	assert.equal(evaluateMcpGate(store, { toolName: "mcp", input: { args: { tool: "keepa_product" } } }, fused), undefined, "keepa 没有熔断，不该被 sorftime 的熔断牵连");
+	assert.deepEqual(mcpCallTargetServers(store, { toolName: "mcp", input: { args: { server: "nosuchpool", tool: "x" } } }), ["nosuchpool"]);
+	assert.equal(evaluateMcpGate(store, { toolName: "mcp", input: { args: { server: "nosuchpool", tool: "x" } } }, fused), undefined, "不是预算池就没有可熔断的东西");
+
+	// ④ 反向对照·顶层既有形态逐字不变。嵌套解析只在顶层两条路径都落空之后才跑，
+	// 既有 17 处 evaluateMcpGate 调用与 G5 白名单都不许被带偏
+	assert.deepEqual(mcpCallTargetServers(store, { toolName: "mcp", input: { server: "sorftime", tool: "ProductResearch" } }), ["sorftime"]);
+	assert.deepEqual(mcpCallTargetServers(store, { toolName: "mcp", input: { tool: "sorftime_ProductResearch" } }), ["sorftime"]);
+	// 顶层 server 优先且不展开：args 里写的是别的池也归顶层那个
+	assert.deepEqual(mcpCallTargetServers(store, { toolName: "mcp", input: { server: "sorftime", args: { tool: "keepa_product" } } }), ["sorftime"]);
+	assert.deepEqual(mcpCallTargetServers(store, { toolName: "sorftime_ProductResearch" }), ["sorftime"]);
+	assert.deepEqual(mcpCallTargetServers(store, { toolName: "mcpScript", input: { code: "await tools.sorftime_ProductResearch({})" } }), ["sorftime"]);
+	assert.deepEqual(mcpCallTargetServers(store, { toolName: "read", input: {} }), []);
+	assert.ok(evaluateMcpGate(store, { toolName: "mcp", input: { server: "sorftime", tool: "ProductResearch" } }, fused), "顶层规范形态仍须被拦");
+	assert.ok(evaluateMcpGate(store, { toolName: "mcp", input: { server: "sorftime", args: { tool: "keepa_product" } } }, fused), "顶层带 server 的既有形态仍须被拦");
+	// G5 的放行白名单不受影响：顶层「列工具」照旧放行
+	assert.equal(evaluateMcpGate(store, { toolName: "mcp", input: { server: "sorftime" } }, fused), undefined, "顶层列工具不发请求，熔断后仍放行");
 });
 
 test("non-finite monthlyLimitCny is rejected before it can poison the store", async () => {

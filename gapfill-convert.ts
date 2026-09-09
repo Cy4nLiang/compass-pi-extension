@@ -677,12 +677,17 @@ export async function convertSorftimePayloads(deps: ConvertDeps, input: ConvertI
  * `baseName` 必须是**去掉扩展名**的前缀：CSV 那边传 `xxx`（不是 `xxx.csv`），材料那边传
  * `yyy`（不是 `yyy.json`）。把带扩展名的传进来会得到 `yyy.json-payload-1.json` 这种名字。
  * 入参收 resolved 而不是 payloads：归档要的是解析后的 body，清理要的是原 payload 的 cleanupPaths。
+ *
+ * `defer=true` 时只归档、不清理，把清理动作作为 `cleanup` 交回调用方——给「解析完还要等人操作、
+ * 中途可能中断重跑」的链路用（参考成本链的逐条同款确认，最长 12 分钟）。清理一旦提前做掉，
+ * 中断后重跑就会在 readFile 上抛裸 ENOENT，那次已计费的调用再也转不出来。
  */
 async function archiveAndClean(
 	deps: ConvertDeps,
 	resolved: ReadonlyArray<{ payload: CachedPayload; body: unknown }>,
 	baseName: string,
-): Promise<{ archivedRaw: string[]; cleaned: string[] }> {
+	defer = false,
+): Promise<{ archivedRaw: string[]; cleaned: string[]; cleanup?: () => Promise<string[]> }> {
 	// 原始 JSON 归档：产物是派生物，出了问题要能回到载荷本身核对
 	const archivedRaw: string[] = [];
 	for (const [index, { body }] of resolved.entries()) {
@@ -690,8 +695,15 @@ async function archiveAndClean(
 		archivedRaw.push(await deps.repo.archiveRaw(`${baseName}-payload-${index + 1}.json`, Buffer.from(JSON.stringify(body), "utf8"), new Date().toISOString()));
 	}
 
-	// 溢写文件与其目录都要删——经营数据不留在 /tmp。两条链各自 mkdtemp 过一个目录，
-	// 所以文件和目录都要清，且失败不能影响已经写好的产物
+	if (defer) return { archivedRaw, cleaned: [], cleanup: () => cleanSpills(resolved) };
+	return { archivedRaw, cleaned: await cleanSpills(resolved) };
+}
+
+/**
+ * 溢写文件与其目录都要删——经营数据不留在 /tmp。两条链各自 mkdtemp 过一个目录，
+ * 所以文件和目录都要清，且失败不能影响已经写好的产物。可重复调用：删过的路径再删只是无声跳过。
+ */
+async function cleanSpills(resolved: ReadonlyArray<{ payload: CachedPayload }>): Promise<string[]> {
 	const cleaned: string[] = [];
 	for (const { payload } of resolved) {
 		for (const path of payload.cleanupPaths ?? []) {
@@ -710,7 +722,7 @@ async function archiveAndClean(
 			}
 		}
 	}
-	return { archivedRaw, cleaned };
+	return cleaned;
 }
 
 export interface ReviewMaterialInput {
@@ -843,6 +855,11 @@ export interface CostReferencePayloadInput {
 	/** YYYY-MM-DD，从这批载荷的 capturedAt 派生，归档文件名用 */
 	capturedDate: string;
 	source?: string;
+	/**
+	 * 只归档、先不清溢写文件，把清理动作作为 `cleanup` 交回调用方。
+	 * 本链在解析与写库之间要逐条弹同款确认（最长 12 分钟且可中断重跑），提前清理会让重跑读不回载荷。
+	 */
+	deferCleanup?: boolean;
 }
 
 export interface CostReferencePayloadResult {
@@ -857,6 +874,8 @@ export interface CostReferencePayloadResult {
 	unavailable: string[];
 	archivedRaw: string[];
 	cleaned: string[];
+	/** 只在 `deferCleanup` 时下发：这一批真正落幕（写库成功 / 判空结果）后调它清溢写文件 */
+	cleanup?: () => Promise<string[]>;
 }
 
 /**
@@ -916,7 +935,7 @@ export async function resolveCostReferencePayload(deps: ConvertDeps, input: Cost
 
 	const source = input.source ?? "sorftime";
 	const base = `mcp-${input.capturedDate}-${slugForFileName(input.marketName)}-${source}-cost-reference`;
-	const { archivedRaw, cleaned } = await archiveAndClean(deps, resolved, base);
+	const { archivedRaw, cleaned, cleanup } = await archiveAndClean(deps, resolved, base, input.deferCleanup === true);
 	return {
 		rows,
 		usedToolCallId,
@@ -926,5 +945,6 @@ export async function resolveCostReferencePayload(deps: ConvertDeps, input: Cost
 		unavailable,
 		archivedRaw,
 		cleaned,
+		cleanup,
 	};
 }

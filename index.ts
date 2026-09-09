@@ -505,7 +505,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 		try {
 			raw = await readFile(repository(ctx).resolveInputPath(FX_PATH), "utf8");
 		} catch {
-			throw new Error(`汇率表读不到（${FX_PATH}）：1688 参考成本要把人民币换成利润测算的币种，没有汇率就不出数。请在工作区补上这份文件（rates 与 as_of 由运营主管填）。`);
+			throw new Error(`汇率表读不到（${FX_PATH}）：1688 参考成本要把人民币换成利润测算的币种，没有汇率就不出数。请在工作区补上这份文件（rates 与 as_of 按 hints.json 里 purchase_cost_source 的汇率维护口径填）。`);
 		}
 		let parsed: { rates?: unknown; as_of?: unknown; source?: unknown };
 		try {
@@ -1726,7 +1726,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 				}
 				const server = paidSources[0];
 
-				// 两条 A 档链路都叫 sorftime，上面按 source 去重的那道检查放得过去，但它们的产物完全
+				// 三条 A 档链路都叫 sorftime，上面按 source 去重的那道检查放得过去，但它们的产物完全
 				// 不同（一份市场 CSV vs 一份差评材料），一张确认单覆盖不了两种。按 writeBack 再判一次
 				const paidWriteBacks = [...new Set(confirmGaps.flatMap((gap) => gap.sources.filter((option) => option.tier === "A").map((option) => option.writeBack)))];
 				if (paidWriteBacks.length !== 1) {
@@ -1939,14 +1939,18 @@ export default function compassExtension(pi: ExtensionAPI): void {
 					const fx = await loadFxRates(ctx);
 					const currency = profitCurrencyFor(store, ticket.marketId);
 					const fxRate = fxRateFor(fx, currency);
+					// deferCleanup：归档立刻做（钱花了要留痕），但溢写文件留到这一批落幕再删。
+					// 逐条同款确认最长 12 分钟且可中断重跑，提前清掉文件会让「重新 convert 继续」在
+					// readFile 上抛裸 ENOENT，那次已计费的调用再也转不出来（2026-09-09 交付评审核出）
 					const parsed = await resolveCostReferencePayload(
 						{ repo: repository(ctx) },
-						{ payloads: keyed, map, marketName: ticket.marketName, capturedDate, source: ticket.server },
+						{ payloads: keyed, map, marketName: ticket.marketName, capturedDate, source: ticket.server, deferCleanup: true },
 					);
 					if (parsed.emptyResult) {
 						// 无结果是正常空值：钱已经花了、原文已归档；换关键词要重新 approve，这张单没有别的用处了
 						mcpPayloads.forget(keyed.map((entry) => entry.toolCallId));
 						gapfillTicket = undefined;
+						await parsed.cleanup?.();
 						const emptyLines = [
 							`关键词「${ticket.searchName ?? ""}」在 1688 检索无结果（或返回 0 行），参考成本不出数，采购价出处缺口保持人工档。`,
 							"下一步：换一个更常见的中文品类词重新 compass_gaps action=approve origin=purchase_cost_source search_name=…（会再花 1 次调用），或改用供应商报价。",
@@ -1989,6 +1993,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 						// 一条同款都没纳入：这张单已经没有可用样本，换关键词要重新 approve
 						mcpPayloads.forget(keyed.map((entry) => entry.toolCallId));
 						gapfillTicket = undefined;
+						await parsed.cleanup?.();
 						const summary = `没有纳入任何同款样本（弹了 ${prompted} 条，否了 ${rejected} 条），参考成本不出数；换关键词请重新 approve`;
 						return textResult(summary, details({ title: "参考成本", status: "warning", summary }));
 					}
@@ -2039,18 +2044,26 @@ export default function compassExtension(pi: ExtensionAPI): void {
 							archivedRaw: parsed.archivedRaw,
 						});
 						let estimateId: string | undefined;
+						let currencyDrift: string | undefined;
 						if (finalChoice === WRITE_AND_UPDATE) {
-							// 用事务内的 store 重新取最新测算：确认循环可长达 12 分钟，循环前那份已过期
+							// 用事务内的 store 重新取最新测算：确认循环可长达 12 分钟，循环前那份已过期。
+							// 币种要在事务内复核：参考成本按循环**开始时**那条测算的币种换算，若这期间有人
+							// 记了一条别的币种的测算，克隆它就会把 USD 的数字塞进 CNY 的测算里
 							const latest = latestProfitEstimate(store, ticket.marketId);
-							if (latest) {
+							if (latest && latest.input.currency !== currency) {
+								currencyDrift = latest.input.currency;
+							} else if (latest) {
 								const input = normalizeProfitInput({ ...latest.input, purchaseCost: reference.referenceCost, purchaseCostSource: "ali1688_reference", costReferenceId: reference.id });
 								estimateId = recordProfitEstimate(store, input, estimateProfit(input, gateThresholds(store)), actor).id;
 							}
 						}
-						return { reference, estimateId };
+						return { reference, estimateId, currencyDrift };
 					});
 					mcpPayloads.forget(keyed.map((entry) => entry.toolCallId));
 					gapfillTicket = undefined;
+					// 落幕了才清溢写文件：中断路径（同款确认 / 最终弹窗被 Esc 或超时）刻意不走到这里，
+					// 好让运营重跑 convert 时还读得回同一批载荷
+					const cleanedSpills = await parsed.cleanup?.();
 					const gapNote = gapNoteFor(written.store, ticket.marketId, written.result.reference.candidateId);
 					const sampleLines = computation.samples.map(
 						(sample) =>
@@ -2062,7 +2075,9 @@ export default function compassExtension(pi: ExtensionAPI): void {
 						...warnings.map((warning) => `警告：${warning}`),
 						written.result.estimateId
 							? `已更新利润测算 estimate_id=${written.result.estimateId}（采购价出处：${PURCHASE_COST_SOURCE_LABELS.ali1688_reference}，其余输入沿用上一次）`
-							: `下一步：compass_profit_estimate market_ref=${ticket.marketId} cost_reference_ref=latest …（其余输入照常给）；拿到供应商报价后改填 purchase_cost 并标 purchase_cost_source=supplier_quote`,
+							: written.result.currencyDrift
+								? `没有更新利润测算：参考成本按 ${currency} 换算，而这期间该市场最新测算换成了 ${written.result.currencyDrift}，克隆会把两种币的数字混在一条里。参考成本已存，请按 ${written.result.currencyDrift} 的汇率重新取，或手工用 compass_profit_estimate 指定币种`
+								: `下一步：compass_profit_estimate market_ref=${ticket.marketId} cost_reference_ref=latest …（其余输入照常给）；拿到供应商报价后改填 purchase_cost 并标 purchase_cost_source=supplier_quote`,
 						`参考成本记录 ${written.result.reference.id} · 原始返回已归档 ${parsed.archivedRaw.length} 份`,
 					];
 					return textResult([summary, ...lines].join("\n"), details({
@@ -2070,7 +2085,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 						status: warnings.length ? "warning" : "success",
 						summary,
 						lines,
-						data: resultData({ payload: { costReferenceId: written.result.reference.id, referenceCost: computation.referenceCost, currency, warnings, estimateId: written.result.estimateId }, gapNote }),
+						data: resultData({ payload: { costReferenceId: written.result.reference.id, referenceCost: computation.referenceCost, currency, warnings, estimateId: written.result.estimateId, cleaned: cleanedSpills ?? [] }, gapNote }),
 					}));
 				}
 				let result: Awaited<ReturnType<typeof convertSorftimePayloads>>;

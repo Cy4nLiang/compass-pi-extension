@@ -1047,6 +1047,59 @@ test("cost_reference 链：溢写文件读取——正文链与结果链都能�
 	});
 });
 
+test("cost_reference 链：deferCleanup 期间不删溢写文件——中断后重跑仍读得回，落幕时才清理", async () => {
+	// 为什么要延迟：另两条链在写出产物之后才归档清理，而参考成本链在解析与写库之间插进了
+	// 最长 12 分钟的逐条同款确认。确认被 Esc / 超时打断时结果文案承诺「可重新 convert 继续」，
+	// 但溢写文件若已在解析阶段被 unlink，重跑就会在 readFile 上抛裸 ENOENT，那次已计费的调用
+	// 再也转不出来（2026-09-09 交付评审核出）。归档要立刻做（钱花了要留痕），清理才推迟。
+	await withRepo(async (repo) => {
+		const spillRoot = await mkdtemp(join(tmpdir(), "compass-cost-defer-"));
+		const dir = join(spillRoot, "a");
+		await mkdir(dir, { recursive: true });
+		const file = join(dir, "output-1.txt");
+		await writeFile(file, JSON.stringify({ doc: {}, data: [costRow(1), costRow(2), costRow(3)] }), "utf8");
+		try {
+			const payloads = [costEntry([], { toolCallId: "call-defer", value: undefined, filePath: file, cleanupPaths: [file] })];
+			const first = await resolveCostReferencePayload({ repo }, { ...COST_INPUT, payloads, deferCleanup: true });
+			assert.equal(first.rows.length, 3);
+			assert.deepEqual(first.cleaned, [], "延迟模式下这一步不清理");
+			assert.equal(first.archivedRaw.length, 1, "归档照旧立刻做：调用已经计费，要留痕");
+			assert.ok(await stat(file), "同款确认期间溢写文件必须还在");
+
+			// 运营中途走开 → 确认单与缓存都没清 → 重新 convert：必须还能读回同一批行
+			const retry = await resolveCostReferencePayload({ repo }, { ...COST_INPUT, payloads, deferCleanup: true });
+			assert.equal(retry.rows.length, 3, "中断后重跑仍能拿到行，不必重新 approve 再花一次钱");
+
+			assert.equal(typeof first.cleanup, "function", "延迟模式必须把清理动作交回给调用方");
+			assert.deepEqual(await first.cleanup?.(), [file], "落幕时才清理，并报出删了哪些");
+			await assert.rejects(() => stat(dir), /ENOENT/u, "目录也要带走，经营数据不留在临时区");
+		} finally {
+			await rm(spillRoot, { recursive: true, force: true });
+		}
+	});
+});
+
+test("cost_reference 链：不传 deferCleanup 时维持既有语义——解析完即清理，且 cleanup 不下发", async () => {
+	await withRepo(async (repo) => {
+		const spillRoot = await mkdtemp(join(tmpdir(), "compass-cost-nodefer-"));
+		const dir = join(spillRoot, "a");
+		await mkdir(dir, { recursive: true });
+		const file = join(dir, "output-1.txt");
+		await writeFile(file, JSON.stringify({ doc: {}, data: [costRow(1)] }), "utf8");
+		try {
+			const result = await resolveCostReferencePayload(
+				{ repo },
+				{ ...COST_INPUT, payloads: [costEntry([], { toolCallId: "call-nodefer", value: undefined, filePath: file, cleanupPaths: [file] })] },
+			);
+			assert.deepEqual(result.cleaned, [file]);
+			assert.equal(result.cleanup, undefined, "非延迟模式不下发 cleanup，免得调用方以为还要再清一次");
+			await assert.rejects(() => stat(dir), /ENOENT/u);
+		} finally {
+			await rm(spillRoot, { recursive: true, force: true });
+		}
+	});
+});
+
 test("cost_reference 链：requestParamsOf 按键取参数对象（直连与网关两种形态），缓存条目记 requestSearchName", () => {
 	// 直连形态：参数就在 input 顶层；网关形态：参数套在 args 里。两个字段必须从同一个对象读
 	assert.deepEqual(requestParamsOf({ search_name: "demo", page: 1 }, "search_name"), { search_name: "demo", page: 1 });

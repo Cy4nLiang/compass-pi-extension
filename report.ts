@@ -215,7 +215,9 @@ export function renderMarketReport(data: MarketReportData): GeneratedReport {
 	lines.push("## 3. 单位经济情景", "");
 	if (profit) {
 		// 采购价出处（compass-1688-cost-reference）：存量记录没有出处字段，标「未标注」；
-		// 引用 1688 参考成本时把样本数 / 系数 / 汇率 / 采样日带上，报价到达后给出与参考成本的差值
+		// 引用 1688 参考成本时把样本数 / 系数 / 汇率 / 采样日带上。差值行的判据是「这条测算不是引用
+		// 参考成本得来的」——供应商报价、手填、存量未标注都给，因为「我填的数与真实货源价差多少」正是
+		// 运营要看的对照；出处已经是参考成本时给了只会是 0.00。任务书 ## Deviations 记了这条比 S4.2 宽
 		const referenced = profit.input.purchaseCostSource === "ali1688_reference" && costReference && costReference.id === profit.input.costReferenceId ? costReference : undefined;
 		const referenceDetail = referenced
 			? ` · 样本 ${referenced.sampleSize} · ×${referenced.coefficient} · 汇率 ${referenced.fxRate}@${referenced.fxAsOf} · 采样 ${referenced.capturedAt.slice(0, 10)}`

@@ -821,6 +821,30 @@ test("参考成本 ③：strict 档固定参数用 String() 比对，且参考�
 	assert.doesNotMatch(gate, /params\[key\] !== expected\)/u, "裸比对会把整数 page=1 判成与 \"1\" 不符——两个分支都不许");
 });
 
+test("参考成本 ⑤：写回克隆在事务内复核币种，且溢写清理只发生在落幕路径", async () => {
+	const source = await readFile(join(repoRoot, "index.ts"), "utf8");
+	const slice = costReferenceConvertSlice(source);
+	// 币种：参考成本按确认循环**开始时**那条测算的币种换算，克隆前必须复核事务内取到的还是同一种币，
+	// 否则 12 分钟里换过币种的市场会被写进一条两种币混用的测算（2026-09-09 交付评审核出）
+	const clone = slice.slice(slice.indexOf("const latest = latestProfitEstimate(store, ticket.marketId);"));
+	assert.ok(clone.length > 0, "抽不到写回克隆段——切片已失效");
+	const guardAt = clone.indexOf("latest.input.currency !== currency");
+	const recordAt = clone.indexOf("recordProfitEstimate(");
+	assert.ok(guardAt > 0 && recordAt > guardAt, "克隆写回之前必须先比对币种");
+	// 清理：解析阶段只归档（deferCleanup），unlink 推迟到写库成功 / 判空结果之后；
+	// 中断路径承诺「可重新 convert 继续」，提前清掉溢写文件会让重跑抛裸 ENOENT
+	assert.match(slice, /deferCleanup: true/u, "参考成本链解析时必须延迟清理");
+	assert.match(slice, /await parsed\.cleanup\?\.\(\)/u, "落幕路径要真的把清理执行掉");
+	// 切片要从 `if (choice === undefined) {` 起——从「同款确认中断」那句文案起会把插在它**前面**的
+	// 清理调用漏在切片外，改坏了也不红（写这条时真踩了一次，正是根 CLAUDE.md 那条假绿家族）
+	const interruptStart = slice.indexOf("if (choice === undefined) {");
+	const interruptEnd = slice.indexOf("if (choice === STOP_OPTION)");
+	assert.ok(interruptStart > 0 && interruptEnd > interruptStart, "抽不到同款确认的中断早退分支——切片已失效");
+	assert.doesNotMatch(slice.slice(interruptStart, interruptEnd), /cleanup/u, "同款确认中断的早退路径不得清理溢写文件：那正是重跑要读回的东西");
+	const finalCancel = slice.slice(slice.indexOf("if (finalChoice !== WRITE_AND_UPDATE"), slice.indexOf("const actor = actorName();"));
+	assert.doesNotMatch(finalCancel, /cleanup/u, "最终弹窗取消 / 超时同样不清理：确认单还在，运营可以重跑");
+});
+
 test("参考成本 ④：approve 在 origin 缺省时排除参考成本链，既有快照链的 approve 不受新缺口影响", async () => {
 	const source = await readFile(join(repoRoot, "index.ts"), "utf8");
 	const body = toolBody(source, "compass_gaps");

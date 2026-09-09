@@ -385,7 +385,11 @@ test("pool candidate detail profit summary carries purchaseCostSource and the co
 	assert.ok(marketId);
 	// 存量形态：没有出处字段 → null 与「未标注」，costReference 为 null
 	const legacy = normalizeProfitInput({ marketId, salePrice: 25.99, purchaseCost: 3.5, fbaFee: 5.2 });
-	recordProfitEstimate(store, legacy, estimateProfit(legacy), "tester");
+	const legacyEstimate = recordProfitEstimate(store, legacy, estimateProfit(legacy), "tester");
+	// 两条测算都落 nowIso()，同一毫秒时 poolCandidateData 的 sort(desc)[0] 会取到先插入的那条
+	//（盘点 A5 的并列坑，本专题不修它）。把两条都钉成**与运行日期无关**的固定值来定序：
+	// 只推后第二条会埋一颗时间炸弹——墙钟越过那个日期后，第一条反而更「新」，用例必红且不自愈
+	legacyEstimate.createdAt = "2026-01-01T00:00:00.000Z";
 	const before = poolCandidateData(store, "fresh market");
 	assert.equal(before.profitSummary?.purchaseCost, 3.5);
 	assert.equal(before.profitSummary?.purchaseCostSource, null);
@@ -418,9 +422,7 @@ test("pool candidate detail profit summary carries purchaseCostSource and the co
 	});
 	const sourced = normalizeProfitInput({ marketId, salePrice: 25.99, purchaseCost: reference.referenceCost, fbaFee: 5.2, purchaseCostSource: "ali1688_reference", costReferenceId: reference.id });
 	const sourcedEstimate = recordProfitEstimate(store, sourced, estimateProfit(sourced), "tester");
-	// 两条测算在同一毫秒落库时 poolCandidateData 的 sort(desc)[0] 会取到先插入的那条（盘点 A5 的并列坑，
-	// 本专题不修它）：把第二条的时间戳显式推后，本用例只钉出处字段的透传
-	sourcedEstimate.createdAt = "2026-09-08T00:00:00.000Z";
+	sourcedEstimate.createdAt = "2026-01-02T00:00:00.000Z";
 	const after = poolCandidateData(store, "fresh market");
 	assert.equal(after.profitSummary?.purchaseCost, 1.26);
 	assert.equal(after.profitSummary?.purchaseCostSource, "ali1688_reference");

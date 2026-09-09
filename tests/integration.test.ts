@@ -2200,10 +2200,20 @@ test("costReferences：币种不符时拒绝引用；手填采购价出处缺省
 	recordProfitEstimate(store, legacy, estimateProfit(legacy), "tester");
 	const legacyReport = generateMarketReport(store, marketId).markdown;
 	assert.match(legacyReport, /- 采购价 USD 4\.00（出处：未标注）/u, "存量记录没有出处字段，报告标「未标注」");
+	// 差值行的判据是「这条测算不是引用参考成本得来的」，不只限供应商报价：手填与存量未标注同样给差值，
+	// 那正是运营最需要的对照（我拍脑袋填的 4.00 与真实货源价差多少）。tasks.md ## Deviations 记了这条放宽
+	assert.match(legacyReport, /与 1688 参考成本 USD 1\.26 相差 \+2\.74（\+217\.5%）/u, "未标注的存量测算也要给出与参考成本的差值");
 
 	const quoted = normalizeProfitInput({ marketId, salePrice: 19.99, purchaseCost: 1.5, fbaFee: 4.5, purchaseCostSource: "supplier_quote" });
 	recordProfitEstimate(store, quoted, estimateProfit(quoted), "tester");
 	const quotedReport = generateMarketReport(store, marketId).markdown;
 	assert.match(quotedReport, /- 采购价 USD 1\.50（出处：供应商报价）/u);
 	assert.match(quotedReport, /与 1688 参考成本 USD 1\.26 相差 \+0\.24（\+19\.0%）/u, "报价与参考成本并存时给差值");
+
+	// 负向：采购价本身就是这条参考成本换算来的，再报「与参考成本相差 0.00」是噪音
+	const sourced = normalizeProfitInput({ marketId, salePrice: 19.99, purchaseCost: 1.26, fbaFee: 4.5, purchaseCostSource: "ali1688_reference", costReferenceId: store.costReferences?.at(-1)?.id });
+	recordProfitEstimate(store, sourced, estimateProfit(sourced), "tester");
+	const sourcedReport = generateMarketReport(store, marketId).markdown;
+	assert.match(sourcedReport, /- 采购价 USD 1\.26（出处：1688 参考成本 · 样本 /u);
+	assert.doesNotMatch(sourcedReport, /相差/u, "出处已经是参考成本时不再给差值行");
 });

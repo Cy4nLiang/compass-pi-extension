@@ -20,6 +20,28 @@ import {
 
 // 夹具一律虚构：本仓库是公开的，CI 日志会把断言失败的实参打到公网上。
 
+/**
+ * 把事件循环钉住，直到 `run()` 落定。
+ *
+ * 为什么需要：`withDeadline` 的超时定时器刻意 `unref`（`dispatch.ts:747`——一个没触发的
+ * 30 秒兜底不该吊住 pi 退出），而 **Node 22 的 test runner 不会为 unref 过的句柄保持事件
+ * 循环存活**。于是「只靠那个定时器往前推」的用例会在事件循环提前判定结束后永远挂着，
+ * node:test 报 `Promise resolution is still pending but the event loop has already resolved`，
+ * 并把**同文件后续所有用例连坐成 not ok**（本文件 30 条里 3 条是真源头、25 条是连坐）。
+ *
+ * 2026-09-10 实测：Node 22.23.2 复现（28 条 not ok，公开仓库 CI 的 `test (22)` 因此长期红，
+ * `test (24)` 只是被 fail-fast 取消）；Node 24.21.0 与 25.8.1 都不复现——所以开发机上一直全绿。
+ * 修在测试侧而不是去掉生产的 unref：unref 在生产是对的，改它会让 pi 退出时被未触发的兜底吊住。
+ */
+async function keepingEventLoopAlive<T>(run: () => Promise<T>): Promise<T> {
+	const anchor = setInterval(() => {}, 1_000);
+	try {
+		return await run();
+	} finally {
+		clearInterval(anchor);
+	}
+}
+
 interface RegistryCall {
 	model: DispatchModelLike;
 	context: DispatchContext;
@@ -136,11 +158,12 @@ test("取消：外部 abort 后底层 signal 立即 aborted 且结果为已取�
 		new Promise<DispatchCompletionLike>((resolve) => {
 			const signal = options.signal as AbortSignal;
 			signal.addEventListener("abort", () => resolve({ role: "assistant", content: [], stopReason: "aborted", usage: USAGE }), { once: true });
-			const timer = setTimeout(() => controller.abort(), 1);
-			(timer as { unref?: () => void }).unref?.();
+			// 这个定时器是测试自己的推进器，**不要 unref**：unref 掉它，Node 22 下这条用例就没有
+			// 任何 ref 句柄能把事件循环撑到 abort 触发
+			setTimeout(() => controller.abort(), 1);
 		}),
 	);
-	const result = await runDispatch({ registry }, baseInput({ config: fastConfig({ timeout_ms: 10_000 }) }), { signal: controller.signal });
+	const result = await keepingEventLoopAlive(() => runDispatch({ registry }, baseInput({ config: fastConfig({ timeout_ms: 10_000 }) }), { signal: controller.signal }));
 	assert.equal(result.status, "error");
 	assert.equal(result.summary, DISPATCH_FAILURE_SUMMARIES.cancelled);
 	assert.equal((calls[0].options.signal as AbortSignal).aborted, true, "工具 signal 中止后，传给 complete 的合并 signal 必须也已中止");
@@ -154,7 +177,8 @@ test("超时：到点返回派发超时且底层 signal aborted", async () => {
 			signal.addEventListener("abort", () => resolve({ role: "assistant", content: [], stopReason: "aborted", usage: USAGE }), { once: true });
 		}),
 	);
-	const result = await runDispatch({ registry }, baseInput({ config: fastConfig() }));
+	// 只有派发自己的超时定时器能推进它，那个定时器是 unref 的 → Node 22 需要锚点
+	const result = await keepingEventLoopAlive(() => runDispatch({ registry }, baseInput({ config: fastConfig() })));
 	assert.equal(result.status, "error");
 	assert.equal(result.summary, DISPATCH_FAILURE_SUMMARIES.timeout);
 	assert.equal((calls[0].options.signal as AbortSignal).aborted, true);
@@ -164,7 +188,8 @@ test("超时：供应商不理 abort 时宽限兜底仍收束", async () => {
 	resetDispatchCounters();
 	// 这个假供应商完全不理 signal，永不 resolve——只有 withDeadline 能把它收住
 	const { registry } = fakeRegistry([DEEPSEEK], () => new Promise<DispatchCompletionLike>(() => {}));
-	const result = await runDispatch({ registry }, baseInput({ config: fastConfig({ timeout_ms: 20 }) }));
+	// 供应商永不 resolve，唯一的推进器就是 withDeadline 那个 unref 定时器 → Node 22 必须有锚点
+	const result = await keepingEventLoopAlive(() => runDispatch({ registry }, baseInput({ config: fastConfig({ timeout_ms: 20 }) })));
 	assert.equal(result.status, "error");
 	assert.equal(result.summary, DISPATCH_FAILURE_SUMMARIES.timeout);
 });

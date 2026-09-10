@@ -24,6 +24,8 @@ Node >= 22.19；无 build 产物。**没有 lint，静态检查全部由 `tsconf
 - `typebox` 必须钉在 **1.3.7**（与宿主捆绑版本一致）；升级会触发 tsc TS2589 深度实例化错误。
 - `@earendil-works/pi-coding-agent` 自带 npm-shrinkwrap，其依赖嵌套安装、不 hoist，因此 `pi-ai` / `pi-tui` 必须在 devDependencies 显式声明 tsc 才能解析。
 - 不要把 pi 系列包挪进 dependencies 或打包进扩展。
+- `@types/node` 的主版本跟**最低支持的 Node** 走（`engines >= 22.19`，CI 矩阵 22/24），不随 Dependabot 提大版本（`dependabot.yml` 已 ignore semver-major）：类型包比运行时新，tsc 会放行 Node 22 上不存在的 API，只在 CI 的 22 那条腿运行时才炸。升 Node 基线时连 `.nvmrc` / `engines` / `ci.yml` 矩阵一起手动同步。
+- TypeScript 与 GitHub Actions 的大版本升级可以照收（2026-09-10 已升 TypeScript 7、checkout / setup-node v7），但合并前要本地 `npm run check` 一遍——CI 是先 test 后 check，测试挂了就跑不到类型检查那步，PR 的红未必是升级本身造成的。
 
 ## 架构
 

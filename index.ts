@@ -33,7 +33,7 @@ import {
 	type DispatchMaterialInfo,
 	type DispatchRegistryLike,
 } from "./dispatch.ts";
-import { computeCostReference, normalizeRows, orderCandidates } from "./cost-reference.ts";
+import { COST_REFERENCE_TEXT, computeCostReference, normalizeRows, orderCandidates } from "./cost-reference.ts";
 import { estimateProfit, normalizeProfitInput } from "./economics.ts";
 import { capturedAtForBatch, convertSorftimePayloads, createMcpPayloadCache, materializeReviewPayloads, parseSorftimeFieldMap, requestParamsOf, resolveCostReferencePayload, type McpPayloadEntry, type SorftimeFieldMap } from "./gapfill-convert.ts";
 import {
@@ -1959,7 +1959,8 @@ export default function compassExtension(pi: ExtensionAPI): void {
 					}
 					const candidates = orderCandidates(normalizeRows(parsed.rows, costMap.fields));
 					// 逐条同款确认是硬步骤（E0c：按销量排序的前几名可能整批不是同款）。循环在写事务**之外**，
-					// 上界 COST_REFERENCE_MAX_PROMPTS；超时 / Esc 即中止且不清单不清缓存，可重新 convert 继续
+					// 上界 COST_REFERENCE_MAX_PROMPTS；超时 / Esc 即中止且不清单不清缓存。重跑是从第 1 条重新弹起
+					// （accepted / candidates 都是本分支的局部变量），且只在确认单 10 分钟 TTL 内还来得及
 					const SAME_OPTION = "是同款，纳入样本";
 					const DIFFERENT_OPTION = "不是同款，跳过";
 					const STOP_OPTION = "停止确认，用已纳入的样本计算";
@@ -1981,7 +1982,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 							{ timeout: 60_000 },
 						);
 						if (choice === undefined) {
-							const summary = `同款确认中断（已纳入 ${accepted.length} 条），参考成本未写入、确认单未清；可重新 compass_gaps action=convert 继续`;
+							const summary = `同款确认中断（已纳入 ${accepted.length} 条），参考成本未写入、确认单未清。确认单自 approve 起 10 分钟内有效，在这之内可以重新 compass_gaps action=convert；重跑从第 1 条重新确认，已纳入的不保留。过期就得重新 approve 并再调 1 次（会再花钱）`;
 							return textResult(summary, details({ title: "参考成本", status: "info", summary }));
 						}
 						if (choice === STOP_OPTION) break;
@@ -2000,17 +2001,26 @@ export default function compassExtension(pi: ExtensionAPI): void {
 					const warnings = [...computation.warnings];
 					const fxAgeDays = Math.floor((Date.now() - Date.parse(fx.asOf)) / 86_400_000);
 					if (Number.isFinite(fxAgeDays) && fxAgeDays > COST_REFERENCE_FX_STALE_DAYS) warnings.push(`汇率已超过 ${COST_REFERENCE_FX_STALE_DAYS} 天未更新（口径日 ${fx.asOf}）`);
+					// 推导式按 method 分叉：min 分支换算用的是最小价，照 medianCny 拼会给运营看一条不成立的
+					// 等式（样本恰 2 条且两价不同时两边差得最明显），而弹窗标题只报「警告 N 条」不报正文，
+					// 「按最小值计」那句在标题上看不见。median 分支的串**逐字不动**：C41 与 follower 的
+					// 存在性断言都钉着它。两处展示共用这一个串（2026-09-09 交付评审 N-1）
+					const equation =
+						computation.method === "min"
+							? `最小价 ¥${computation.baseCny.toFixed(2)} × ${computation.coefficient} = ¥${computation.referenceCostCny.toFixed(2)}（${COST_REFERENCE_TEXT.smallSample}）`
+							: `¥${computation.medianCny.toFixed(2)} × ${computation.coefficient} = ¥${computation.referenceCostCny.toFixed(2)}`;
 					// 最终确认：写不写、写多深由运营定。「更新利润测算」只在该市场已有测算时提供——克隆的是它的其余输入
 					const WRITE_AND_UPDATE = "写入参考成本并更新利润测算";
 					const SAVE_ONLY = "只保存参考成本";
 					const hasEstimate = latestProfitEstimate(store, ticket.marketId) !== undefined;
 					const finalChoice = await ctx.ui.select(
-						`参考成本 ¥${computation.medianCny.toFixed(2)} × ${computation.coefficient} = ¥${computation.referenceCostCny.toFixed(2)} → ${currency} ${computation.referenceCost.toFixed(4)}（汇率 ${fxRate}@${fx.asOf}）· 样本 ${computation.sampleSize}（零销量 ${computation.zeroSalesCount}）· 警告 ${warnings.length} 条`,
+						`参考成本 ${equation} → ${currency} ${computation.referenceCost.toFixed(4)}（汇率 ${fxRate}@${fx.asOf}）· 样本 ${computation.sampleSize}（零销量 ${computation.zeroSalesCount}）· 警告 ${warnings.length} 条`,
 						[...(hasEstimate ? [WRITE_AND_UPDATE] : []), SAVE_ONLY, "取消"],
 						{ timeout: 60_000 },
 					);
 					if (finalChoice !== WRITE_AND_UPDATE && finalChoice !== SAVE_ONLY) {
-						const summary = finalChoice === undefined ? "确认超时或已取消，参考成本未写入、确认单未清；可重新 convert" : "已取消，参考成本未写入、确认单未清；可重新 convert";
+						const retryHint = "确认单自 approve 起 10 分钟内有效，在这之内可以重新 convert（从第 1 条重新确认）；过期就得重新 approve 并再调 1 次（会再花钱）";
+						const summary = finalChoice === undefined ? `确认超时或已取消，参考成本未写入、确认单未清。${retryHint}` : `已取消，参考成本未写入、确认单未清。${retryHint}`;
 						return textResult(summary, details({ title: "参考成本", status: "info", summary }));
 					}
 					const actor = actorName();
@@ -2069,7 +2079,7 @@ export default function compassExtension(pi: ExtensionAPI): void {
 						(sample) =>
 							`${sample.productId} · ${sample.priceField === "tier_median" ? `阶梯中位（${sample.tierCount} 档）` : "头价"} ¥${sample.priceCny.toFixed(2)} · 30 天销量 ${sample.salesOf30d}${sample.zeroSales ? "（零销量补位）" : ""}${sample.url ? ` · ${sample.url}` : ""}`,
 					);
-					const summary = `1688 参考成本：¥${computation.medianCny.toFixed(2)} × ${computation.coefficient} = ¥${computation.referenceCostCny.toFixed(2)} → ${currency} ${computation.referenceCost.toFixed(4)}（汇率 ${fxRate}@${fx.asOf}）· 样本 ${computation.sampleSize}（零销量 ${computation.zeroSalesCount}，否 ${rejected}）`;
+					const summary = `1688 参考成本：${equation} → ${currency} ${computation.referenceCost.toFixed(4)}（汇率 ${fxRate}@${fx.asOf}）· 样本 ${computation.sampleSize}（零销量 ${computation.zeroSalesCount}，否 ${rejected}）`;
 					const lines = [
 						...sampleLines,
 						...warnings.map((warning) => `警告：${warning}`),

@@ -66,6 +66,12 @@ export interface CostReferenceComputation {
 	method: "median" | "min";
 	/** 纳入样本价格升序后的中位数（偶数取均值），只作展示与极小值判据 */
 	medianCny: number;
+	/**
+	 * 换算真正用的基数：median 分支即中位数，min 分支是纳入样本的最小价。
+	 * 展示层按 `method` 拼「¥基数 × 系数 = ¥结果」时读它——从 `medianCny` 反推会在 min 分支
+	 * 得到一条不成立的等式（2026-09-09 交付评审 N-1）。
+	 */
+	baseCny: number;
 	referenceCostCny: number;
 	referenceCost: number;
 	coefficient: number;
@@ -215,6 +221,7 @@ export function computeCostReference(accepted: readonly CandidateRow[], options:
 	return {
 		method,
 		medianCny: round4(pivot),
+		baseCny: round4(base),
 		referenceCostCny,
 		referenceCost: round4(referenceCostCny * options.fxRate),
 		coefficient,

@@ -162,6 +162,24 @@ test("参考成本·样本量 0：不出数", () => {
 	assert.equal(computeCostReference([], FX), null);
 });
 
+test("参考成本·换算基数 baseCny：median 分支等于中位数，min 分支等于最小价，两个分支都满足 base × 系数 = 结果", () => {
+	// 展示层要按 method 拼「¥基数 × 系数 = ¥结果」，基数必须由这里给出——从 medianCny 反推在
+	// min 分支会得到一条不成立的等式（评审 N-1：样本恰 2 条且两价不同时，等号两边差约 5%）
+	const round4 = (value: number) => Math.round(value * 10_000) / 10_000;
+	const median = computeCostReference([candidate(1, 9), candidate(2, 3), candidate(3, 7)], FX);
+	assert.ok(median);
+	assert.equal(median.method, "median");
+	assert.equal(median.baseCny, median.medianCny, "median 分支的基数就是中位数");
+	assert.equal(median.referenceCostCny, round4(median.baseCny * median.coefficient));
+
+	const min = computeCostReference([candidate(1, 9), candidate(2, 3)], FX);
+	assert.ok(min);
+	assert.equal(min.method, "min");
+	assert.equal(min.baseCny, 3, "min 分支的基数是纳入样本的最小价");
+	assert.notEqual(min.baseCny, min.medianCny, "两价不同时基数与中位数必然不等——正是展示式对不上的那种输入");
+	assert.equal(min.referenceCostCny, round4(min.baseCny * min.coefficient));
+});
+
 // ── 极小值防线 ───────────────────────────────────────────────────────────────
 
 test("参考成本·极小值：最小价低于中位价一半时告警，正常分布不告警", () => {

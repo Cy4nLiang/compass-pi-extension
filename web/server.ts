@@ -155,6 +155,23 @@ function assertLocalHost(request: IncomingMessage): void {
 	if (!host || !LOOPBACK_HOST.test(host)) throw new HttpError(403, "罗盘工作台仅接受来自本机的访问");
 }
 
+// 只读端点允许**本机其它端口**的页面跨源读取：Origin 是回环时回 Access-Control-Allow-Origin（逐请求回显，不用 *）。
+// 与上面「本机任意端口的 Origin 都放行」是同一条安全模型；写端点不受影响——跨源 JSON POST 会先发预检，
+// 本服务不处理 OPTIONS、不回 Allow-Methods，预检必然失败，且 assertSameOrigin 仍在。非回环 Origin 一个头都不给。
+function allowLoopbackOriginRead(request: IncomingMessage, response: ServerResponse): void {
+	const origin = request.headers.origin;
+	if (!origin) return;
+	let originHost: string;
+	try {
+		originHost = new URL(origin).host;
+	} catch {
+		return;
+	}
+	if (!LOOPBACK_HOST.test(originHost)) return;
+	response.setHeader("access-control-allow-origin", origin);
+	response.setHeader("vary", "origin");
+}
+
 // 写端点额外挡跨站：Content-Type 为 text/plain 的跨站 POST 不触发预检，
 // 靠 Origin 判定；无 Origin（curl/脚本）放行，浏览器的非安全方法必带 Origin。
 function assertSameOrigin(request: IncomingMessage): void {
@@ -426,6 +443,7 @@ export async function startCompassWebServer(options: CompassWebServerOptions): P
 
 	async function handleApi(request: IncomingMessage, response: ServerResponse, method: string, pathname: string): Promise<void> {
 		assertLocalHost(request);
+		if (method === "GET") allowLoopbackOriginRead(request, response);
 		if (pathname === "/api/health") {
 			if (method !== "GET") throw new HttpError(405, `该接口只支持 GET：${pathname}`);
 			sendJson(response, 200, { ok: true, data: { status: "ok" }, meta: { generatedAt: new Date().toISOString() } });

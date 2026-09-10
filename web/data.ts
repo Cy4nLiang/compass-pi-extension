@@ -1,4 +1,4 @@
-import { FRESHNESS_LABELS, purchaseCostSourceLabel, snapshotFreshness, snapshotNeedsRefresh, type SnapshotFreshness } from "../defaults.ts";
+import { compareSnapshotRecencyDesc, FRESHNESS_LABELS, purchaseCostSourceLabel, snapshotFreshness, snapshotNeedsRefresh, type SnapshotFreshness } from "../defaults.ts";
 import { outcomeStatistics } from "../history.ts";
 import { confidenceLabel, DIMENSIONS, formatMetric, METRIC_LABELS, outcomeLabel } from "../report.ts";
 import {
@@ -9,6 +9,7 @@ import {
 	evaluateMarketWithoutPersisting,
 	findMarket,
 	gateDefaultsLine,
+	importHistoryNote,
 	latestSnapshotIfPresent,
 	listPoolCandidates,
 	listRetroDue,
@@ -438,6 +439,13 @@ export function marketDossierData(store: CompassStore, reference: string, now = 
 			: null,
 		evaluation,
 		metricSections,
+		// 本市场全部快照（最新在前，≤10）与「快照对照」行：抽屉 / 档案页展示来源与上一次快照的变化，复用工具结果尾注同一个函数
+		snapshots: store.snapshots
+			.filter((item) => item.marketId === market.id)
+			.sort(compareSnapshotRecencyDesc)
+			.slice(0, 10)
+			.map((item) => ({ id: item.id, source: item.source, capturedAt: item.capturedAt, importedAt: item.importedAt, rowCount: item.rowCount })),
+		history: snapshot ? importHistoryNote(store, market.id, snapshot.id) : [],
 		divergences: metricDivergences(store, market.id).map((item) => ({
 			metric: item.metric,
 			label: metricLabel(item.metric, units),

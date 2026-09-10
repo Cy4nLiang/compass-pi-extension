@@ -439,3 +439,26 @@ test("pool candidate detail profit summary carries purchaseCostSource and the co
 	// 无测算时 profitSummary 仍是 null（既有钉子）
 	assert.equal(poolCandidateData(store, "stale market").profitSummary, null);
 });
+
+test("market dossier lists the market's snapshots newest first and carries the snapshot-comparison history line", async () => {
+	const store = await seededStore();
+	const first = marketDossierData(store, "fresh market", NOW);
+	assert.equal(first.snapshots.length, 1);
+	assert.equal(first.snapshots[0].id, first.snapshot?.id);
+	assert.deepEqual(Object.keys(first.snapshots[0]).sort(), ["capturedAt", "id", "importedAt", "rowCount", "source"]);
+	assert.deepEqual(first.history, [], "只有一份快照时没有对照行");
+	// 再导一份更新的快照：列表最新在前，history 出现「快照对照 旧→新」
+	const csv = await readFile(join(here, "../examples/demo-market.csv"), "utf8");
+	const newer = parseMarketCsv(csv, { source: "sellersprite", capturedAt: "2026-08-26T00:00:00.000Z" });
+	importMarketAndScreen(store, { marketName: "fresh market", parsed: newer, capturedAt: "2026-08-26T00:00:00.000Z", actor: "tester", runScreen: true });
+	const second = marketDossierData(store, "fresh market", NOW);
+	assert.equal(second.snapshots.length, 2);
+	assert.equal(second.snapshots[0].capturedAt, "2026-08-26T00:00:00.000Z");
+	assert.equal(second.snapshots[1].capturedAt, "2026-08-24T00:00:00.000Z");
+	assert.ok(second.history.every((line) => typeof line === "string"));
+	// 只有线索、没有快照的市场：两个字段都是空数组，不是 null
+	createLead(store, { marketName: "lead only market", actor: "tester" });
+	const empty = marketDossierData(store, "lead only market", NOW);
+	assert.deepEqual(empty.snapshots, []);
+	assert.deepEqual(empty.history, []);
+});

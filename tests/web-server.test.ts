@@ -829,3 +829,32 @@ test("找不到实体的错误按类型判 404，与错误文案里的关键词�
 		await teardown(root, server);
 	}
 });
+
+// 只读端点对本机其它端口的页面开放跨源读取（同一条「本机单用户」安全模型）：
+// 回环 Origin 的 GET 回显 Access-Control-Allow-Origin；非回环一个头都不给；写端点不受影响（预检不处理、Origin 判据仍在）。
+test("read endpoints echo Access-Control-Allow-Origin for loopback origins only, writes stay same-origin", async () => {
+	const { root, server } = await setupProject({ seed: true });
+	try {
+		const loopback = await fetch(`${server.url}/api/todos`, { headers: { origin: "http://127.0.0.1:4790" } });
+		assert.equal(loopback.status, 200);
+		assert.equal(loopback.headers.get("access-control-allow-origin"), "http://127.0.0.1:4790", "回环 Origin 逐请求回显，不用 *");
+		assert.equal(loopback.headers.get("vary"), "origin");
+		const localhost = await fetch(`${server.url}/api/health`, { headers: { origin: "http://localhost:3000" } });
+		assert.equal(localhost.headers.get("access-control-allow-origin"), "http://localhost:3000");
+		const evil = await fetch(`${server.url}/api/todos`, { headers: { origin: "https://evil.example" } });
+		assert.equal(evil.status, 200, "非回环 Origin 的 GET 本身照常（同源策略由浏览器执行）");
+		assert.equal(evil.headers.get("access-control-allow-origin"), null, "非回环 Origin 不给 CORS 头");
+		const noOrigin = await fetch(`${server.url}/api/todos`);
+		assert.equal(noOrigin.headers.get("access-control-allow-origin"), null, "无 Origin 不给头");
+		// 跨源 JSON 写会先发预检：本服务不处理 OPTIONS，预检拿不到任何 CORS 头
+		const preflight = await fetch(`${server.url}/api/pool/decide`, { method: "OPTIONS", headers: { origin: "http://127.0.0.1:4790", "access-control-request-method": "POST" } });
+		assert.notEqual(preflight.status, 200);
+		assert.equal(preflight.headers.get("access-control-allow-origin"), null, "写端点的预检不回 CORS 头");
+		assert.equal(preflight.headers.get("access-control-allow-methods"), null);
+		// 回环 Origin 的 POST 也不带 CORS 头（Origin 判据放行是另一回事）
+		const post = await fetch(`${server.url}/api/pool/decide`, { method: "POST", headers: { "content-type": "application/json", origin: "http://127.0.0.1:4790" }, body: "{}" });
+		assert.equal(post.headers.get("access-control-allow-origin"), null, "写端点不回 CORS 头");
+	} finally {
+		await teardown(root, server);
+	}
+});

@@ -210,6 +210,15 @@ function actorName(explicit?: string): string {
 	return explicit?.trim() || process.env.USER || process.env.USERNAME || "pi-user";
 }
 
+/**
+ * 花钱的动作（补数确认、1688 逐条同款确认）只在「能当面确认」的会话里放行：
+ * TUI，或宿主进程显式声明 COMPASS_CONFIRM_HOST=chat 的 rpc 会话（宿主替运营把弹窗画到浏览器里）。
+ * 这是声明不是凭据——谁都能设；它的价值在于 print / json 与未声明的 rpc（脚本、CI）默认被拒。
+ */
+function canConfirmInPerson(ctx: Pick<ExtensionContext, "mode">): boolean {
+	return ctx.mode === "tui" || (ctx.mode === "rpc" && process.env.COMPASS_CONFIRM_HOST === "chat");
+}
+
 function details(input: Omit<CompassDetails, "kind">): CompassDetails {
 	return { kind: TOOL_DETAILS_KIND, ...input };
 }
@@ -1690,8 +1699,8 @@ export default function compassExtension(pi: ExtensionAPI): void {
 				// 注意这个顺序只覆盖**本分支内部**：`findMarket` 在 execute 顶部、所有 action 分支
 				// 之前就跑了，所以 market_ref 写错时先报的是「未找到市场」而不是 mode 拒绝。
 				// 那不是 bug（假 ref 本来就该报错），但别把 mode 当成第一道门。
-				if (!ctx.hasUI) throw new Error("compass_gaps action=approve 要当面确认，而当前会话没有 UI（print / json 模式）。请在 pi 的 TUI 里执行。");
-				if (ctx.mode !== "tui") throw new Error(`compass_gaps action=approve 只在 TUI 会话里放行（当前 mode=${ctx.mode}）：花钱的动作要运营本人在终端上按下确认。`);
+				if (!ctx.hasUI) throw new Error("compass_gaps action=approve 要当面确认，而当前会话没有 UI（print / json 模式）。请在能弹出确认的会话里执行。");
+				if (!canConfirmInPerson(ctx)) throw new Error(`compass_gaps action=approve 只在能当面确认的会话里放行（当前 mode=${ctx.mode}）：花钱的动作要运营本人按下确认。`);
 				if (!market) throw new Error("compass_gaps action=approve 需要 market_ref（先用 action=plan 看这个市场缺什么）");
 
 				// 映射表先校验：3 次调用花出去之后才发现映射表坏了，点数是要不回来的
@@ -1925,9 +1934,9 @@ export default function compassExtension(pi: ExtensionAPI): void {
 					}));
 				}
 				if (ticket.kind === "cost_reference") {
-					// 逐条同款确认要当面按键，与 approve 同一道 TUI 门
-					if (!ctx.hasUI) throw new Error("1688 参考成本的转换要逐条当面确认同款，而当前会话没有 UI（print / json 模式）。请在 pi 的 TUI 里执行。");
-					if (ctx.mode !== "tui") throw new Error(`1688 参考成本的转换只在 TUI 会话里放行（当前 mode=${ctx.mode}）：同款要运营本人逐条确认。`);
+					// 逐条同款确认要当面按键，与 approve 同一道门
+					if (!ctx.hasUI) throw new Error("1688 参考成本的转换要逐条当面确认同款，而当前会话没有 UI（print / json 模式）。请在能弹出确认的会话里执行。");
+					if (!canConfirmInPerson(ctx)) throw new Error(`1688 参考成本的转换只在能当面确认的会话里放行（当前 mode=${ctx.mode}）：同款要运营本人逐条确认。`);
 					const costMap = map.costReference;
 					if (!costMap) throw new Error(`补数映射表（${GAPFILL_MAP_PATH}）没有声明 cost_reference 段：无法把返回体映射成参考成本，请先在工作区补上再试。`);
 					// 只收本关键词的返回：窗口内同一工具换个词再调，返回体形状完全相同，不按关键词过滤会把别的品类混进样本

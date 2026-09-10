@@ -858,3 +858,41 @@ test("参考成本 ④：approve 在 origin 缺省时排除参考成本链，既
 		"选链规则：任何做过手填测算的市场都会同时挂着快照链与参考成本链，不在 origin 缺省时排除后者，「A 档产物唯一」检查会把运营照旧只写 market_ref 的 approve 一律拒绝",
 	);
 });
+
+// 花钱动作的「当面确认」门（2026-09-10）：approve 与 1688 convert 两处不再硬判 mode === "tui"，
+// 改调 canConfirmInPerson（tui，或宿主声明 COMPASS_CONFIRM_HOST=chat 的 rpc）。
+// 切到**分支级**（approve 分支、convert 里的 cost_reference 分支各自切一次）：同一个工具里两处形状相同，
+// 只切到工具级会被另一处单独满足（根 CLAUDE.md 「源码切片假绿家族」第四种）。
+test("当面确认门：approve 与 cost_reference convert 各恰好一处 canConfirmInPerson(ctx)，不再裸判 mode", async () => {
+	const source = await readFile(join(repoRoot, "index.ts"), "utf8");
+	const fnStart = source.indexOf("function canConfirmInPerson(");
+	const fnEnd = source.indexOf("\n}\n", fnStart);
+	assert.ok(fnStart > 0 && fnEnd > fnStart, "找不到 canConfirmInPerson 的定义");
+	const fn = source.slice(fnStart, fnEnd);
+	assert.match(fn, /return ctx\.mode === "tui" \|\| \(ctx\.mode === "rpc" && process\.env\.COMPASS_CONFIRM_HOST === "chat"\);/u, "门的条件：tui，或 rpc + 宿主声明");
+
+	const body = toolBody(source, "compass_gaps");
+	const approveStart = body.indexOf('if (action === "approve")');
+	const convertStart = body.indexOf('if (action === "convert")', approveStart);
+	assert.ok(approveStart > 0 && convertStart > approveStart, "抽不到 approve / convert 分支——切片已失效");
+	const approve = body.slice(approveStart, convertStart);
+	const gateLines = (text: string) => text.split("\n").filter((line) => line.includes("canConfirmInPerson(ctx)"));
+	assert.equal(gateLines(approve).length, 1, "approve 分支恰好一处 canConfirmInPerson(ctx)");
+	assert.match(approve, /if \(!canConfirmInPerson\(ctx\)\) throw new Error\(`compass_gaps action=approve 只在能当面确认的会话里放行（当前 mode=\$\{ctx\.mode\}）：花钱的动作要运营本人按下确认。`\);/u, "approve 拒绝文案不含宿主名词");
+	assert.doesNotMatch(approve, /ctx\.mode !== "tui"/u, "approve 分支不得再裸判 mode");
+	// hasUI 门仍在前：没有 UI 的会话（print / json）先被它挡下
+	assert.ok(approve.indexOf("if (!ctx.hasUI)") < approve.indexOf("canConfirmInPerson(ctx)"), "hasUI 门在当面确认门之前");
+
+	const convert = body.slice(convertStart);
+	const costStart = convert.indexOf('if (ticket.kind === "cost_reference")');
+	assert.ok(costStart > 0, "抽不到 convert 的 cost_reference 分支——切片已失效");
+	const costEnd = convert.indexOf("const costMap = map.costReference;", costStart);
+	assert.ok(costEnd > costStart, "cost_reference 分支的门应在读映射之前");
+	const costGate = convert.slice(costStart, costEnd);
+	assert.equal(gateLines(costGate).length, 1, "cost_reference 分支恰好一处 canConfirmInPerson(ctx)");
+	assert.match(costGate, /if \(!canConfirmInPerson\(ctx\)\) throw new Error\(`1688 参考成本的转换只在能当面确认的会话里放行（当前 mode=\$\{ctx\.mode\}）：同款要运营本人逐条确认。`\);/u, "convert 拒绝文案不含宿主名词");
+	assert.doesNotMatch(convert, /ctx\.mode !== "tui"/u, "convert 分支不得再裸判 mode");
+	// 整个工具块里只有这两处调用；别处（例如 list / plan）不得挂这道门
+	assert.equal(gateLines(body).length, 2, "compass_gaps 里 canConfirmInPerson(ctx) 恰好两处");
+	for (const forbidden of ["对话台", "TUI 会话里放行", "在终端上按下"]) assert.equal(body.includes(forbidden), false, `拒绝文案不得出现「${forbidden}」`);
+});

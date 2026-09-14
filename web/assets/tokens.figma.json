@@ -1,0 +1,40 @@
+{
+	"_readme": "Figma 暗色工作台 Color 集合快照（纯色值），与 style.css 的 :root 同名同值；由 tests/web-tokens.test.ts 守着，刷新 = 从 Figma 回读变量后重写本文件。",
+	"file": {
+		"key": "6fSw84YOQZswY0lGC7BmnO",
+		"collection": "VariableCollectionId:2:2",
+		"modes": {
+			"dark": "2:0"
+		},
+		"readAt": "2026-09-13"
+	},
+	"dark": {
+		"--c-bg": "#0e1216",
+		"--c-bg-header": "#11161c",
+		"--c-bg-strip": "#0b0f13",
+		"--c-bg-panel": "#151b22",
+		"--c-border": "#232c36",
+		"--c-divider": "#1a222b",
+		"--c-sep": "#3a4653",
+		"--c-pipeline-off": "#2a333e",
+		"--c-text": "#dce3ea",
+		"--c-text-secondary": "#8b98a5",
+		"--c-text-muted": "#74828f",
+		"--c-accent": "#e2a33e",
+		"--c-accent-hover": "#f0bc66",
+		"--c-accent-ink": "#0e1216",
+		"--c-success": "#4cc38a",
+		"--c-warning": "#e5b567",
+		"--c-error": "#e5534b",
+		"--c-info": "#7ea6d9",
+		"--c-focus": "#dce3ea",
+		"--c-tier-a-bg": "#241c0e",
+		"--c-tier-a-border": "#5a4620",
+		"--c-tier-b-bg": "#111a24",
+		"--c-tier-b-border": "#2b3d52"
+	},
+	"scale": {
+		"--radius": "6px",
+		"--radius-sm": "4px"
+	}
+}

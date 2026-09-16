@@ -255,6 +255,15 @@ test("README 工具表覆盖全部对外工具", async () => {
 	}
 });
 
+test("无快照路由走 planNoSnapshotDataRoute，不得让人干等 7 天待办", async () => {
+	const source = await readFile(join(repoRoot, "index.ts"), "utf8");
+	const body = toolBody(source, "compass_data_route");
+	assert.match(body, /planNoSnapshotDataRoute\(/u, "无快照分支必须复用 gaps.ts 的计划函数，不要在 index.ts 另写一份");
+	assert.match(body, /sorftimeApproveReady\(/u, "A 档推荐必须与 hasEffectiveLimit 对齐，不能只用 available()");
+	assert.doesNotMatch(body, /等「建卡后仍无快照」待办派生/u, "待办 7 天宽限不是补数门槛");
+	assert.doesNotMatch(body, /function available\s*\(/u, "局部 available() 会把默认无上限池误报成可 approve");
+});
+
 // 五个写工具的 execute：按「name: "<tool>"」切到下一个 registerTool 块为止。
 // 用位置断言而不是 grep 计数——计数是「可以被悄悄删掉一处而不报警的量」
 const GAP_NOTE_WRITE_TOOLS = [

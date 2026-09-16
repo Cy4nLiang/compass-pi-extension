@@ -39,9 +39,10 @@ pi
 
 ```text
 导入这个卖家精灵 CSV，按精铺日均10单模板粗筛，然后做利润测算并出报告。
+查这个商品，用 sorftime 拉实时数据。
 ```
 
-Agent 会先调用 `compass_tools`，按需动态激活相关工具。
+Agent 会先调用 `compass_tools`，按需动态激活相关工具。查商品 / listing 会激活 `compass_gaps` 与 `compass_data_route`，不会因为「第一次」就假装 sorftime MCP 不可用。默认 guided 档下单次商品查询可直连 MCP（自动计量）；完整快照仍要 `compass_gaps approve` 当面确认。无快照时不必等 7 天「建卡后仍无快照」待办。
 
 ## 工具
 

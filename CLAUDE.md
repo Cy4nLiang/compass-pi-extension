@@ -6,6 +6,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 罗盘 Compass：pi coding agent 的项目级 Extension（纯 TypeScript，无构建步骤），把 Amazon US 精铺选品工作流落进终端。入口由 `package.json` 的 `pi.extensions: ["./index.ts"]` 声明，pi 宿主直接加载 TS 源码（Node type stripping）；本仓库被 clone 到使用方项目的 `.pi/extensions/compass/` 下生效。
 
+## Git 隔离
+
+- 改文件前执行 `git branch --show-current`。若是 `main` 或 `release/*`，停下来，开 `feat/` / `fix/` / `chore/` worktree。禁止在 `main` 上编辑或 commit。主检出只 pull / 看 PR / 打 tag。
+- 一个会话只操作一个 worktree，不要 `git -C` 去另一个检出。
+- 禁止 `git stash`（用 WIP commit）。禁止 `git push --force`（功能分支允许 `--force-with-lease`）。禁止 `git push --tags`。
+- 进 `origin/main` 必须走 PR：`gh pr create --base main`。不要直接 `git push origin HEAD` 到 `main`。
+- 允许合入的分支前缀：`feat/` `fix/` `chore/` `docs/` `refactor/` `test/` `perf/` `ci/`。不要用 `spike/*` 或 `worktree-*` 开 PR。
+- 发版用 annotated tag：候选 `vX.Y.Z-beta.N`，正式 `vX.Y.Z` 必须打在某个已存在 beta 的**同一 commit**。不要把前缀改成 `-rc.`。一次只推一个 tag。
+- Worktree 建在 clone 外面，不要建在父项目的 `.claude/worktrees/` 里。对父仓库做 `git worktree add` 隔离不到本仓库；必须对本仓库自己 `worktree add`。
+- 本地 hook：`.githooks/pre-push`（`core.hooksPath` 指向该目录）。拒绝直推 `main` / `release/*`，拒绝删除 `v*` tag。
+
 ## 常用命令
 
 ```bash

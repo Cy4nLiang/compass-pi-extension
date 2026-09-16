@@ -6,6 +6,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 罗盘 Compass：pi coding agent 的项目级 Extension（纯 TypeScript，无构建步骤），把 Amazon US 精铺选品工作流落进终端。入口由 `package.json` 的 `pi.extensions: ["./index.ts"]` 声明，pi 宿主直接加载 TS 源码（Node type stripping）；本仓库被 clone 到使用方项目的 `.pi/extensions/compass/` 下生效。
 
+## Git 隔离
+
+主检出停在 `main`，只 pull / 看 PR / 打 tag。正式改动开短分支 worktree（`feat/` `fix/` `chore/`），进 `origin/main` 走 PR，不要直推 `main`。禁止 `git stash`、`git push --force`、`git push --tags`。候选 tag 继续 `vX.Y.Z-beta.N`，正式版打在同一 commit；不要改成 `-rc.`。对父项目 `git worktree add` 隔离不到本仓库。细则见 `AGENTS.md`；可选本地 hook 见 `.githooks/pre-push`。
+
 ## 常用命令
 
 ```bash

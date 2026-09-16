@@ -11,6 +11,9 @@ import {
 	RISK_CONTEXT_METRICS,
 	deriveGaps,
 	hasEffectiveLimit,
+	planNoSnapshotDataRoute,
+	sorftimeApproveReady,
+	sorftimeLiveWithoutLimit,
 	diffGaps,
 	gapActionLine,
 	gapLabel,
@@ -503,10 +506,35 @@ test("快照过期缺口的 TTL 跟 todo 的固定 30 天，不用 stage TTL", (
 	const gap = derive(store).find((item) => item.origin === "todo_snapshot_stale");
 	assert.ok(gap, "125 天前的快照必然浮出 snapshot_stale");
 	assert.equal(gap.ttlDays, 30, "与 todo.ts 的判据同口径，不能写 deep_research 的 7 天");
+	assert.equal(gap.autoTier, "C_auto", "已有快照过期仍优先重导 CSV，不能因为无快照那条改动把过期也打成 A 档");
 	assert.equal(gapTtlDays("deep_research"), 7);
 	assert.equal(gapTtlDays("decision"), 7);
 	assert.equal(gapTtlDays("review"), 1);
 	assert.equal(gapTtlDays("archived"), null);
+});
+
+test("无快照的新线索立刻产 snapshot 缺口，不等 7 天待办宽限", () => {
+	const store = baseStore();
+	addMarket(store, "mkt_demo_newlead", "demo new lead");
+	addCandidate(store, "cand_demo_newlead", "mkt_demo_newlead", "lead", { createdAt: NOW });
+	const todos = listWorkbenchTodos(store, NOW);
+	assert.equal(todos.filter((todo) => todo.kind === "snapshot_stale").length, 0, "待办仍有 7 天宽限，刚建卡不该催 CSV");
+	const gap = derive(store, { now: NOW, budgets: [SORFTIME_CONFIGURED] }).find((item) => item.field === "snapshot");
+	assert.ok(gap, "无快照当天就要能 approve，不能把待办宽限当成补数门槛");
+	assert.equal(gap.origin, "todo_snapshot_stale");
+	assert.equal(gap.autoTier, "A_confirm");
+	assert.equal(gap.sources.find((option) => option.source === "manual_csv")?.auto, "partial", "没有可重导的快照时 C 档不能是 auto=yes，否则 approve 永远收不到这条");
+	assert.match(gap.reason, /尚无市场快照/u);
+	assert.equal(gap.todoId, undefined, "缺口可以没有对应待办");
+});
+
+test("无快照且 sorftime 未配上限时 snapshot 缺口降为 manual，不是假 A 档", () => {
+	const store = baseStore();
+	addMarket(store, "mkt_demo_nolimit", "demo no limit");
+	addCandidate(store, "cand_demo_nolimit", "mkt_demo_nolimit", "lead", { createdAt: NOW });
+	const gap = derive(store, { now: NOW, budgets: [SORFTIME_UNCONFIGURED] }).find((item) => item.field === "snapshot");
+	assert.ok(gap);
+	assert.equal(gap.autoTier, "manual", "默认 ¥0 无上限不能算 A_confirm，否则 approve 会报没有 A 档缺口");
 });
 
 test("archived 候选不产任何缺口", () => {
@@ -920,4 +948,36 @@ test("hasEffectiveLimit：只配金额上限而单价缺省 = 等于没配（两
 	// approve 里那段 state === "free" 的拒绝因此不可达——这条断言把那个前提钉住，
 	// 哪天 limitConfigured 放宽到「只看金额上限」，它会先红
 	assert.equal(hasEffectiveLimit({ ...base, monthlyLimitCny: 500 }), false, "金额上限单独成立时 state 已离开 free，但这里必须仍是 false，否则 approve 的 free 分支会变成可达而无人测");
+});
+
+test("planNoSnapshotDataRoute：立刻给 approve 或先配上限，不等 7 天待办", () => {
+	const fused: GapBudgetPool = { source: "sorftime", tier: "A", enabled: true, monthlyLimitCny: 0, monthlyCallLimit: 10, state: "fused" };
+	const disabled: GapBudgetPool = { source: "sorftime", tier: "A", enabled: false, monthlyLimitCny: 0, monthlyCallLimit: 10, state: "ok" };
+	const noWait = /不必等「建卡后仍无快照」待办/u;
+	const waitForTodo = /等「建卡后仍无快照」待办派生/u;
+
+	const unlimited = planNoSnapshotDataRoute({ marketId: "mkt_x", budgets: [SORFTIME_UNCONFIGURED] });
+	assert.equal(unlimited[0].startsWith("C档："), true);
+	assert.match(unlimited[1], /monthly_call_limit/u);
+	assert.match(unlimited[1], noWait);
+	assert.match(unlimited[1], /可以直接调 sorftime MCP/u);
+	assert.equal(unlimited.some((line) => waitForTodo.test(line)), false);
+
+	const ready = planNoSnapshotDataRoute({ marketId: "mkt_x", budgets: [SORFTIME_CONFIGURED] });
+	assert.match(ready[1], /compass_gaps action=approve market_ref=mkt_x/u);
+	assert.match(ready[1], noWait);
+	assert.match(ready[1], /可以直接调 sorftime MCP/u);
+
+	const down = planNoSnapshotDataRoute({ marketId: "mkt_x", budgets: [fused] });
+	assert.match(down[1], /预算不可用/u);
+	assert.equal(planNoSnapshotDataRoute({ marketId: "mkt_x", budgets: [disabled] })[1], down[1]);
+});
+
+test("sorftimeApproveReady 与 LiveWithoutLimit 互斥，对齐 approve 能否发出确认单", () => {
+	assert.equal(sorftimeApproveReady([SORFTIME_CONFIGURED]), true);
+	assert.equal(sorftimeLiveWithoutLimit([SORFTIME_CONFIGURED]), false);
+	assert.equal(sorftimeApproveReady([SORFTIME_UNCONFIGURED]), false);
+	assert.equal(sorftimeLiveWithoutLimit([SORFTIME_UNCONFIGURED]), true);
+	assert.equal(sorftimeApproveReady(undefined), false);
+	assert.equal(sorftimeLiveWithoutLimit([]), false);
 });

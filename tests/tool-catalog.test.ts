@@ -27,6 +27,10 @@ const GOLDEN: Array<{ query: string; expected: DomainToolName }> = [
 	{ query: "关键词搜索量趋势", expected: "compass_keyword_metrics" },
 	{ query: "数据新鲜度不够要补数", expected: "compass_data_route" },
 	{ query: "缺口清单", expected: "compass_gaps" },
+	{ query: "查这个商品", expected: "compass_gaps" },
+	{ query: "用sorftime查商品", expected: "compass_gaps" },
+	{ query: "ProductResearch", expected: "compass_gaps" },
+	{ query: "拉listing", expected: "compass_data_route" },
 	{ query: "相似市场的经验教训", expected: "compass_history" },
 	{ query: "执行到期复盘录实绩", expected: "compass_retro" },
 ];
@@ -45,6 +49,17 @@ test("命中为空时退回入口工具，而不是给一张空表（M169）", (
 	const ranked = rankTools("今天天气怎么样").matches;
 	assert.deepEqual(ranked.map((item) => item.name), [...FALLBACK_TOOLS]);
 	for (const item of ranked) assert.equal(item.score, 0, "兜底结果不该伪装成有分数的命中");
+});
+
+test("第一次查商品不能落入兜底入口：要能激活补数而不是假装 MCP 不可用", () => {
+	for (const query of ["查这个商品", "用sorftime查商品", "ProductResearch", "listing", "拉listing"]) {
+		const result = rankTools(query);
+		assert.equal(result.fallback, false, `「${query}」不应落入 FALLBACK`);
+		const names = result.matches.map((item) => item.name);
+		assert.ok(names.includes("compass_gaps") || names.includes("compass_data_route"), `「${query}」应激活 compass_gaps 或 compass_data_route，实际：${names.join(" ")}`);
+	}
+	const withSorftime = rankTools("用sorftime查商品").matches.map((item) => item.name);
+	assert.ok(withSorftime.indexOf("compass_gaps") < withSorftime.indexOf("compass_import_csv"), "「用sorftime查商品」应优先补数而不是 CSV 导入");
 });
 
 test("catalog 与 DOMAIN_TOOLS 一一对应，没有孤儿条目（M168）", () => {

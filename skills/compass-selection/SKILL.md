@@ -60,6 +60,11 @@ description: Amazon US 中小卖家精铺选品工作流。用于市场 CSV 导�
 
 需要补数时先调用 `compass_data_route`，不要无节制调用付费源。ASIN/关键词窄历史可用 `compass_asin_history` 与 `compass_keyword_metrics`；全局时间线、相似市场、决策检索、复盘台账和经验卡统一用 `compass_history`。这些工具只读取本地快照，不会联网，也不要绕过它们直接读取 `.pi/compass/store.json`。
 
+**第一次查商品不要干等、也不要假装 MCP 不可用：**
+
+- 无快照时 C 档仍是官方导出 CSV；若运营要立刻用 Sorftime，**不必等「建卡后仍无快照」那条 7 天待办**（待办宽限只是少打扰，不是补数门槛）。配了 `monthly_call_limit`（或金额+单价）后立刻 `compass_gaps action=approve`；默认池没配上限时 approve 发不出确认单，先 `compass_budget configure source=sorftime monthly_call_limit=<次数>`。
+- 默认 `/compass-fill guided` 不硬拦 MCP：用户明确要查某个商品 / ASIN / listing 时，**可以直接调 sorftime MCP**（自动计量）。完整快照、差评材料、1688 参考成本仍必须走 approve。`/compass-fill strict` 才会把未持确认单的付费调用一律拦住。
+
 ### 3. 产品力与差评
 
 对 Top10 竞品的 1–3 星评论聚类：质量、尺寸、运输损坏、期望落差、使用困惑、其他。每个主题标记可改良性：
@@ -104,14 +109,14 @@ description: Amazon US 中小卖家精铺选品工作流。用于市场 CSV 导�
 ## 补数缺口与补数纪律
 
 - `compass_gaps list` 给缺口清单（按成本档分组），`compass_gaps plan market_ref=…` 给某个市场的逐条补数计划。这两个只读派生、不写库、不花钱。
-- `compass_gaps approve market_ref=…` 是**唯一会花钱的子命令**：它在能当面确认的会话里（TUI，或宿主声明了 `COMPASS_CONFIRM_HOST=chat` 的 rpc 会话）弹一次确认，运营按下确认后发一张 10 分钟有效的确认单，授权按映射表声明的链路调用付费数据源补齐这个市场的完整快照。拿到返回后用 `compass_gaps convert market_ref=…` 把返回体确定性地转成一份市场 CSV（不经模型猜数字），再照它给出的命令 `compass_import_csv` 导入。
+- `compass_gaps approve market_ref=…` 是批量补数（完整快照 / 差评 / 1688）**唯一会花钱的子命令**。它在能当面确认的会话里（TUI，或宿主声明了 `COMPASS_CONFIRM_HOST=chat` 的 rpc 会话）弹一次确认，运营按下确认后发一张 10 分钟有效的确认单。无快照的新线索**当天就可以 approve**，不必等「建卡后仍无快照」待办（那条待办有 7 天宽限，只为少打扰）。默认 sorftime 池没配次数上限时 approve 会拒绝——先 `compass_budget configure source=sorftime monthly_call_limit=<次数>`。拿到返回后用 `compass_gaps convert market_ref=…` 把返回体确定性地转成产物（不经模型猜数字），再照它给出的命令导入或派子代理。
 - **approve 之后扣了次数不等于拿到数据**：超时与中途中断同样计费。失败了就重新 approve，不要在同一张确认单里反复重试。
 - convert 有一条硬规则：listing 行与关键词行**必须同时拿到**才写文件。只拿到一份时它会拒绝并说明缺哪一边——残缺快照会让策略指标静默消失，而导入链对此零告警。
 - convert 产出的 CSV 是全英文表头，导入时**必须显式写 `source=sorftime`**（否则会被识别成通用 CSV，在同一个市场里凭空造出「多来源」）；`captured_at` 照抄 convert 给的完整时间戳（这批载荷最后一次收到返回的时刻），不要改成纯日期——纯日期按 UTC 零点解释，会被同一天早些时候导入的快照压成「旧快照」。
 - **A 档有三条链，产物不同**：快照补数（`origin` 缺省）走「approve → 按 chain 调三步 → convert 写 CSV → `compass_import_csv` 导入」；差评补数（`origin=review_evidence`）走「approve 带 `asins=` → 每 ASIN 1 次 `product_reviews` → convert 写材料文件 → `compass_dispatch` 聚类」。后者按 ASIN 计次而不是按链长，一张单最多 5 个 ASIN；调用时 `amz_site=US` 与 `review_type=Negative` 都必须显式写，漏传 `review_type` 会按服务端默认返回全量评论并照样计费，strict 档会当场拒绝。材料不进导入目录，也不能走 `compass_import_csv`。
 - **1688 参考成本链（`origin=purchase_cost_source`）**：approve 必须显式带 `origin=purchase_cost_source search_name=<中文品类词>`（`coefficient=` 可选，缺省 0.9；`origin` 缺省时这条链不会入选），确认后调 1 次 `ali1688_similar_product`（`search_name` 与确认单一致、`page` 只认 1，strict 档换词或翻页会被拦）。convert 时罗盘**逐条弹同款确认**（同一道当面确认门）（运营亲自判，你不代答、不催），按「有销量前 5 → 阶梯价中位数 → 升序取中位 × 系数 → 按 `.pi/gapfill/fx.json` 汇率换算」算出参考采购价，最终弹窗由运营选「写入并更新利润测算」（克隆上次测算的其余输入）或「只保存参考成本」。关键词要用 1688 常见的中文品类词、别直译英文标题——两个语素的词会被按字拆开匹配，销量前几名可能整批不是同款，所以运营判「不是同款」是正常结果；无结果时不出数、不写库，换词要重新 approve（再花 1 次）。样本不足 3 条取最小值并告警、零销量补位会写明条数、最低价不到中位一半提示疑似占位价——这些警告都要转述给运营。
 - **差评材料的「完整」与快照不同**：没抓到评论的 ASIN 被点名进 `missing_asins`，材料照写——差评是逐 ASIN 独立的证据，少一个不影响另一个的聚类。那几次的钱已经花了，要补就重新 approve 只批那几个，不要在同一张单里重试。
-- 三档分工：**C 档**（重导带列 CSV、查本地历史）可以直接做；**A 档**（付费数据源）必须走上面的 approve 当面确认，agent 不得自行发起；**人工**（供应商报价、官方证据链接、店铺实绩、预估星级）只能由运营给。
+- 三档分工：**C 档**（重导带列 CSV、查本地历史）可以直接做；**A 档完整快照 / 差评 / 1688**必须走上面的 approve 当面确认，agent 不得把「补一整份快照」自行发起；**人工**（供应商报价、官方证据链接、店铺实绩、预估星级）只能由运营给。默认 guided 档下，用户明确要求的**单次商品查询**可以直接调 sorftime MCP（会计量），不要先拒绝再说「必须 approve」。
 - **缺数据一律按缺数据处理**：填空模板里的 `{{占位符}}` 没拿到就留空，绝不猜数字、绝不替运营填。百分比大于 1 时换算并回显「按 0.15 记」。
 - 一轮最多问 3 个问题，选择题优先，推荐项的依据只能来自 store 里的事实（预算余量、相似市场、待办状态）；运营说「你定」就全取推荐并停止追问。
 - 成本项显示「为假设」时说的是**值等于系统默认**，不等于运营没填——落库值区分不了两者，措辞不要写成「未填」。
@@ -155,7 +160,7 @@ description: Amazon US 中小卖家精铺选品工作流。用于市场 CSV 导�
 
 - 用 `compass_budget` 记录每次付费数据成本，并尽量关联 `market_ref`；80% 告警、100% 熔断。
 - Sorftime 等 MCP 在线调用由罗盘自动计量（无需手工 record）；可用 `compass_budget configure source=sorftime cost_per_call_cny=… monthly_call_limit=…` 配置单价与次数上限（0=清除），金额或次数任一达限即熔断并拦截后续调用，池 `enabled=false` 时同样拦截，解除方式以拦截提示为准。计次口径是「请求是否已发到服务端」：成功、服务端业务错误、超时、发出后中断都算一次，认证/连接/退避/审批等未发出的失败不算。预算结算月按 **UTC 月**计（北京时间每月 1 日 08:00 整清零，1 日凌晨 0–8 点的调用仍记上月），向运营解释「次月自动恢复」时必须带上这个时刻。`mcpScript` 内部调用不计量。
-- **缺口清单本身不花钱**：`compass_gaps list` / `plan` 是只读派生。会花钱的只有 `approve`（以及它授权之后的那几次调用），而 approve 必须由运营当面按下确认（TUI 或宿主声明过的 rpc 会话）——agent 不得替运营确认，也不得把「我去补一下数据」直接变成付费调用。`/compass-fill strict` 会把这条从纪律变成硬拦截：没有确认单的付费调用一律被门禁拦下。
+- **缺口清单本身不花钱**：`compass_gaps list` / `plan` 是只读派生。会花钱的是 `approve`（以及它授权之后的那几次调用）和 guided 档下运营明确要求的单次商品 MCP。approve 必须由运营当面按下确认（TUI 或宿主声明过的 rpc 会话）——agent 不得替运营确认，也不得把「我去补一份完整快照」直接变成付费调用。`/compass-fill strict` 会把「未持确认单的付费调用」变成硬拦截；默认 guided 只提示不拦，单次商品查询可以直连 sorftime MCP。
 - **`compass_dispatch` 会把数据发出本机**：差评材料或采购口径整段发往所配置的模型供应商。这是除 MCP 取数之外唯一的出境路径，所以三条纪律硬性：只发通用事实（市场名、类目、代表商品标题、待查风险类别、取了假设值的字段名），**绝不发金额**；内部口径（找谁、按什么规则归类、谁批）不进 prompt，由你在结果**下方**本地拼接；受限共享会话一律不可用。它的 token 费**不计入** `compass_budget`（那是 MCP 次数的面），单会话 40 次、并发 2 路，超了直接拒绝。结果里出现「本次已用主会话模型」时要转述给运营——那意味着材料发给了主模型那家供应商。
 - 不做刷单、测评、跟卖等违规操作；不对外转售采集数据。
 - 优先官方 API、官方导出和用户主动触发采集。

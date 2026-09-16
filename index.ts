@@ -45,7 +45,10 @@ import {
 	diffGaps,
 	gapActionLine,
 	gapTtlDays,
+	planNoSnapshotDataRoute,
 	renderGapNote,
+	sorftimeApproveReady,
+	sorftimeLiveWithoutLimit,
 	summarizeGaps,
 	transientProfitUnpersistedGap,
 	type GapRecord,
@@ -1614,9 +1617,10 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			};
 			const fields = params.fields?.length ? params.fields : defaults[params.stage];
 			const snapshot = latestSnapshotIfPresent(store, market.id);
+			const budgets = budgetStatus(store);
 			if (!snapshot) {
-				const plan = ["C档：先从卖家精灵/Sorftime/Keepa 官方导出 CSV，经 /compass-import 导入首个快照，成本≈¥0；没有可导出的 CSV 时，等「建卡后仍无快照」待办派生出 snapshot 缺口，再用 compass_gaps action=plan / approve 走 Sorftime 完整快照（A档，approve 确认后才花钱）"];
-				const summary = `尚无快照 · 缺 ${fields.length}/${fields.length} 字段 · 先完成 C 档采集`;
+				const plan = planNoSnapshotDataRoute({ marketId: market.id, budgets });
+				const summary = `尚无快照 · 缺 ${fields.length}/${fields.length} 字段 · ${plan.length} 条路由`;
 				return textResult([summary, `market=${market.id}`, `missing=${fields.join(",")}`, ...plan].join("\n"), details({ title: "数据源路由", status: "warning", summary, lines: plan }));
 			}
 			const metrics = buildStrategyContext(store, market.id).context.metrics;
@@ -1624,20 +1628,21 @@ export default function compassExtension(pi: ExtensionAPI): void {
 			const maxAge = snapshotTtlDays(params.stage);
 			const missing = fields.filter((field) => metrics[field]?.value === undefined || metrics[field]?.value === null);
 			const stale = age > maxAge;
-			const budgets = budgetStatus(store);
-			const available = (source: string) => {
-				const pool = budgets.find((item) => item.source === source);
-				return Boolean(pool?.enabled && pool.state !== "fused");
-			};
 			const plan: string[] = [];
 			if (!stale && missing.length === 0) plan.push(`CACHE：复用 ${snapshot.source} 快照（${age}d，TTL ${maxAge}d）`);
 			else if (params.stage === "lead" || params.stage === "screen") plan.push("C档：优先官方导出 CSV 后经 /compass-import 重导（缺列或过期都走这条）；成本≈¥0");
 			else if (params.stage === "deep_research") {
-				if (missing.some((field) => ["main_cpc", "cpc_ratio"].includes(field))) plan.push(available("sorftime") ? "A档：Sorftime 完整快照补主词 CPC / CPC 比（compass_gaps action=plan 规划并给出预计次数、approve 确认后才花钱）" : "降级：compass_keyword_metrics 查本地历史 CPC 作参考，或人工从广告后台取主词 CPC 手填（sorftime 预算不可用）");
+				if (missing.some((field) => ["main_cpc", "cpc_ratio"].includes(field))) {
+					if (sorftimeApproveReady(budgets)) plan.push("A档：Sorftime 完整快照补主词 CPC / CPC 比（compass_gaps action=plan 规划并给出预计次数、approve 确认后才花钱）");
+					else if (sorftimeLiveWithoutLimit(budgets)) plan.push("A档：sorftime 还没有可生效上限，compass_gaps action=approve 发不出确认单。先 compass_budget configure source=sorftime monthly_call_limit=<次数>，再 compass_gaps action=plan / approve");
+					else plan.push("降级：compass_keyword_metrics 查本地历史 CPC 作参考，或人工从广告后台取主词 CPC 手填（sorftime 预算不可用）");
+				}
 				if (missing.some((field) => ["history", "demand_cv", "season_flag"].includes(field))) plan.push("人工：历史曲线/需求波动靠按期重导 CSV 积累多期快照，或由运营手填历史证据；季节性经 compass_risk_check 记录；不自动取付费数据");
 				if (missing.some((field) => ["gross_margin", "fba_fee"].includes(field))) {
 					plan.push("人工：FBA 费用与毛利按官方费用计算器 / 供应商与货代报价取数后填进 compass_profit_estimate");
-					plan.push(available("sorftime") ? "A档：采购价可先经 compass_gaps action=approve origin=purchase_cost_source search_name=<中文品类词> 取 1688 参考成本（1 次调用，convert 时逐条确认同款后写入）" : "降级：采购价等供应商报价手填（sorftime 预算不可用，1688 参考成本链不提供）");
+					if (sorftimeApproveReady(budgets)) plan.push("A档：采购价可先经 compass_gaps action=approve origin=purchase_cost_source search_name=<中文品类词> 取 1688 参考成本（1 次调用，convert 时逐条确认同款后写入）");
+					else if (sorftimeLiveWithoutLimit(budgets)) plan.push("A档：采购价可走 1688 参考成本，但 sorftime 还没有可生效上限。先 compass_budget configure source=sorftime monthly_call_limit=<次数>，再 compass_gaps action=approve origin=purchase_cost_source search_name=<中文品类词>");
+					else plan.push("降级：采购价等供应商报价手填（sorftime 预算不可用，1688 参考成本链不提供）");
 				}
 			}
 			else if (params.stage === "risk") plan.push("官方源优先：USPTO/Google Patents/CPSC/FDA/FCC/EPA；AI 只生成检索式并初筛，证据 URL 必须留痕");
@@ -2343,6 +2348,8 @@ export default function compassExtension(pi: ExtensionAPI): void {
 		promptSnippet: "Search and enable Compass Amazon US product-selection tools",
 		promptGuidelines: [
 			"Use compass_tools before an Amazon US product-selection workflow when the required compass_* tool is not active.",
+			"When the user asks to look up a product, listing, ASIN, or live Sorftime data, load compass_data_route and compass_gaps; do not treat Sorftime MCP as unavailable.",
+			"In default guided fill mode a single product MCP call is allowed and metered. Do not wait for the 7-day no-snapshot todo. Full snapshot / reviews / 1688 still require compass_gaps approve.",
 			"Never present a Compass risk item as green solely from model memory; use official-source evidence and compass_risk_check.",
 		],
 		parameters: Type.Object({

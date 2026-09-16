@@ -522,10 +522,49 @@ export function hasEffectiveLimit(pool: { enabled: boolean; monthlyLimitCny: num
 	return Boolean(pool?.enabled && ((pool.monthlyCallLimit !== undefined && pool.monthlyCallLimit > 0) || (pool.monthlyLimitCny > 0 && (pool.costPerCallCny ?? 0) > 0)));
 }
 
+const GUIDED_PRODUCT_MCP_HINT = "默认 guided 档下用户明确要查某个商品时可以直接调 sorftime MCP（自动计量）；/compass-fill strict 才会硬拦未持确认单的付费调用。完整快照 / 差评 / 1688 仍须 compass_gaps action=approve。";
+
+/**
+ * 尚无快照时 `compass_data_route` 的补数计划。C 档 CSV 仍优先；A 档立刻给
+ * approve（或先配上限），**不必等**「建卡后仍无快照」那条 7 天待办——待办宽限
+ * 只是少打扰，不是补数门槛。
+ */
+export function planNoSnapshotDataRoute(input: { marketId: string; budgets?: readonly GapBudgetPool[] }): string[] {
+	const pool = input.budgets?.find((item) => item.source === "sorftime");
+	const live = Boolean(pool?.enabled && pool.state !== "fused");
+	const lines = ["C档：先从卖家精灵/Sorftime/Keepa 官方导出 CSV，经 /compass-import 导入首个快照，成本≈¥0"];
+	if (!live) {
+		lines.push("降级：sorftime 预算不可用，没有 CSV 时只能等官方导出");
+		return lines;
+	}
+	if (!hasEffectiveLimit(pool)) {
+		lines.push(`A档：sorftime 还没有可生效上限（默认池如此），compass_gaps action=approve 发不出确认单。先 compass_budget configure source=sorftime monthly_call_limit=<次数>，再 compass_gaps action=approve market_ref=${input.marketId}。不必等「建卡后仍无快照」待办——那是 7 天宽限，不是补数门槛。${GUIDED_PRODUCT_MCP_HINT}`);
+		return lines;
+	}
+	lines.push(`A档：没有可导出的 CSV 时，立刻 compass_gaps action=approve market_ref=${input.marketId} 走 Sorftime 完整快照（当面确认后才花钱）。不必等「建卡后仍无快照」待办——那是 7 天宽限，不是补数门槛。${GUIDED_PRODUCT_MCP_HINT}`);
+	return lines;
+}
+
+/** A 档路由是否真能发出确认单：池启用、未熔断、且上限会生效。 */
+export function sorftimeApproveReady(budgets: readonly GapBudgetPool[] | undefined): boolean {
+	const pool = budgets?.find((item) => item.source === "sorftime");
+	return Boolean(pool?.enabled && pool.state !== "fused" && hasEffectiveLimit(pool));
+}
+
+/** 池活着但 approve 发不出确认单（默认 ¥0 无次数上限）。 */
+export function sorftimeLiveWithoutLimit(budgets: readonly GapBudgetPool[] | undefined): boolean {
+	const pool = budgets?.find((item) => item.source === "sorftime");
+	return Boolean(pool?.enabled && pool.state !== "fused" && !hasEffectiveLimit(pool));
+}
+
 // 与 compass_data_route 的 available() 同口径：池启用且未熔断。
 // limitConfigured 另判「上限是否真的会生效」——只配金额上限而单价缺省时自动计量金额恒 0，
 // 熔断门同样空转，等于没配（默认 sorftime 池就是这种情况）。
-function resolveSources(routeKey: string, budgets: readonly GapBudgetPool[], localHistoryAuto: boolean): GapSourceOption[] {
+function resolveSources(
+	routeKey: string,
+	budgets: readonly GapBudgetPool[],
+	flags: { localHistoryAuto: boolean; csvAuto: boolean },
+): GapSourceOption[] {
 	const templates = GAP_SOURCE_MATRIX[routeKey] ?? GAP_SOURCE_MATRIX.generic;
 	const options: GapSourceOption[] = templates.map((template) => {
 		const pool = budgets.find((item) => item.source === template.source);
@@ -534,7 +573,14 @@ function resolveSources(routeKey: string, budgets: readonly GapBudgetPool[], loc
 			template.tier === "manual" || template.source === "local_history" || template.source === "manual_csv"
 				? true
 				: Boolean(pool?.enabled && pool.state !== "fused");
-		const auto = template.source === "local_history" && localHistoryAuto ? "yes" : template.auto;
+		// 尚无快照时「导出 CSV」不是 auto=yes：那会把整个缺口打成 C_auto，
+		// approve 只收 A_confirm，付费首张快照永远发不出确认单。
+		const auto =
+			template.source === "local_history" && flags.localHistoryAuto
+				? "yes"
+				: template.source === "manual_csv" && !flags.csvAuto
+					? "partial"
+					: template.auto;
 		return { ...template, auto, available, limitConfigured };
 	});
 	const rank = (option: GapSourceOption) => (option.tier === "C" ? 0 : option.tier === "A" ? 1 : 2);
@@ -559,6 +605,8 @@ interface GapSeed {
 	evidence: string;
 	todoId?: string;
 	localHistoryAuto?: boolean;
+	/** 缺省 true。无快照时 false：C 档导出降为 partial，才能在配了上限时升到 A_confirm */
+	csvAuto?: boolean;
 }
 
 function foldField(field: string, missingColumns: ReadonlySet<string>): string {
@@ -639,6 +687,20 @@ function seedsForMarket(store: CompassStore, candidate: Candidate, todos: readon
 		} else if (todo.kind === "metric_divergence") {
 			seeds.push({ ...base, field: "metric_divergence", origin: "todo_metric_divergence", reason: todo.reason, evidence: `todo:${todo.id}`, todoId: todo.id });
 		}
+	}
+
+	// 尚无快照立刻下 snapshot 缺口，不绑「建卡 7 天」待办宽限。待办那条是少打扰
+	// （刚建卡不催 CSV），不是补数门槛——绑在一起会让第一次商品取数既不能
+	// approve，技能又不准直连 MCP。有 snapshot_stale 待办时两条合到同一 field。
+	if (!snapshot) {
+		seeds.push({
+			...base,
+			field: "snapshot",
+			origin: "todo_snapshot_stale",
+			reason: "尚无市场快照，无法进入粗筛",
+			evidence: "snap:none",
+			csvAuto: false,
+		});
 	}
 
 	// ④ 利润测算：缺主词 CPC 与静默默认值
@@ -734,7 +796,7 @@ function materialize(
 	muted: readonly MutedGap[],
 	now: string,
 ): GapRecord[] {
-	const merged = new Map<string, { primary: GapSeed; reasons: string[]; evidences: Set<string>; todoId?: string; localHistoryAuto: boolean }>();
+	const merged = new Map<string, { primary: GapSeed; reasons: string[]; evidences: Set<string>; todoId?: string; localHistoryAuto: boolean; csvAuto: boolean }>();
 	for (const seed of seeds) {
 		const key = `${seed.marketId} ${seed.field}`;
 		const bucket = merged.get(key);
@@ -745,6 +807,7 @@ function materialize(
 				evidences: new Set([seed.evidence]),
 				todoId: seed.todoId,
 				localHistoryAuto: seed.localHistoryAuto ?? false,
+				csvAuto: seed.csvAuto !== false,
 			});
 			continue;
 		}
@@ -752,6 +815,7 @@ function materialize(
 		bucket.evidences.add(seed.evidence);
 		bucket.todoId ??= seed.todoId;
 		bucket.localHistoryAuto ||= seed.localHistoryAuto ?? false;
+		bucket.csvAuto &&= seed.csvAuto !== false;
 		if (ORIGIN_PRECEDENCE.indexOf(seed.origin) < ORIGIN_PRECEDENCE.indexOf(bucket.primary.origin)) bucket.primary = seed;
 	}
 
@@ -759,7 +823,7 @@ function materialize(
 	for (const bucket of merged.values()) {
 		const seed = bucket.primary;
 		const snapshot = latestSnapshotOf(store, seed.marketId);
-		const sources = resolveSources(gapRouteKey(seed.field), budgets, bucket.localHistoryAuto);
+		const sources = resolveSources(gapRouteKey(seed.field), budgets, { localHistoryAuto: bucket.localHistoryAuto, csvAuto: bucket.csvAuto });
 		const id = `gap_${seed.marketId}_${seed.field}`;
 		const evidence = [...bucket.evidences].sort().join("|");
 		// 快照过期缺口的 ttl 固定跟 todo_snapshot_stale 的判据（固定 30 天）走，
@@ -812,7 +876,7 @@ export function deriveGaps(store: CompassStore, input: DeriveGapsInput): GapReco
 // 瞬时缺口：没有 market_ref 的利润测算根本不进 store（recordProfitEstimate 不被调用），
 // deriveGaps 永远看不到它。只能由 compass_profit_estimate 的 execute 就地产出一条。
 export function transientProfitUnpersistedGap(input: { summary: string; stamp?: string }): GapRecord {
-	const sources = resolveSources("profit_unpersisted", [], false);
+	const sources = resolveSources("profit_unpersisted", [], { localHistoryAuto: false, csvAuto: true });
 	return {
 		id: "gap_-_market_ref",
 		fingerprint: `gap_-_market_ref#${input.stamp ?? "session"}`,

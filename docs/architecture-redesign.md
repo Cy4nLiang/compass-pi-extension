@@ -1,13 +1,15 @@
 # 罗盘 Compass 架构重设提案：模块边界与数据流
 
 **状态：** 提案（不改生产行为；本 PR 只落地本文）  
-**日期：** 2026-09-19  
+**日期：** 2026-09-19（同日锁定 §0.5 三条决策）  
 **范围：** 模块边界、数据流、发现层 / 立项层分工。**不**改 `/compass-strategy`、不改 store 里的策略 YAML、不做大重构。  
 **对照材料：** 《亚马逊美国站选品逻辑整合版》（软排序找机会，硬关卡定生死）、`jingpu-daily10` v1、amz-selection 六指数、精铺 SOP。
 
 一句话目标：
 
 > 把「看见机会」和「敢不敢下单」拆成两条可独立演进的链路；分数只排序，Gate 才淘汰。
+
+**已拍板（详见 §0.5）：** Listing 级候选卡（打破一市场一卡）· 独立工具 `compass_discover` · 导入默认不跑 screen。Phase 2–3 按这三条写，不再当开放问题辩论。
 
 ---
 
@@ -24,6 +26,54 @@
 | 发现 vs 立项已经分开 | **不成立。** `scanMarkets` 对每个市场跑 `evaluateStrategy(..., "screen")`，再按 **GSE Score** 排序，还可选 `minQrd` / `minNewListingShare` / `maxCpcRatio` / `outcome` **硬过滤**——这正是 amz-selection 反对的「硬阈值过滤」。 |
 
 真正的耦合热点是 **`index.ts`（3001 行，宿主胶水）+ `service.ts`（业务编排）**，不是 `strategy.ts` 或 `store.ts`。
+
+---
+
+## 0.5 已锁定决策（2026-09-19）
+
+下列三条已由产品拍板，从 §6 移出。实现评审不再重开；与之冲突的「建议 / 暂不」措辞以本节为准。
+
+| # | 决策 | 含义 | 不再采用 |
+|---|---|---|---|
+| D1 | **拆开一市场一卡** | 支持 **Listing 级候选**（同一 `marketId` 下可有多张卡，按 ASIN / listing 身份区分） | 发现结果只停在市场档案附录、看板仍一市场一卡 |
+| D2 | **新工具 `compass_discover`** | 发现入口与 `compass_market_scan` **长期分家** | 给 scan 加 `purpose=discover\|screen` 当长期形状 |
+| D3 | **导入默认不跑 screen** | 链路是 **先发现、再立项粗筛**；`run_screen=true` 仅显式选择 | 导入默认 `importMarketAndScreen` → `runStrategy(mode=screen)` |
+
+### D1 含义：候选身份键与存量
+
+现行不变量（`createLead` / `importParsedMarket` 里 `candidates.find(item => item.marketId === market.id)`）在 Phase 2–3 **废除**。目标模型：
+
+```
+Market 1 ──< MarketSnapshot
+     └── * Candidate
+           ├ kind = "market"   存量 / 纯线索（无 ASIN）：一词族一张，继续当想法容器
+           └ kind = "listing"  新卡：同一市场多张，身份 = (marketId, listingKey)
+```
+
+- **`listingKey`（实现时定稿）：** 优先规范化 ASIN（`^[A-Z0-9]{10}$`，与 `amazonProductUrl` 同口径）；CSV 无 ASIN 时用稳定退化键（例如 `rank` + 标题归一），并在卡上标明「身份弱、重导可能重键」。禁止用「该市场唯一一张卡」当查找键。
+- **存量迁移：** 已有卡没有 listing 身份 → 视为 `kind=market`。`assertStore` 只加**可选字段**（`asin?` / `listingKey?` / `kind?`），**不**为新字段加硬必填——缺省即旧卡。`schemaVersion` 保持 1。
+- **派生待办 id：** 闭环四类 `todo_<kind>_<市场/候选/来源>` 已是持久化格式。Listing 新卡用新的 `candidate.id`（`cand_*`）拼进 id，不改旧卡拼法；**不要**把「市场 id」误当成「该市场所有 listing 卡共享一条待办」。
+- **`runStrategy` / 利润 / 风险 / 差评：** 必须带 **显式 `candidateId`**（或列出要写回的卡），禁止再 `find(marketId)` 写「这个市场那一张」。市场级 GSE（`amz_share` / `cr3` / QRD）仍从父市场 `StrategyContext` 读；listing 卡**继承**同一次市场粗筛的 `outcome` 或各自挂 `strategyRunId`，但 **`Candidate.score` 只写 GSE 立项分**，发现分不进这个槽。
+- **看板 UX：** `compass_pool` / Web 候选池按市场分组，行上露出 ASIN / 标题 / 发现秩；一市场多卡是默认，不是异常。否决品仍保留、不删除。
+
+### D2 含义：两个工具、两套排序
+
+| 工具 | 层 | 排序键 | 可否按 Gate / QRD 砍行 |
+|---|---|---|---|
+| `compass_discover`（新） | 发现 | `DiscoveryRank`（市场级代理 + listing 指数） | **否**。Hard/Trap 只旗标 |
+| `compass_market_scan` | 立项粗筛 | 现有 GSE Score（`evaluateStrategy(..., "screen")`） | 可以（保持现语义，文案改成「立项扫描」） |
+
+`DOMAIN_TOOLS` / `catalog.ts` / `tests/tool-catalog.test.ts` / README·手册·速查卡·SKILL 在 Phase 3 一起加 `compass_discover`。不要用 scan 的 `purpose` 旗标冒充发现入口（短期兼容 shim 若有，也不得写进 SKILL 当主路径）。
+
+### D3 含义：导入不再偷偷立项
+
+- **默认：** `importParsedMarket` 只写 Market + Snapshot +（可选）市场级线索卡；**不**调用 `runStrategy`。`compass_import_csv` / `/compass-import` / Web `POST /api/import` 的 `run_screen` 缺省 = `false`。
+- **显式选择：** `run_screen=true` 仍可走现有 `importMarketAndScreen`，给「我已经决定立项粗筛」的运营；这是 opt-in，不是省钱默认。
+- **导入后下一步：** `compass_discover` 看全排序 → 人工 / agent 把 Top listing **提升**为 listing 候选卡 → 再 `compass_strategy_run(mode=screen)` 或 opt-in 导入粗筛。
+- **`autoCheckImportedOutcome`：** 这是复盘对照（已有人工决策锚点时），不是 screen。默认不跑 screen **不**等于关掉这条复盘；对照仍可在导入事务里按现规则触发。
+- Phase 1 **零行为**，本条从 Phase 3 起改默认（或 Phase 2 末若只动导入默认、工具尚未上线，须同步改 SKILL / 手册，避免「导入即粗筛」文案骗人）。
+
+发现 Rank 与立项 Score **分字段**（§3.2）在 D1–D3 下仍然成立：listing 卡可以同时有 `discoveryRank`（派生或随后决定是否落盘，见 Q6）和 `score`（GSE）；展示两列，互不覆盖。
 
 ---
 
@@ -94,6 +144,8 @@ Market 1 ──< MarketSnapshot          元数据在 store；listings/keywords 
      └── 1 Candidate                 ★ 现行不变量：一市场一张候选卡
                                        （createLead / importParsedMarket
                                         都是 find by marketId）
+                                       目标（D1）：同一市场 * Candidate，
+                                       listing 卡身份 = (marketId, listingKey)
 
 ProfitEstimate / CostReference / RiskRecord / ReviewAnalysis
 StrategyVersion / StrategyRun
@@ -136,7 +188,7 @@ SOP / GSE 四阶段（`market_screen` / `unit_economics` / `product_quality` / `
 
 ```
 compass_lead
-  → compass_import_csv（默认 run_screen=true → importMarketAndScreen → screen Gate）
+  → compass_import_csv（现行默认 run_screen=true → importMarketAndScreen → screen Gate）
   → compass_market_scan（GSE screen + Score 排序，无快照的线索不进表）
   → compass_profit_estimate / compass_reviews_record / compass_risk_check
   → compass_strategy_run(mode=full)
@@ -148,6 +200,8 @@ compass_lead
 旁路（成本与证据，不是选品判定）：`compass_gaps`、`compass_data_route`、`compass_budget`、`compass_dispatch`、`compass_todo`。
 
 **没有** `compass_discover` / `compass_rank` / 六指数工具。`compass_market_scan` 的 catalog 文案是「扫描…按 Gate、QRD、新品占比筛选」——被当成发现入口，实现却是立项粗筛。
+
+目标主路径（D2 / D3，Phase 3）：`import`（默认不 screen）→ **`compass_discover`** → 提升 listing 卡 → 显式 `screen` / `full` → pool。`compass_market_scan` 留作立项扫描。
 
 Slash：`/compass` `/compass-web` `/compass-import` `/compass-report` `/compass-strategy` `/compass-retro` `/compass-fill` `/compass-history-brief` `/compass-help`。TUI 六页、Web 八视图，读同一 store。
 
@@ -184,7 +238,7 @@ flowchart TD
 1. **导入即立项粗筛。** `importMarketAndScreen`（`service.ts`）默认 `runScreen !== false` 就写 Gate。运营还没「选 Top N」，市场已经被 reject / review。
 2. **扫描再筛一次。** `scanMarkets` 对已有最新快照的市场再 `evaluateStrategyVersionOnSnapshot(..., "screen")`，`normalize: percentile` 时在**同一批**里重写 `dimensionScores` 与 `score`（**不写回** candidate；candidate.score 仍是上次 `runStrategy` 的有界分）。Web 市场表读的是 candidate 上冻结的 score，和 scan 表可能不是同一个数。
 3. **screen 模式下 Score 仍算五维。** `evaluateStrategy` 无论 `mode` 都调用 `calculateDimensionScores`。导入后通常还没有利润 / 风险 / 差评 → `unit_economics` / `product` / `risk` 因缺数走 `average([]) = 50`。权重里这三维合计 **0.55**，扫描排序有一半以上是「缺省 50」。这不是发现指数，是立项综合分的残缺形态。
-4. **Listing 不是候选。** `ListingRecord` 只是快照证据。替换机会、新品苗子、差 Listing 无法变成第二张候选卡——一市场一卡。
+4. **Listing 不是候选（现状）。** `ListingRecord` 只是快照证据。替换机会、新品苗子、差 Listing 无法变成第二张候选卡——一市场一卡。目标见 D1。
 
 ### 1.7 现状依赖（简化）
 
@@ -267,6 +321,8 @@ Hard / Capital / Ops / Trap **类目旗标**不存在；风险只有立项用的
 amz-selection 六指数大量是 **ASIN / Listing** 中心。
 
 罗盘把两者压进「一市场一候选卡」。一个词族里同时出现「替换苗子 + 差 Listing + 新品爆款」无法并列进池，只能当同一张卡的证据行。这是产品模型问题，不是改 `scanMarkets` 能单独解决的。
+
+**已锁定（D1）：** Phase 2–3 拆成 Listing 级候选，同一市场多卡进看板。市场级 GSE（QRD / CR3 / AMZ）仍挂在父市场上下文上，不把六指数误当成市场 Gate。
 
 ### 2.5 漏斗阶段与策略阶段脱节
 
@@ -381,10 +437,10 @@ flowchart TB
 | Presentation | 组合上述只读 DTO | 在 `index.ts` 里长业务公式 |
 | Persistence | `types` + 校验 | 业务规则（Gate / 指数） |
 
-立项 Score 与发现 Rank **不得共用一个字段名**。建议：
+立项 Score 与发现 Rank **不得共用一个字段名**（D1 拆多卡后更要守：一张 listing 卡上两套数并存）：
 
-- `Candidate.score` / `StrategyEvaluation.score`：**继续表示 GSE 立项综合分**（运营已认识）。
-- 发现结果用新类型，例如 `DiscoveryRank { total, indices, flags, sampleSize }`，默认**派生不落盘**（与 `WorkbenchTodo` 同族），避免动 `schemaVersion` / `assertStore`。
+- `Candidate.score` / `StrategyEvaluation.score`：**继续表示 GSE 立项综合分**（运营已认识）。`runStrategy` 只写这个槽，且必须对准**显式 candidateId**。
+- 发现结果用新类型，例如 `DiscoveryRank { total, indices, flags, sampleSize, listingKey? }`。Phase 2 **派生不落盘**（与 `WorkbenchTodo` 同族）；是否写入 candidate 可选字段见仍开放的 Q6。**禁止**把发现总分写进 `Candidate.score`。
 
 ### 3.3 `service.ts` 的目标形态
 
@@ -393,13 +449,13 @@ flowchart TB
 | 新文件（建议） | 搬出的符号 |
 |---|---|
 | `lookup.ts` 或留在 `service` | `findMarket` `latestSnapshot*` `ensureDefaults` |
-| `leads.ts` | `createLead` |
-| `import-apply.ts`（内存侧，I/O 仍在 `importer.ts`） | `importParsedMarket`；**自动 screen 改为显式调用方决定**（默认值暂不改，只改存放位置） |
-| `discovery.ts` | **新**：指数、旗标、`rankMarkets` / `rankListings` |
-| `screening.ts` | `buildStrategyContext*` `runStrategy` `scanScreen`（现 `scanMarkets` 的 Gate 半截） |
-| `profit.ts` | 利润 + 采购价出处解析 |
+| `leads.ts` | `createLead`（Phase 1 仍一市场一卡；Phase 2 起按 `listingKey` 查找，不再 `find(marketId)` 当唯一键） |
+| `import-apply.ts`（内存侧，I/O 仍在 `importer.ts`） | `importParsedMarket`；`importMarketAndScreen` 仅服务 **opt-in** `run_screen=true`。Phase 1 搬家不改默认；Phase 3 默认改为不跑 screen（D3） |
+| `discovery.ts` | **新**：指数、旗标、`rankMarkets` / `rankListings`；listing 身份键；提升为候选卡的纯函数入口（写事务仍走 pool） |
+| `screening.ts` | `buildStrategyContext*` `runStrategy` `scanScreen`（现 `scanMarkets` 的 Gate 半截；**不是**发现入口） |
+| `profit.ts` | 利润 + 采购价出处解析（写回必须带 `candidateId`，一市场多卡后不能「该市场最新一条」含糊落账） |
 | `risk.ts` / `reviews.ts` | `record*` + `*Metrics` 生产者（顺带让 `KNOWN_METRIC_NAMES` 可从生产者登记） |
-| `pool.ts` | `moveCandidate` `decideCandidate` `listPoolCandidates` `marketAmazonLinks` |
+| `pool.ts` | `moveCandidate` `decideCandidate` `listPoolCandidates` `marketAmazonLinks`；Phase 2–3 按市场分组列出 listing 卡 |
 | `budget.ts` | `budgetMonth` 到 `evaluateMcpGate` 整段 |
 | `retro.ts` | `performRetroCheck` 到 `generateRetroReport` |
 | `todos.ts`（编排，派生仍在 `todo.ts`） | `listWorkbenchTodos` + 闭环四函数 |
@@ -411,13 +467,14 @@ flowchart TB
 
 | 表面 | 发现 | 立项 |
 |---|---|---|
-| 工具 | 新 `compass_discover`（或 `compass_market_scan` 增加 `purpose=discover\|screen`，默认 discover） | 现有 `compass_strategy_run` / 导入后的 screen |
-| SKILL | 建池 → 全排序 → 旗标 → 人工挑 Top N | 再跑 screen → full → decide |
-| Web 市场表 | 发现总分 + 旗标列；**reject 仍在表里** | Gate 列单独着色，不隐藏行 |
-| TUI 市场页 | 同上 | 同上 |
-| 报告 | 可选「发现附录」（指数与样本） | 现有 D1–D5 + GSE 规则表 |
+| 工具 | **`compass_discover`（D2，长期唯一发现入口）** | `compass_market_scan`（立项扫描）+ `compass_strategy_run`；导入 **opt-in** `run_screen=true`（D3） |
+| SKILL | 建池 → 导入（默认不粗筛）→ discover 全排序 → 旗标 → 提升 Top listing 为候选卡 | 再跑 screen → full → decide |
+| Web 候选池 | 按市场分组的 **listing 卡**；发现秩 + 旗标；**reject 仍在表里** | Gate / `Candidate.score` 单独列，不覆盖发现秩 |
+| Web 市场表 | 市场级发现代理分（可选） | 市场级 Gate（若已显式跑过 screen） |
+| TUI 候选池 / 市场页 | 同上 | 同上 |
+| 报告 | 「发现附录」：该市场 listing 排序与样本 | 现有 D1–D5 + GSE 规则表 |
 
-**Phase 1 不改这些表面**，只把文档和模块边界准备好。表面改动放 Phase 3，并同步 README / 手册 / 速查卡 / SKILL（四处运营表面）。
+**Phase 1 不改这些表面**，只把文档和模块边界准备好。`compass_discover`、导入默认翻转、一市场多卡看板都在 Phase 3 露出，并同步 README / 手册 / 速查卡 / SKILL（四处运营表面）。
 
 ---
 
@@ -425,13 +482,13 @@ flowchart TB
 
 ```mermaid
 flowchart TD
-  ideas["想法池：lead 无快照也可以"] --> ingest
-  csv["CSV / 补数 convert"] --> ingest["Ingestion\nMarket + 不可变 Snapshot + metrics"]
-  ingest --> disc["Discovery\n六指数能算的就算；不能算的缺数旗标\n全排序；Hard/Trap 只标注"]
-  disc --> pick["运营 / agent 挑 Top N\n不在本层 reject"]
-  pick --> screen["Screening GSE market_screen\n红海 veto / 新品 require / QRD require"]
+  ideas["想法池：lead 无快照也可以\n至多一张 kind=market 线索卡"] --> ingest
+  csv["CSV / 补数 convert"] --> ingest["Ingestion\nMarket + 不可变 Snapshot + metrics\n默认不跑 screen（D3）"]
+  ingest --> disc["compass_discover\n六指数能算的就算；不能算的缺数旗标\n全排序 Listing；Hard/Trap 只标注"]
+  disc --> pick["运营 / agent 挑 Top N\n提升为 kind=listing 候选卡\n身份 (marketId, listingKey)\n不在本层 reject"]
+  pick --> screen["显式 Screening\ncompass_strategy_run mode=screen\n或导入 opt-in run_screen=true\n市场级 Gate 写回该 listing 卡"]
   screen -->|reject| keep["候选保留，阶段可留 screen 或回 lead"]
-  screen -->|pass 或 review| deep["Economics + Reviews + Risk 取证"]
+  screen -->|pass 或 review| deep["Economics + Reviews + Risk 取证\n挂 candidateId"]
   deep --> full["GSE full\nunit_economics / product_quality / risk_screen"]
   full --> decide["Pool decide\ngo / waitlist / no_go"]
   decide --> retro["Retro：快照对照 / 实绩 / Lesson"]
@@ -441,18 +498,18 @@ flowchart TD
 
 | 产物 | 所有者 | 能否淘汰 |
 |---|---|---|
-| `DiscoveryRank.total` 与分指数 | `discovery.ts` | 否，只排序 |
+| `DiscoveryRank.total` 与分指数 | `discovery.ts` / `compass_discover` | 否，只排序 |
 | `DiscoveryFlag`（Hard/Capital/Ops/Trap + 数据缺口） | `discovery.ts` | 否 |
 | `StrategyEvaluation.outcome` | `strategy.evaluateStrategy` | 是（立项） |
-| `StrategyEvaluation.score` | 同上，**只给已进立项的卡排优先级** | 否 |
-| `Candidate.decisionStatus` | `decideCandidate` | 人的终局，系统不因 Score 改写 |
+| `StrategyEvaluation.score` → `Candidate.score` | 同上，**只给已显式跑过 GSE 的那张卡** | 否 |
+| `Candidate.decisionStatus` | `decideCandidate` | 人的终局，系统不因 Score 或发现秩改写 |
 
-导入链路建议（**行为默认先不动**，只在文档上标目标）：
+导入链路（D3，Phase 3 起改默认；Phase 1 仍零行为）：
 
-1. 现在：`import → metrics → screen Gate → 写 candidate`。  
-2. 目标：`import → metrics → 派生 DiscoveryRank →（可选）screen`。自动 screen 仍可当省钱默认，但 scan / 市场表的**主排序**改走发现分；Gate 变成筛选项而不是默认删除键。
+1. 现在：`import → metrics → screen Gate → 写「该市场那一张」candidate`。  
+2. 目标：`import → metrics →（不写 Gate）→ compass_discover 排 listing → 提升 Top N 为 listing 卡 → 显式 screen`。`run_screen=true` 仍可用，但是选择，不是默认。
 
-Listing 级机会（替换 / 新品 / 差 Listing）目标形态：对最新快照 Top100 **派生** `ListingOpportunity[]`，挂在市场档案里，**暂不**改「一市场一候选」——除非开放问题 Q1 决定拆卡。
+Listing 级机会不再只停在档案附录（D1）：Phase 2 先派生 `ListingOpportunity[]`（含 `listingKey` + `DiscoveryRank`）；Phase 3 经 `compass_discover` / pool 提升为真正的 `Candidate`。
 
 ---
 
@@ -475,89 +532,98 @@ Listing 级机会（替换 / 新品 / 差 Listing）目标形态：对最新快�
 
 风险：低。主要是 git 搬家 + 循环依赖要小心（`lookup` 不要 import `screening`）。
 
-### Phase 2 — 发现层只读派生（仍不改策略 YAML）
+### Phase 2 — 发现层只读派生 + Listing 身份模型（仍不改策略 YAML）
 
-新增 `discovery.ts`（名字可议），**只用现有字段**先做能算的：
+前提按 D1：排序对象是 **listing**，不是「一市场一行」。新增 `discovery.ts`（名字可议），**只用现有字段**先做能算的：
 
-1. **市场级代理总分**（发现总表的可落地子集）：需求 / 竞争 / 利润潜力（有测算才计，无则缺数不补 50）/ 品牌真空代理（无品牌 listing 占比）/ 增长代理（`new_listing_share_12m` 或 `top20_age_months_median`，并在文档标明不是 6 个月斜率）。
-2. **Listing 级替换机会与新品速度**（弱公式，标注「代理」）。
-3. **旗标**：先做可配置的类目关键字表（Hard/Trap…），匹配 `Market.category` / listing.category；未匹配 = 无旗标，不是 clear。
-4. 纯函数 + `tests/discovery.test.ts`。不写 store，不改 `Candidate.score`。
-5. 不接工具面，避免 SKILL 与实现再漂一次。
+1. **`listingKey` 纯函数**（ASIN 优先，无 ASIN 退化键）+ 单测；与 `amazonProductUrl` 白名单同口径。
+2. **Listing 级替换机会与新品速度**（弱公式，标注「代理」）→ `ListingOpportunity[]`。
+3. **市场级代理总分**（发现总表的可落地子集，给市场表用）：需求 / 竞争 / 利润潜力（有测算才计，无则缺数不补 50）/ 品牌真空代理 / 增长代理（标明不是 6 个月斜率）。
+4. **旗标**：可配置类目关键字表（Hard/Trap…），匹配 `Market.category` / listing.category；未匹配 = 无旗标，不是 clear。
+5. 纯函数 + `tests/discovery.test.ts`。**不写 `Candidate.score`**。可选字段草案（`asin` / `listingKey` / `kind`）可以进 `types.ts` 但不强制 `assertStore`。
+6. 提升为候选卡的 **内存 API**（`promoteListingCandidate` 一类）可在本阶段落地并测「同一市场两张 listing 卡不互相覆盖」；工具面仍可不接，以免 SKILL 与实现再漂。
 
 季节 / FBA / Listing 优化：数据不够就 **显式缺数**，不要用常数填满。
 
-### Phase 3 — 工具与展示把两条链路拆开（运营可感知）
+### Phase 3 — 工具与展示按 D1–D3 露出（运营可感知）
 
-- `scanMarkets` 拆成 `rankForDiscovery`（默认不按 Gate 过滤、不按 QRD 砍行）与 `screenMarkets`（现逻辑）。
-- 工具：优先 **加** `compass_discover`，保留 `compass_market_scan` 一段时间以免坏掉旧会话；或给 scan 加 `purpose` 且默认值要在开放问题 Q3 拍板。
-- Web / TUI：发现分与 Gate 分列；reject 行可见。
+- **新工具 `compass_discover`**（D2）：全排序 listing（可按市场过滤），输出秩 / 指数 / 旗标 / `listingKey`；可选把 Top N **提升**为 `kind=listing` 候选卡。默认不按 Gate / QRD 砍行。
+- **`compass_market_scan` 留作立项扫描**（现逻辑），文案不再冒充发现入口。禁止把 `purpose` 旗标当长期形状。
+- **导入默认 `run_screen=false`（D3）**：`compass_import_csv` / `/compass-import` / Web 导入向导同步；`run_screen=true` 保留为显式选择。
+- **`runStrategy` 写回改显式 `candidateId`**，去掉 `find(marketId)` 唯一卡假设。
+- Web / TUI 候选池：按市场分组的 listing 卡；发现秩与 Gate / `score` 分列；reject 行可见。
 - 同步四处运营文档 + `catalog.ts` + `tests/tool-catalog.test.ts`。
-- SKILL「推荐执行顺序」在粗筛前插入「发现排序 → 挑 Top N」。
+- SKILL 主路径改为：导入（默认不粗筛）→ `compass_discover` → 提升 Top N → 显式 screen → full → decide。
 
-**此阶段仍不要求改 jingpu-daily10 YAML。** 导入默认 `run_screen=true` 可先保留（省钱），但产品文案要写清：自动粗筛是立项，不是发现。
+**此阶段仍不要求改 jingpu-daily10 YAML。**
 
 ### Phase 4 — 漏斗与策略阶段的弱对齐（仍可不改 YAML）
 
 - 文档 + 待办：未跑过 screen 或 screen=reject 时，移入 `deep_research` 给警告（先派生待办，不硬拒，避免锁死现有自由跳转）。
 - 若要硬拒，必须先回答 Q5。
+- 待办派生按 **候选卡** 而不是「一市场一条」，避免一市场多 listing 时水位绑错。
 
 ### Phase 5 — 以后才做（本文明确不做）
 
 - `/compass-strategy` 另存版本、出厂稿 vs 本机 v1、风险「红则 veto」、中性市场 `review_if_fail`。
 - 为季节 / FBA / A+ 扩 CSV 列与 `KNOWN_METRIC_NAMES`。
-- 拆「一市场多候选」或 Listing 转候选卡。
 - 把发现权重做成第二份 YAML（那是新策略面，不是 GSE 的 stages）。
+- （D1 已锁定，不再列「要不要拆一市场一卡」。）
 
-### 对运营保持稳定的契约（Phase 1–2）
+### 对运营保持稳定的契约
+
+**Phase 1（零行为）：**
 
 - 工具名、slash、Web 路由 / `WRITE_PATHS`（现 7 条）。
 - `store.json` 形状、`decisionLog.type`、快照 sidecar。
-- 导入默认仍跑 screen；Gate 文案与阈值仍来自生效策略。
+- 导入默认**仍**跑 screen（直到 Phase 3 翻 D3）。
 - 缺数据 → review；否决品保留。
 - 预算 UTC 月、补数当面确认、dispatch 零工具。
 
+**Phase 3 起预期变化（先写进 SKILL / 手册再切默认）：**
+
+- 多一张工具 `compass_discover`；scan 仍在，语义收窄为立项。
+- 导入后不再自动出现 Gate；候选池出现同一市场多张 listing 卡。
+- Gate 文案与阈值仍来自生效策略（YAML 不在本重设里改）。
+
 ---
 
-## 6. 开放问题（只能由产品 / 运营拍板）
+## 6. 仍开放的问题（只能由产品 / 运营拍板）
 
-**Q1. 候选粒度要不要拆？**  
-保持「一市场一卡」（与现行 SOP / QRD 一致），还是允许同一 `marketId` 下多张卡（ASIN / 供应商 / 玩法）？  
-不定 Q1，Listing 级指数只能停在档案附录，进不了看板。
-
-**Q2. 导入是否还要默认自动 `screen`？**  
-省钱、和现在 SKILL 一致；但会在发现之前写下 `gateOutcome=reject`，市场表第一眼像「已经淘汰」。备选：默认只派生发现分，screen 改显式 / 仅 Top N。
-
-**Q3. 发现入口的工具形状？**  
-新工具 `compass_discover`（表面清晰、catalog 要扩），还是 `compass_market_scan` 加 `purpose`（少一个工具、容易继续混用）？默认 purpose 是什么？
+Q1 / Q2 / Q3 已锁定，见 **§0.5 D1–D3**。下面这些仍影响 Phase 2 公式与 Phase 4 门闩，**不**挡 Phase 1 剪文件。
 
 **Q4. 六指数的第一批范围？**  
-建议 Phase 2 只做：**替换机会代理、新品速度代理、市场级需求/竞争/品牌真空代理、类目旗标**。季节 / FBA / Listing 优化等有列再做。是否同意「缺数据就缺，不补 50」？
+建议 Phase 2 只做：**listing 身份键 + 替换机会代理 + 新品速度代理 + 市场级需求/竞争/品牌真空代理 + 类目旗标**。季节 / FBA / Listing 优化等有列再做。是否同意「缺数据就缺，不补 50」？
 
 **Q5. 看板阶段要不要和 GSE 关卡做硬门？**  
-例如 screen=reject 不能进 deep_research。与现行「任意跳转 + 必填 reason」冲突。先警告还是硬拒？
+例如 screen=reject 不能进 deep_research。与现行「任意跳转 + 必填 reason」冲突。先警告还是硬拒？一市场多卡后，门闩必须按 **卡** 判，不能按市场一刀切。
 
 **Q6. 发现分要不要落盘？**  
-派生（无迁移、改公式即全库重算）vs 写入 snapshot.metrics 或新集合（可审计、要白名单 / 回滚策略）。建议先派生。
+派生（无迁移、改公式即全库重算）vs 写入 candidate 可选字段 / 新集合（可审计、要白名单 / 回滚策略）。建议 Phase 2 先派生；listing 卡提升时可以只存 `listingKey` + 指向当次快照，秩当场重算。
 
 **Q7. 类目旗标词表放哪？**  
 本仓库开源，不宜写死真实敏感经营名单。放宿主 `.pi/compass/` 配置（与 gapfill 映射表同模式），还是先做空表 + 示例？
 
 **Q8. agent 能否在发现阶段建议「先扔掉」？**  
-整合版说不删。SKILL 是否写明：发现结果里的 Trap/Hard 只能汇报旗标，`compass_pool decide no_go` 必须发生在立项 Gate 之后？
+整合版说不删。SKILL 是否写明：`compass_discover` 里的 Trap/Hard 只能汇报旗标，`compass_pool decide no_go` 必须发生在立项 Gate 之后？
 
 **Q9. Web / TUI 的主排序键？**  
-市场表现在按 `updatedAt`；scan 按 GSE Score。发现层上线后，默认按发现分、更新时间，还是 Gate 分组？这决定运营每天先看见什么。
+市场表现在按 `updatedAt`；scan 按 GSE Score。发现层上线后，候选池默认按发现秩、还是按市场分组再按发现秩、还是 Gate 分组？这决定运营每天先看见什么。
+
+**Q10. 无 ASIN 的 listing 如何稳定成卡？**（D1 的实现细节，不是要不要拆卡）  
+退化键（rank + 标题归一）在重导、排序漂移时可能撞车或拆成两张。是拒绝提升无 ASIN 行，还是允许弱键并在 UI 标红？
 
 ---
 
 ## 7. Phase 1 落地时怎么辩论
 
-建议合并本提案后，第一次实现评审只讨论：
+建议合并本提案后，第一次实现评审（Phase 1）只讨论：
 
 1. §3.3 的剪文件清单是否同意（尤其 MCP 是否跟 Phase 1 一起搬）。  
-2. Q1 / Q2 / Q3（粒度、自动 screen、工具形状）——卡住 Phase 3 表面，不卡 Phase 1。  
-3. Phase 2 代理公式是否允许「弱、但标明代理」，避免等齐六指数才开工。
+2. Phase 2 代理公式是否允许「弱、但标明代理」，避免等齐六指数才开工（Q4）。  
+3. D1 的 `listingKey` 草案（ASIN 优先 / 无 ASIN 是否允许提升，Q10）——可在 Phase 1 评审里定口径，代码仍放 Phase 2。
+
+D1–D3 已锁定，**不要**在 Phase 1 评审里重开「要不要拆卡 / 要不要新工具 / 导入是否默认 screen」。
 
 明确**非目标**：重写 GSE DSL、改本机已生效的 `jingpu-daily10` v1、把罗盘做成联网采集平台。
 
@@ -571,8 +637,11 @@ Listing 级机会（替换 / 新品 / 差 Listing）目标形态：对最新快�
 | 扫描 = 立项分排序 | `scanMarkets` `service.ts`；工具 `compass_market_scan` `index.ts` |
 | Gate + Score 同返回 | `evaluateStrategy` `strategy.ts` |
 | 立项五维分 | `calculateDimensionScores` `SCORING_DIMENSIONS` |
-| 写回唯一 score 槽 | `runStrategy` → `candidate.score` |
-| 一市场一卡 | `createLead` / `importParsedMarket` 内 `candidates.find(marketId)` |
+| 写回唯一 score 槽 | `runStrategy` → `candidate.score`（目标：只写显式 `candidateId`，不进发现秩） |
+| 一市场一卡（**现状**；D1 废除） | `createLead` / `importParsedMarket` 内 `candidates.find(marketId)` |
+| 已锁定：Listing 多卡 | §0.5 D1；目标身份 `(marketId, listingKey)` |
+| 已锁定：发现工具 | §0.5 D2；`compass_discover` ≠ `compass_market_scan` |
+| 已锁定：导入不默认 screen | §0.5 D3；`run_screen` 仅 opt-in |
 | 指标全集 | `KNOWN_METRIC_NAMES` `defaults.ts` |
 | 替换机会弱原语 | `low_rating_high_sales_count` `metrics.targetDependentMetrics` |
 | 报告五维 | `DIMENSIONS` `report.ts` |
@@ -583,4 +652,4 @@ Listing 级机会（替换 / 新品 / 差 Listing）目标形态：对最新快�
 
 ---
 
-*本文是设计提案，不是变更日志。实现从 Phase 1 剪文件开始，策略 YAML 仍按「以后用 `/compass-strategy` 另存」处理。*
+*本文是设计提案，不是变更日志。D1–D3 已锁定。实现从 Phase 1 剪文件开始；策略 YAML 仍按「以后用 `/compass-strategy` 另存」处理。*

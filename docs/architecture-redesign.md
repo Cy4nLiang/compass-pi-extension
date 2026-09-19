@@ -1,7 +1,7 @@
 # 罗盘 Compass 架构重设提案：模块边界与数据流
 
 **状态：** 提案（不改生产行为；本 PR 只落地本文）  
-**日期：** 2026-09-19（同日锁定 §0.5 三条决策）  
+**日期：** 2026-09-19（锁定 D1–D3；同日补 §4 六指数规格）  
 **范围：** 模块边界、数据流、发现层 / 立项层分工。**不**改 `/compass-strategy`、不改 store 里的策略 YAML、不做大重构。  
 **对照材料：** 《亚马逊美国站选品逻辑整合版》（软排序找机会，硬关卡定生死）、`jingpu-daily10` v1、amz-selection 六指数、精铺 SOP。
 
@@ -10,6 +10,22 @@
 > 把「看见机会」和「敢不敢下单」拆成两条可独立演进的链路；分数只排序，Gate 才淘汰。
 
 **已拍板（详见 §0.5）：** Listing 级候选卡（打破一市场一卡）· 独立工具 `compass_discover` · 导入默认不跑 screen。Phase 2–3 按这三条写，不再当开放问题辩论。
+
+**六指数是目标发现层的一等规格**（公式、输入、现状字段、Phase 2 代理），见 **§4**，不是「代码里还没有」一笔带过。
+
+### 目录
+
+1. [§0 调查结论](#0-调查结论先读这段)
+2. [§0.5 已锁定决策](#05-已锁定决策2026-09-19)
+3. [§1 现状地图](#1-现状地图)
+4. [§2 痛点](#2-痛点)
+5. [§3 目标架构](#3-目标架构)
+6. [**§4 发现层规格：六大选品指数**](#4-发现层规格六大选品指数) ← 目标 Discovery 的完整定义
+7. [§5 目标数据流](#5-目标数据流)
+8. [§6 迁移计划](#6-迁移计划先划界不大爆炸)
+9. [§7 仍开放的问题](#7-仍开放的问题只能由产品--运营拍板)
+10. [§8 Phase 1 评审范围](#8-phase-1-落地时怎么辩论)
+11. [§9 符号索引](#9-符号索引便于对照代码)
 
 ---
 
@@ -60,7 +76,7 @@ Market 1 ──< MarketSnapshot
 
 | 工具 | 层 | 排序键 | 可否按 Gate / QRD 砍行 |
 |---|---|---|---|
-| `compass_discover`（新） | 发现 | `DiscoveryRank`（市场级代理 + listing 指数） | **否**。Hard/Trap 只旗标 |
+| `compass_discover`（新） | 发现 | `DiscoveryRank`（§4 六指数 + 总表 composite） | **否**。Hard/Trap 只旗标 |
 | `compass_market_scan` | 立项粗筛 | 现有 GSE Score（`evaluateStrategy(..., "screen")`） | 可以（保持现语义，文案改成「立项扫描」） |
 
 `DOMAIN_TOOLS` / `catalog.ts` / `tests/tool-catalog.test.ts` / README·手册·速查卡·SKILL 在 Phase 3 一起加 `compass_discover`。不要用 scan 的 `purpose` 旗标冒充发现入口（短期兼容 shim 若有，也不得写进 SKILL 当主路径）。
@@ -301,19 +317,9 @@ amz-selection 总表是另一套：**市场需求 30% / 竞争 25% / 利润潜�
 
 `low_rating_high_sales_count` 是替换机会指数的弱代理（固定 4.2 / q，计数不是 `月销 × (5−评分) × 评论修正`）。它进入 GSE 的 competition **和** product，再进报告 D2/D4。发现信号被立项加权稀释，也无法单独排出「高销低分」清单。
 
-可从现有 `ListingRecord` 近似、但未实现的：
+可从现有 `ListingRecord` 近似、但未实现的字段对照，以及目标公式，以 **§4** 为准（这里不再用一张残表代替规格）。
 
-| 指数 | 现有字段能否起步 | 缺什么 |
-|---|---|---|
-| 替换机会 | `monthlySales` `rating` `reviewCount` | 类目均分、评论修正曲线 |
-| 新品爆发 | `monthlySales` `monthsOnline` / `launchDate` | 日销曲线、广告 vs 自然 |
-| HPI 的需求 / 供给 / 评论壁垒 | `keyword_search_volume` `listing_count` `cr*` `waist_review_median` | 品牌真空流量、场景、复杂度 |
-| 品牌真空 | `brand`（可算无品牌页占比） | 无品牌**流量**占比 |
-| 季节景气 | 无 | 12 个月序列；`CategoryTrend` 末月不完整的坑也未处理 |
-| FBA 套利 | 无 `shippingType` | FBM / Buy Box 价差 / FBA 费 |
-| Listing 优化 | 仅有 `title` 可测长度 | 主图 / A+ / 关键词覆盖 |
-
-Hard / Capital / Ops / Trap **类目旗标**不存在；风险只有立项用的 `RiskRecord` 五字段（认证 / IP / 季节 / 政策 / 物流），缺证据 → review，不是「标红仍留在列表」。
+Hard / Capital / Ops / Trap **类目旗标**在现状代码中不存在；风险只有立项用的 `RiskRecord` 五字段。目标旗标见 §4.6。
 
 ### 2.4 市场中心 vs 选品中心
 
@@ -368,7 +374,7 @@ flowchart TB
   end
 
   subgraph discovery["Discovery 发现"]
-    disc["discovery.ts（新）\n指数 / 旗标 / 全排序"]
+    disc["discovery.ts（新）\n§4 六指数 + 总表 + 旗标"]
   end
 
   subgraph screening["Screening 立项粗筛"]
@@ -421,7 +427,7 @@ flowchart TB
   persist --> present
 ```
 
-`metrics.ts` 仍是市场聚合的唯一生产者（QRD / CR / AMZ / 新品占比…）。发现层**只读**这些指标和 listings，**禁止**调用 `evaluateStrategy`，**禁止**写 `gateOutcome`。
+`metrics.ts` 仍是市场聚合的唯一生产者（QRD / CR / AMZ / 新品占比…）。发现层**只读**这些指标和 listings，**禁止**调用 `evaluateStrategy`，**禁止**写 `gateOutcome`。六指数的公式、输入与缺数规则以 **§4** 为准。
 
 ### 3.2 依赖规则（比「别循环 import」更硬）
 
@@ -440,18 +446,18 @@ flowchart TB
 立项 Score 与发现 Rank **不得共用一个字段名**（D1 拆多卡后更要守：一张 listing 卡上两套数并存）：
 
 - `Candidate.score` / `StrategyEvaluation.score`：**继续表示 GSE 立项综合分**（运营已认识）。`runStrategy` 只写这个槽，且必须对准**显式 candidateId**。
-- 发现结果用新类型，例如 `DiscoveryRank { total, indices, flags, sampleSize, listingKey? }`。Phase 2 **派生不落盘**（与 `WorkbenchTodo` 同族）；是否写入 candidate 可选字段见仍开放的 Q6。**禁止**把发现总分写进 `Candidate.score`。
+- 发现结果用 §4 的 `DiscoveryRank`（六指数具名槽 + 总表 `composite` + 旗标）。Phase 2 **派生不落盘**（与 `WorkbenchTodo` 同族）；是否写入 candidate 可选字段见仍开放的 Q6。**禁止**把发现总分写进 `Candidate.score`。
 
 ### 3.3 `service.ts` 的目标形态
 
-不为了好看新建一层「Service 框架」。按现有扁平文件风格，把 `service.ts` **按上下文剪成同级模块**，再留一个很薄的 `service.ts` 做 re-export（Phase 1 零行为，见 §5）。建议落点：
+不为了好看新建一层「Service 框架」。按现有扁平文件风格，把 `service.ts` **按上下文剪成同级模块**，再留一个很薄的 `service.ts` 做 re-export（Phase 1 零行为，见 §6）。建议落点：
 
 | 新文件（建议） | 搬出的符号 |
 |---|---|
 | `lookup.ts` 或留在 `service` | `findMarket` `latestSnapshot*` `ensureDefaults` |
 | `leads.ts` | `createLead`（Phase 1 仍一市场一卡；Phase 2 起按 `listingKey` 查找，不再 `find(marketId)` 当唯一键） |
 | `import-apply.ts`（内存侧，I/O 仍在 `importer.ts`） | `importParsedMarket`；`importMarketAndScreen` 仅服务 **opt-in** `run_screen=true`。Phase 1 搬家不改默认；Phase 3 默认改为不跑 screen（D3） |
-| `discovery.ts` | **新**：指数、旗标、`rankMarkets` / `rankListings`；listing 身份键；提升为候选卡的纯函数入口（写事务仍走 pool） |
+| `discovery.ts` | **新**：§4 六指数 + 总表 + 旗标、`rankMarkets` / `rankListings`；listing 身份键；提升为候选卡的纯函数入口（写事务仍走 pool） |
 | `screening.ts` | `buildStrategyContext*` `runStrategy` `scanScreen`（现 `scanMarkets` 的 Gate 半截；**不是**发现入口） |
 | `profit.ts` | 利润 + 采购价出处解析（写回必须带 `candidateId`，一市场多卡后不能「该市场最新一条」含糊落账） |
 | `risk.ts` / `reviews.ts` | `record*` + `*Metrics` 生产者（顺带让 `KNOWN_METRIC_NAMES` 可从生产者登记） |
@@ -478,13 +484,273 @@ flowchart TB
 
 ---
 
-## 4. 目标数据流
+## 4. 发现层规格：六大选品指数
+
+本节是目标 Discovery 层的**规范定义**，不是现状描述。来源：amz-selection 方法论卡 + 整合版 §3。实现落在 `discovery.ts`，经 `compass_discover`（D2）产出 `DiscoveryRank` / listing 秩。**禁止**写入 `Candidate.score`（那是 GSE 立项分，权重见本节对照表）。
+
+**Q4 已收窄为规范，不再问「要不要这六条」：** 目标模型含全部六指数 + 总表 + 四旗标。Phase 2 对**现有字段够用的分量做代理**，其余分量与整条指数保持 `missing`。缺列再算的指数（季节 / FBA / 主图·A+）进 Phase 5 取数，不从目标模型删除。
+
+### 4.1 纪律（发现层，规范）
+
+1. **全排序，不硬砍。** 边界品留在列表。Hard / Capital / Ops / Trap **只旗标**。不得按 Gate、QRD、新品占比、CPC 删除行（那是立项 `compass_market_scan` 的事）。
+2. **缺数据 → 显式 `missing` / 旗标，绝不填默认 50。** `strategy.calculateDimensionScores` 对空维 `average([]) = 50` 是立项残缺形态，发现层禁止复制。乘积公式里任一因子缺失 → **整条指数 `missing`**（不能把缺因子当 1）。可加和的 HPI：只对**有值的分量**加权；缺的分量记入 `missingComponents`，不补 50。
+3. **分数只排序。** 发现分不能改 `gateOutcome`，不能救活红色 Gate，不能写成 `Candidate.score`。
+4. **经验画像不是硬线。** 「搜索量 2000–8000、ASIN <50、品牌真空 >70%」等只作解读，不作发现层过滤。
+5. **样本量。** 建议 ≥3 页 / ≥300 行再信头部以外的排序。`listing_count < 300` 时打 `sample_thin` 旗标，**不删行**。
+6. **专利 / 认证 / 备案。** 任何指数都不能替代正式检索（替换机会、FBA 套利尤其如此）。
+
+### 4.2 产物形状（目标类型，尚未写代码）
+
+```
+DiscoveryFlag = "hard" | "capital" | "ops" | "trap" | "sample_thin" | "index_missing"
+
+DiscoveryIndexId =
+  "hpi" | "replacement" | "seasonal" | "new_burst" | "fba_arbitrage" | "listing_opt"
+
+DiscoveryIndexValue = {
+  id: DiscoveryIndexId
+  value: number | null          // null = missing，禁止用 50 顶上
+  missingComponents: string[]   // 缺的 η / 因子名
+  proxy: boolean                // Phase 2 弱公式为 true
+  note?: string
+}
+
+DiscoveryRank = {
+  listingKey: string
+  marketId: string
+  snapshotId: string
+  indices: Record<DiscoveryIndexId, DiscoveryIndexValue>
+  composite: number | null      // §4.4 总表；缺维不补 50，见合成规则
+  compositeMissing: string[]    // 总表里未参与的维度
+  flags: DiscoveryFlag[]
+  sampleSize: number
+}
+```
+
+`compass_discover` 返回一组 `DiscoveryRank`（默认同市场或查询范围内 **listing 全量**，按 `composite` 或调用方指定的单指数排序）。提升为候选卡时只带 `listingKey` + 指向快照；秩默认当场重算（Q6）。
+
+### 4.3 两套权重，禁止混用
+
+| | 发现层总表（§4.4） | GSE 立项分（`calculateDimensionScores` + `jingpu-daily10`） |
+|---|---|---|
+| 用途 | 想法池 / `compass_discover` 默认合成 | 已进立项的卡排优先级 |
+| 写入 | `DiscoveryRank.composite` | `StrategyEvaluation.score` → `Candidate.score` |
+| 维度 | 需求 30 / 竞争 25 / 利润潜力 20 / 品牌真空 10 / 增长 10 / 场景·复杂度 5 | 单位经济 0.30 / 竞争 0.25 / 需求 0.20 / 产品 0.15 / 风险 0.10 |
+| 缺维 | 该维不参与合成，记 `compositeMissing` | 现状 `average([]) = 50`（立项已知问题，发现层不学） |
+| 工具 | `compass_discover` | `compass_strategy_run` / `compass_market_scan` |
+
+六指数是 **listing（及部分市场上下文）上的玩法分**；总表是跨玩法的默认合成。一次 `compass_discover` 应同时给出六槽 + `composite`，以便按玩法切「只看替换」而不丢掉其它指数。
+
+### 4.4 发现层总评分表（默认 composite）
+
+来源：amz-selection §三 / 整合版 §3.7。可按卖家阶段调权（新手加重竞争），但**默认向量如下**，与 GSE 权重无关。
+
+| 维度 id | 权重 | 含义 | Phase 2 代理（有则算，无则该维 missing） |
+|---|---:|---|---|
+| `demand` | 0.30 | 市场需求（月销 / 搜索量） | listing：`monthlySales`（有限正数）归一；市场上下文可并用 `keyword_search_volume`、`waist_monthly_sales`。销量与搜索量都缺 → 维 missing |
+| `competition` | 0.25 | 竞争强度（ASIN 数 / 评论壁垒） | 市场：`listing_count` 反向 + `waist_review_median` 反向 + `cr3` 反向（有哪个用哪个）。三维皆缺 → missing |
+| `profit` | 0.20 | 利润潜力（价 − FBA − 佣金） | **仅当**该市场已有 `ProfitEstimate` 且 `gross_margin` 为有限数时用毛利率归一。未测算 → **missing**（不准用价本身假装利润） |
+| `brand_vacuum` | 0.10 | 品牌真空 / 集中度 | 页面代理：无品牌 listing 占比（`brand` 空或归一后像 generic / unbranded / 无品牌）。`cr3`/`hhi` 可作集中度补充。无品牌**流量**占比缺 → 记入 `missingComponents`，不补 70% |
+| `trend` | 0.10 | 增长趋势（约 6 个月斜率） | Phase 2 **无月序列 → 整维 missing**。禁止用 `new_listing_share_12m` 冒充 6 个月斜率（可另作解读字段，不进本维） |
+| `scene` | 0.05 | 场景可描述 / 产品复杂度 | Phase 2 **无 SimilarProductFeature → 整维 missing** |
+
+**合成规则：**  
+`composite = Σ (wᵢ / W) × sᵢ`，其中 `sᵢ` 为已归一到 0–100 的有值维，`W` 为有值维权重之和。`W = 0` → `composite = null`。部分维缺失时 `composite` 仍可算，但必须带 `compositeMissing` 且 UI/工具标明「部分维」。**禁止**对缺失维使用 50 或「中性分」。
+
+### 4.5 六指数分条规格
+
+下列公式是目标定义（整合版 / amz-selection 原文）。`ListingRecord` / `KeywordRecord` / `MetricMap` 字段名按仓库现状。Phase 2 只实现标了「代理」的部分；标「缺列」的分量保持 missing。
+
+---
+
+#### 4.5.1 HPI 隐赚指数（蓝海）· `hpi`
+
+**用途：** 找供给薄、需求在、品牌真空、利润看得出的蓝海词/坑。市场上下文重、listing 也可挂同一市场的 HPI 作背景分。
+
+**目标公式：**
+
+```
+HPI = η1×需求热度 + η2×供给稀疏度 + η3×利润潜力 + η4×评论壁垒(反向)
+    + η5×品牌真空 + η6×增长可持续性 + η7×场景可描述性 + η8×产品复杂度(反向)
+```
+
+| 分量 | 来源定义 | 目标输入 | Compass 今天有 | Phase |
+|---|---|---|---|---|
+| η1 需求热度 | 搜索量 / 月销热度 | `keyword_search_volume`；listing `monthlySales` | 有（词族合计、listing 月销） | **P2 代理**：有搜索量用 log 归一，否则用月销；都缺 → 分量 missing |
+| η2 供给稀疏度 | `1 / (每 $1000 营收对应 ASIN 数)` | `listing_count`、`category_monthly_revenue` | 有（营收仅在「每行都有月销额」时才非 null） | **P2 代理**：`1 / max(listing_count / max(revenue/1000, ε), ε)`；营收 missing 则改用「每 $1000 **月销额缺失时用月销×price_p50**」仍缺则分量 missing |
+| η3 利润潜力 | 价 − FBA − 佣金 | `gross_margin` 或 listing 价与费率 | 有测算才有 `gross_margin`；listing 有 `price`，无 FBA/佣金列 | **P2**：有 `gross_margin` 才算；否则分量 missing（不拿光秃售价当利润） |
+| η4 评论壁垒（反向） | 腰部/头部评论越高壁垒越高 | `waist_review_median`、listing `reviewCount` | 有 | **P2 代理**：`1 / log1p(waist_review_median)` 或 listing 评论；缺 → missing |
+| η5 品牌真空 | 无品牌流量占比 × 无品牌页面占比（>70% 为强信号，非硬线） | 流量占比 + 页面占比 | **仅** `brand` → 可算页面占比；**无**无品牌流量 | **P2 代理**：只用页面占比，并 `missingComponents += "unbranded_traffic_share"` |
+| η6 增长可持续性 | 趋势是否可持续 | 6 个月斜率 / 新品结构 | 有 `new_listing_share_12m`、`top20_age_months_median`；**无**月序列 | **P2**：本分量 **missing**（不拿新品占比冒充可持续性） |
+| η7 场景可描述性 | 场景能否一句话说清 | SimilarProductFeature 一类 | **无** | **缺列** → missing |
+| η8 产品复杂度（反向） | 越复杂分越低 | 结构/配件/定制 | **无** | **缺列** → missing |
+
+η 权重：来源未给数值。Phase 2 **对有值分量等权**（`ηᵢ = 1/k`，k = 非 missing 分量数）；k = 0 → `hpi.value = null`。以后校准 η 是实现细节，不删分量。
+
+典型高 HPI 画像（搜索量约 2000–8000、同词 ASIN <50、品牌真空 >70%、利润潜力 >50%）**只作文案**，不作过滤。
+
+---
+
+#### 4.5.2 替换机会指数（高销低分）· `replacement`
+
+**用途：** 需求已验证、体验差，做改进版截流。灰区（月销约 800–1200、评分约 4.0–4.3）必须留下来。
+
+**目标公式：**
+
+```
+替换机会指数 = 月销量 × (5 − 评分) × 评论数修正因子
+```
+
+| 输入 | 目标 | Compass 今天 | Phase |
+|---|---|---|---|
+| 月销量 | listing `monthlySales` | `ListingRecord.monthlySales` | 缺 → **整条 missing** |
+| 评分 | listing `rating`（0–5） | `ListingRecord.rating`（csv 已做 0–5 校验） | 缺 → **整条 missing** |
+| 评论数修正因子 | 来源未给闭式；要压极端爆款评论、抬中等评论 | `ListingRecord.reviewCount` | **P2 代理**（须标注 `proxy: true`）：`reviewAdj = clamp(ln(1 + reviewCount) / ln(1 + 200), 0.25, 1.5)`，200 为具名常量。`reviewCount` 缺 → 整条 missing（不把因子当 1） |
+| 类目均分（解读，非公式因子） | 评分显著低于类目均分约 0.5+ | `waist_rating_median` | 有则写 `note`；缺不影响公式本身 |
+
+**禁止**用 `low_rating_high_sales_count`（星级≤4.2 且月销≥q 的**条数**）代替本指数。那条是市场计数，继续给 GSE / 报告用，发现层要的是 **逐 listing 的连续分**。
+
+入场前必须独立查专利；差评若集中在功能缺失而非质量缺陷，改造成本可能更高——发现层只排序，不替代差评分析。
+
+---
+
+#### 4.5.3 季节景气指数 · `seasonal`
+
+**用途：** 按旺季 ROI 与可行动窗口排季节品，不按全年 ROI。
+
+**目标公式：**
+
+```
+景气指数 = 峰谷比得分(40%) × 趋势加速度(40%) × 可行动窗口(20%)
+```
+
+- 峰谷比不必死卡 3.0×。
+- 趋势加速度：今年是否领先去年 2–3 个月（常是备货信号）。
+- 可行动窗口：距峰值 2–3 个月立即行动；4–6 个月可计划；已到峰值前夜建议放弃（**放弃是人读建议，发现层只把窗口分打低，不删行**）。
+
+**口径陷阱（规范，写进 `discovery.ts` 注释与测试）：** 类目趋势最后一个月常是**不完整当月**。用首末比会把类目算成暴跌（来源实测：真实 +0.7% 可被算成 −59.1%）。**必须先剔除不完整月**再算同比 / 中期趋势。Compass 今日无 `CategoryTrend` 序列，本陷阱在接入月序列的那一阶段生效，不能用「快照是单月点」假装已经避开。
+
+| 输入 | Compass 今天 | Phase |
+|---|---|---|
+| 12 个月销量 / 搜索曲线 | **无**。快照是单次切片，没有月序列字段 | **P2：整条 `seasonal` = missing**（`missingComponents` 含 `monthly_series`） |
+| 峰值月、峰谷比 | 无 | 有序列后算；不完整月丢弃 |
+| `RiskRecord.season_flag` | 立项人工标记 | **不**拿来填季节指数（那是立项证据，不是曲线） |
+
+Phase 5：扩 CSV / MCP 月序列列之后按目标公式实现，并加「含不完整末月 vs 剔除后」的对单测。
+
+---
+
+#### 4.5.4 新品爆发指数 · `new_burst`
+
+**用途：** 7 天爆量苗子排在 28 天稳步爬升者前面。硬阈值按「月销」会误判。
+
+**目标公式：**
+
+```
+新品爆发指数 = 月销量 / 上架天数 × 增长加速度（近期日销 / 早期日销）
+```
+
+| 输入 | Compass 今天 | Phase |
+|---|---|---|
+| 月销量 | `monthlySales` | 缺 → 整条 missing |
+| 上架天数 | `monthsOnline` × 30.44 或 `launchDate` 相对 `capturedAt` | 有其一即可；都缺 → 整条 missing |
+| 增长加速度（近期日销 / 早期日销） | **无**日销曲线 | **P2：本因子 missing → 整条 missing**？见下行 |
+| 自然 vs 广告、大促窗口 | 无 ACoS / 品牌词占比 | 缺列；有则降权大促窗口 |
+
+**Phase 2 代理（显式降级，不是目标公式）：** 仅当月销与上架天数都有限且上架天数 ≥ 1 时：
+
+```
+new_burst_proxy = monthlySales / daysOnline
+```
+
+`proxy: true`，`missingComponents += "growth_acceleration"`。加速度齐了再乘回去。禁止把「月销高、上架很久」的老链接打成高爆发（代理本身已用天数惩罚）。
+
+---
+
+#### 4.5.5 FBA 转换套利指数 · `fba_arbitrage`
+
+**用途：** FBM 出单、Buy Box 价差够、FBA 费吃得下的转换机会。须先核品牌备案；跟卖侵权风险高。
+
+**目标公式：**
+
+```
+转换套利指数 = FBM 销量 × Buy Box 价差溢价率 × FBA 费效系数
+```
+
+| 输入 | Compass 今天 | Phase |
+|---|---|---|
+| 配送类型 FBM / FBA | **无** `shippingType`。`seller` 是自由文本，`isAmazon` 不是 FBM | **P2：整条 missing**（`missingComponents` 含 `shipping_type`）。禁止用「非 Amazon」假装 FBM |
+| FBM 销量 | 无 | 缺列 |
+| Buy Box 价差溢价率 | 无 | 缺列 |
+| FBA 费 / 费效 | 无 listing 级 FBA。`ProfitEstimate.fbaFee` 是手填测算，不是该行官方费 | 不拿手填测算冒充该 listing 的 FBA 费效 |
+| 大件/重货 | 无尺寸重量 | 有则剔或降权；发现层降权，不删行 |
+
+Phase 5：CSV / MCP 补 `shippingType`、Buy Box、官方 FBA 费后再实现。FBA 费以 Seller Central / Revenue Calculator 为准（与经济学模块同一纪律）。
+
+---
+
+#### 4.5.6 Listing 优化潜力指数 · `listing_opt`
+
+**用途：** 4.3 分但主图差、标题短、无 A+ 的链接，优化空间可能大于满分满配。差 listing 仍出单可能藏致命缺陷 → 查退货 / 差评（发现层不替代）。
+
+**目标公式：**
+
+```
+优化潜力指数 = 月销量 × 关键词覆盖缺口 × 主图质量缺口 × 标题质量缺口
+```
+
+| 因子 | Compass 今天 | Phase |
+|---|---|---|
+| 月销量 | `monthlySales` | 缺 → 整条 missing |
+| 关键词覆盖缺口 | **无** per-listing 覆盖。市场只有 `KeywordRecord[]` | **P2：因子 missing**（不能用词族搜索量冒充该链接覆盖） |
+| 主图质量缺口 | **无** 图 URL / 质量分 / A+ | **P2：因子 missing** |
+| 标题质量缺口 | 仅有 `title` 字符串 | **P2 代理（仅此因子）：** `titleGap = clamp(1 − length(title) / 200, 0, 1)`（200 字符为具名上限，代理）。`title` 缺 → 因子 missing |
+
+乘积纪律：三缺口里 Phase 2 只有标题代理 → **整条 `listing_opt` 仍为 missing**（另两个因子缺，不能当 1）。可另输出 `listing_opt_title_gap` 解读字段，避免假装已经有完整优化指数。
+
+Phase 5：补关键词覆盖、主图、A+ 列后按目标乘积实现。
+
+---
+
+### 4.6 风险旗标（只标注，不删除）
+
+来源：amz-selection §四 / 整合版 §3.8。挂在 `DiscoveryRank.flags`，**不是** `RiskRecord`（那是立项五字段 + 官方 URL）。
+
+| 旗标 | 类目示例（来源原文，不是本仓库要落盘的完整经营名单） | 发现层动作 |
+|---|---|---|
+| 🔴 `hard` | 食品/饮料/保健/医疗器械/婴儿食品/农药/酒精/功能性化妆品 | 必须有资质，独立评审；**不删行** |
+| 🟡 `capital` | 服装/鞋包/珠宝/假发/家具/床垫/大件家电 | 退货与库存风险高，显著提示 |
+| 🟠 `ops` | 电子/液体/易燃/IP 授权/汽配/玻璃易碎 | 认证、危品、侵权、破损 |
+| ⚠️ `trap` | 手机壳/钢化膜/节日装饰/书碟 | 内卷、薄利、季节死库存 |
+
+匹配：`Market.category` 与 listing `category`（有哪个用哪个）。未匹配 = **无旗标**，不是 `clear`。词表放哪见 Q7（开源仓库不宜写死完整经营名单；宿主配置或示例表）。
+
+立项 `risk_screen` 仍按 GSE 对证据做 require/veto。发现旗标 **不**自动写成 `RiskRecord.overall`。
+
+### 4.7 Phase 2 实现对照（对照 §6 迁移）
+
+| 指数 | Phase 2 | 之后 |
+|---|---|---|
+| `replacement` | **代理整条**（月销 × (5−评分) × ln 评论修正） | 修正曲线可校准 |
+| `new_burst` | **代理**：月销/上架天数，加速度 missing | 有日销曲线后乘加速度 |
+| `hpi` | **部分代理**（η1/η2/η4/η5 页面；η3 仅有测算时；η6–η8 missing） | 流量真空、月序列、场景/复杂度 |
+| 总表 `composite` | 按 §4.4：有维算维，缺维不补 50 | `trend`/`scene` 有列后再进合成 |
+| 旗标 | 可配置词表匹配 | 词表运营化（Q7） |
+| `seasonal` | **整条 missing** | 月序列 + 剔除不完整月 |
+| `fba_arbitrage` | **整条 missing** | shippingType / Buy Box / 官方 FBA |
+| `listing_opt` | **整条 missing**（可另给标题缺口解读） | 覆盖 / 主图 / A+ |
+
+Phase 2 验收：`tests/discovery.test.ts` 必须包含「缺因子 → `value === null`、不是 50」的负向用例，以及替换机会灰区（4.0–4.3、月销 800–1200）**不被丢掉**。
+
+---
+
+## 5. 目标数据流
 
 ```mermaid
 flowchart TD
   ideas["想法池：lead 无快照也可以\n至多一张 kind=market 线索卡"] --> ingest
   csv["CSV / 补数 convert"] --> ingest["Ingestion\nMarket + 不可变 Snapshot + metrics\n默认不跑 screen（D3）"]
-  ingest --> disc["compass_discover\n六指数能算的就算；不能算的缺数旗标\n全排序 Listing；Hard/Trap 只标注"]
+  ingest --> disc["compass_discover · §4\nhpi / replacement / seasonal\nnew_burst / fba_arbitrage / listing_opt\n能算的算；不能算的 missing\n全排序；Hard/Trap 只标注"]
   disc --> pick["运营 / agent 挑 Top N\n提升为 kind=listing 候选卡\n身份 (marketId, listingKey)\n不在本层 reject"]
   pick --> screen["显式 Screening\ncompass_strategy_run mode=screen\n或导入 opt-in run_screen=true\n市场级 Gate 写回该 listing 卡"]
   screen -->|reject| keep["候选保留，阶段可留 screen 或回 lead"]
@@ -498,7 +764,7 @@ flowchart TD
 
 | 产物 | 所有者 | 能否淘汰 |
 |---|---|---|
-| `DiscoveryRank.total` 与分指数 | `discovery.ts` / `compass_discover` | 否，只排序 |
+| `DiscoveryRank.indices`（六槽）+ `composite` | `discovery.ts` / `compass_discover`（§4） | 否，只排序 |
 | `DiscoveryFlag`（Hard/Capital/Ops/Trap + 数据缺口） | `discovery.ts` | 否 |
 | `StrategyEvaluation.outcome` | `strategy.evaluateStrategy` | 是（立项） |
 | `StrategyEvaluation.score` → `Candidate.score` | 同上，**只给已显式跑过 GSE 的那张卡** | 否 |
@@ -509,11 +775,11 @@ flowchart TD
 1. 现在：`import → metrics → screen Gate → 写「该市场那一张」candidate`。  
 2. 目标：`import → metrics →（不写 Gate）→ compass_discover 排 listing → 提升 Top N 为 listing 卡 → 显式 screen`。`run_screen=true` 仍可用，但是选择，不是默认。
 
-Listing 级机会不再只停在档案附录（D1）：Phase 2 先派生 `ListingOpportunity[]`（含 `listingKey` + `DiscoveryRank`）；Phase 3 经 `compass_discover` / pool 提升为真正的 `Candidate`。
+Listing 级机会不再只停在档案附录（D1）：Phase 2 按 §4 派生 `DiscoveryRank[]`（六槽 + composite + 旗标）；Phase 3 经 `compass_discover` / pool 提升为真正的 `Candidate`。
 
 ---
 
-## 5. 迁移计划（先划界，不大爆炸）
+## 6. 迁移计划（先划界，不大爆炸）
 
 原则：每一步可独立合并；运营工具名、store schema、GSE 判定语义尽量不动；红线（写事务、decisionLog 白名单、缺数据不判绿）每步回归。
 
@@ -534,16 +800,14 @@ Listing 级机会不再只停在档案附录（D1）：Phase 2 先派生 `Listin
 
 ### Phase 2 — 发现层只读派生 + Listing 身份模型（仍不改策略 YAML）
 
-前提按 D1：排序对象是 **listing**，不是「一市场一行」。新增 `discovery.ts`（名字可议），**只用现有字段**先做能算的：
+规格以 **§4** 为准（六指数全在目标模型里）。前提按 D1：排序对象是 **listing**。新增 `discovery.ts`，实现 §4.7 的 Phase 2 列：
 
 1. **`listingKey` 纯函数**（ASIN 优先，无 ASIN 退化键）+ 单测；与 `amazonProductUrl` 白名单同口径。
-2. **Listing 级替换机会与新品速度**（弱公式，标注「代理」）→ `ListingOpportunity[]`。
-3. **市场级代理总分**（发现总表的可落地子集，给市场表用）：需求 / 竞争 / 利润潜力（有测算才计，无则缺数不补 50）/ 品牌真空代理 / 增长代理（标明不是 6 个月斜率）。
-4. **旗标**：可配置类目关键字表（Hard/Trap…），匹配 `Market.category` / listing.category；未匹配 = 无旗标，不是 clear。
-5. 纯函数 + `tests/discovery.test.ts`。**不写 `Candidate.score`**。可选字段草案（`asin` / `listingKey` / `kind`）可以进 `types.ts` 但不强制 `assertStore`。
-6. 提升为候选卡的 **内存 API**（`promoteListingCandidate` 一类）可在本阶段落地并测「同一市场两张 listing 卡不互相覆盖」；工具面仍可不接，以免 SKILL 与实现再漂。
-
-季节 / FBA / Listing 优化：数据不够就 **显式缺数**，不要用常数填满。
+2. **六槽都要出现在 `DiscoveryRank.indices`：** `replacement` / `new_burst` 出代理值；`hpi` 部分代理；`seasonal` / `fba_arbitrage` / `listing_opt` 的 `value` 必须是 `null` 并列出 `missingComponents`——类型上六条都在，不是「先只做两条」。
+3. **总表 `composite`：** 按 §4.4 权重合成；缺维不补 50；`trend` / `scene` Phase 2 为 missing。
+4. **旗标：** Hard / Capital / Ops / Trap + `sample_thin`（§4.6）。
+5. 纯函数 + `tests/discovery.test.ts`（§4.7 负向：缺因子 ≠ 50；替换灰区不丢）。**不写 `Candidate.score`**。
+6. 提升为候选卡的 **内存 API**（`promoteListingCandidate` 一类）可在本阶段落地并测「同一市场两张 listing 卡不互相覆盖」；工具面仍可不接。
 
 ### Phase 3 — 工具与展示按 D1–D3 露出（运营可感知）
 
@@ -588,12 +852,12 @@ Listing 级机会不再只停在档案附录（D1）：Phase 2 先派生 `Listin
 
 ---
 
-## 6. 仍开放的问题（只能由产品 / 运营拍板）
+## 7. 仍开放的问题（只能由产品 / 运营拍板）
 
-Q1 / Q2 / Q3 已锁定，见 **§0.5 D1–D3**。下面这些仍影响 Phase 2 公式与 Phase 4 门闩，**不**挡 Phase 1 剪文件。
+Q1 / Q2 / Q3 已锁定，见 **§0.5 D1–D3**。**Q4 已收窄为规范**（§4 开篇）：六指数 + 总表 + 四旗标都在目标模型里；Phase 2 有数据做代理、没数据保持 missing；缺数据不补 50。下面这些仍影响实现细节与 Phase 4 门闩，**不**挡 Phase 1 剪文件。
 
-**Q4. 六指数的第一批范围？**  
-建议 Phase 2 只做：**listing 身份键 + 替换机会代理 + 新品速度代理 + 市场级需求/竞争/品牌真空代理 + 类目旗标**。季节 / FBA / Listing 优化等有列再做。是否同意「缺数据就缺，不补 50」？
+**Q4（剩余子问题，不是「要不要六指数」）。**  
+η 向量要不要在 Phase 2 之后改成非等权？评论修正的 `200`、标题长度 `200` 是否改成可配常量？这两项不改变公式形状，实现时可以先按 §4.5 的具名常量落地。
 
 **Q5. 看板阶段要不要和 GSE 关卡做硬门？**  
 例如 screen=reject 不能进 deep_research。与现行「任意跳转 + 必填 reason」冲突。先警告还是硬拒？一市场多卡后，门闩必须按 **卡** 判，不能按市场一刀切。
@@ -615,12 +879,12 @@ Q1 / Q2 / Q3 已锁定，见 **§0.5 D1–D3**。下面这些仍影响 Phase 2 �
 
 ---
 
-## 7. Phase 1 落地时怎么辩论
+## 8. Phase 1 落地时怎么辩论
 
 建议合并本提案后，第一次实现评审（Phase 1）只讨论：
 
 1. §3.3 的剪文件清单是否同意（尤其 MCP 是否跟 Phase 1 一起搬）。  
-2. Phase 2 代理公式是否允许「弱、但标明代理」，避免等齐六指数才开工（Q4）。  
+2. §4 已是发现层规格：**不要**再辩论「要不要六指数」。Phase 2 按 §4.7 做代理 / missing 即可。  
 3. D1 的 `listingKey` 草案（ASIN 优先 / 无 ASIN 是否允许提升，Q10）——可在 Phase 1 评审里定口径，代码仍放 Phase 2。
 
 D1–D3 已锁定，**不要**在 Phase 1 评审里重开「要不要拆卡 / 要不要新工具 / 导入是否默认 screen」。
@@ -629,7 +893,7 @@ D1–D3 已锁定，**不要**在 Phase 1 评审里重开「要不要拆卡 / �
 
 ---
 
-## 8. 符号索引（便于对照代码）
+## 9. 符号索引（便于对照代码）
 
 | 概念 | 符号 |
 |---|---|
@@ -649,7 +913,14 @@ D1–D3 已锁定，**不要**在 Phase 1 评审里重开「要不要拆卡 / �
 | 运营工作流 | `skills/compass-selection/SKILL.md` |
 | 待办派生 | `deriveTodos` `todo.ts`；编排 `listWorkbenchTodos` |
 | Web 写面 | `WRITE_PATHS` `web/server.ts` |
+| 发现层规格（目标） | **§4**；`DiscoveryRank` / 六 `DiscoveryIndexId` / 总表权重 / 旗标 |
+| HPI | §4.5.1 `hpi` |
+| 替换机会 | §4.5.2 `replacement`（≠ `low_rating_high_sales_count`） |
+| 季节景气 | §4.5.3 `seasonal`（不完整月陷阱） |
+| 新品爆发 | §4.5.4 `new_burst` |
+| FBA 套利 | §4.5.5 `fba_arbitrage` |
+| Listing 优化 | §4.5.6 `listing_opt` |
 
 ---
 
-*本文是设计提案，不是变更日志。D1–D3 已锁定。实现从 Phase 1 剪文件开始；策略 YAML 仍按「以后用 `/compass-strategy` 另存」处理。*
+*本文是设计提案，不是变更日志。D1–D3 已锁定。六指数目标规格见 §4。实现从 Phase 1 剪文件开始；策略 YAML 仍按「以后用 `/compass-strategy` 另存」处理。*
